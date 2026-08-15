@@ -42,8 +42,17 @@ rsync -av /root/harness/CP/data/ root@<VPS>:/opt/ssq/data/
 
 ## 四、构建并启动
 
+先配置 LLM 凭据（**仓库不含任何 URL/Key**，全部走 `.env`，该文件已 gitignore）：
+
 ```bash
 cd /opt/ssq
+cp .env.example .env
+# 编辑 .env，填入你自己的 LLM 通道（DeepSeek/智谱/通义等任意 OpenAI 兼容服务均可）
+#   LOTT_LLM_BASE_URL=...  LOTT_LLM_API_KEY=...  LOTT_LLM_MODEL=...
+# 多模型可选：LOTT_LLM_MODEL_LIST=模型A,模型B  或  LOTT_LLM_EXTRA_MODELS=[{...}]
+```
+
+```bash
 docker compose up -d --build          # 首次构建约 2–5 分钟（拉取 python:3.11-slim + pip 依赖）
 docker compose logs -f --tail 50      # 观察启动日志（首次含 数据同步→回测→生成预测）
 ```
