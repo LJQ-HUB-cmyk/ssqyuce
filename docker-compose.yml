@@ -1,0 +1,29 @@
+services:
+  lottery:
+    build: .
+    image: ssq-predictor:latest
+    container_name: ssq-predictor
+    ports:
+      - "18000:18000"              # 对外端口（如需改，改这里）
+    volumes:
+      - ./data:/app/data           # 数据持久化（数据库 + 原始快照），备份=拷贝该目录
+    env_file:
+      - path: .env                 # 所有密钥/URL 都在 .env 中（不入库，见 .env.example）
+        required: false
+    environment:
+      - TZ=Asia/Shanghai
+      - PORT=18000
+      - LOTT_SCHEDULER=1           # 开奖日（周二/四/日）21:35 后自动：抓取→在线对照→生成预测
+      - LOTT_BOOT_PREDICT=1        # 启动时若无下期预测则自动生成
+    restart: unless-stopped        # 长期运行：崩溃/重启后自动拉起
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:18000/api/health', timeout=5)"]
+      interval: 60s
+      timeout: 8s
+      retries: 3
+      start_period: 120s           # 首次启动含数据初始化+预测生成，放宽
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"            # 日志轮转，防止长期运行撑爆磁盘
+        max-file: "3"

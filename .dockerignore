@@ -1,0 +1,10 @@
+.git
+.venv
+data
+__pycache__
+*.pyc
+*.db
+.gitignore
+README.md
+DEPLOY.md
+双色球预测系统方案.md

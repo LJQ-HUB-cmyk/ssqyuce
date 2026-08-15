@@ -1,0 +1,7 @@
+.venv/
+data/*.db
+data/raw/
+__pycache__/
+*.pyc
+.env
+双色球预测系统方案.md

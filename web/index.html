@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>双色球智能预测分析系统</title>
+<link rel="stylesheet" href="/static/style.css">
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>🎱 双色球智能预测分析系统 <span class="sub">历史规律研究 · 样本外回测验证 · LLM 推理选号</span></h1>
+    <div class="disclaimer">
+      ⚠️ 双色球开奖是独立随机事件，历史数据不存在可稳定预测未来的"规律"（本系统回测已实证）。
+      系统输出仅为统计结构与 LLM 推理的参考建议，<b>不构成中奖概率、不构成投注建议</b>。
+      请理性购彩，量力而行。
+    </div>
+  </header>
+
+  <div class="toolbar">
+    <button id="btnRefresh" onclick="refresh()">⟳ 刷新开奖数据</button>
+    <button id="btnBacktest" onclick="runBacktest()">🧪 规律回测</button>
+    <button id="btnPredict" class="primary" onclick="runPredict()">🎯 生成预测</button>
+    <button id="btnEval" onclick="runOfflineEval()">📊 离线评估</button>
+    <button id="btnOnline" onclick="runOnline()">✔ 在线对照</button>
+    <span id="status" style="color:var(--muted);font-size:12.5px;align-self:center;"></span>
+  </div>
+
+  <!-- 预测 -->
+  <div class="card" id="cardPredict">
+    <h2>📌 下一期预测 <span class="tag" id="predIssue"></span></h2>
+    <div id="predList"></div>
+    <div class="note" id="predNote"></div>
+  </div>
+
+  <!-- 多尺度统计 -->
+  <div class="card">
+    <h2>📈 多尺度统计（长 / 中 / 短期）</h2>
+    <div class="tabs">
+      <div class="tab on" data-w="long" onclick="setWin('long')">长期 · 全量</div>
+      <div class="tab" data-w="mid" onclick="setWin('mid')">中期 · 近150期</div>
+      <div class="tab" data-w="short" onclick="setWin('short')">短期 · 近30期</div>
+    </div>
+    <div class="grid2">
+      <div>
+        <div class="note">红球出现频率（33 格热力）</div>
+        <div class="heat" id="heatFreq"></div>
+      </div>
+      <div>
+        <div class="note">红球当前遗漏 Top10</div>
+        <div class="chart" id="chOmit"></div>
+      </div>
+      <div>
+        <div class="note">近 60 期和值走势（含均值线）</div>
+        <div class="chart" id="chSum"></div>
+      </div>
+      <div>
+        <div class="note">近 60 期三区比堆积</div>
+        <div class="chart" id="chZone"></div>
+      </div>
+    </div>
+    <div class="note" id="winStats"></div>
+  </div>
+
+  <!-- 规律有效性 -->
+  <div class="card">
+    <h2>🔬 规律库 · 样本外回测结果 <span class="tag" id="patSummary"></span></h2>
+    <div class="scroll">
+      <table id="patTable">
+        <thead><tr>
+          <th>规律</th><th>尺度</th><th>说明</th><th>样本n</th><th>avg命中</th><th>期望</th>
+          <th>边际</th><th>p值</th><th>adj_p</th><th>等级</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="chart" id="chPattern" style="height:200px;"></div>
+  </div>
+
+  <!-- 历史走势 -->
+  <div class="card">
+    <h2>🗓️ 最近开奖走势</h2>
+    <div class="scroll" id="histGrid"></div>
+  </div>
+
+  <!-- 评估 -->
+  <div class="card">
+    <h2>📊 评估体系 <span class="tag">系统 vs 随机基线（同注数）</span></h2>
+    <div id="evalArea"><div class="note">点击「离线评估」生成结果（约需 30~60 秒）。</div></div>
+  </div>
+
+  <footer>双色球智能预测分析系统 · 仅供研究参考 · 随机性诚实声明见页首 · 数据源 e.17500.cn</footer>
+</div>
+
+<div id="toast"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
