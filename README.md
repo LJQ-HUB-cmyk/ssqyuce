@@ -31,28 +31,76 @@
 - **部署友好**：Python 标准栈，FastAPI 直接托管零构建单页前端（ECharts CDN），
   单进程运行，低资源占用；可选 Docker / 开奖日自动调度。
 
-## 快速开始
+## 安装部署（新手向导）
+
+> 二选一：**方式一 Docker（推荐，最省事）** 或 **方式二 本地 Python**。
+> 两种方式都**可以不配置 LLM 直接运行**（自动降级为纯统计模型），配了 LLM 才有 AI 推理选号。
+
+### 第 0 步：准备
+
+- 一台机器：本地电脑或 VPS 都行，**要求很低**（1 核 CPU / 512MB 内存即可）；
+- 可选：一个 OpenAI 兼容的 LLM 服务（DeepSeek / 智谱 / 通义等任意一家），拿到它的 **API 地址 + Key + 模型名**。
+
+### 方式一：Docker Compose（推荐，新手最省事）
 
 ```bash
-# 1. 安装
+# 1) 安装 Docker（已装可跳过；Ubuntu/Debian 一条命令）
+curl -fsSL https://get.docker.com | sh
+
+# 2) 下载项目
+git clone https://github.com/jiam9069/ssqyuce.git
+cd ssqyuce
+
+# 3) 配置 LLM（可选：不配置也能跑，只是没有 AI 推理）
+cp .env.example .env          # 复制模板
+vim .env                      # 填写你自己的 LOTT_LLM_BASE_URL / LOTT_LLM_API_KEY / LOTT_LLM_MODEL
+
+# 4) 一键启动（首次约 2-5 分钟：构建镜像 → 自动抓取全部历史数据 → 回测 → 生成首期预测）
+docker compose up -d --build
+
+# 5) 打开浏览器
+#    本机:  http://localhost:18000      服务器: http://服务器IP:18000
+curl http://localhost:18000/api/health   # 返回 {"status":"ok",...} 即成功
+```
+
+**日常命令**（都在项目目录执行）：
+
+| 想做什么 | 命令 |
+|---|---|
+| 看运行日志 | `docker compose logs -f` |
+| 重启 | `docker compose restart` |
+| 停止 | `docker compose down` |
+| 手动刷新数据 + 生成预测 | `docker compose exec lottery python -m lottery.cli fetch` 然后 `... predict` |
+| 升级到最新版 | `git pull && docker compose up -d --build`（数据在 `data/` 目录，不会丢） |
+
+### 方式二：本地 Python（不用 Docker）
+
+```bash
+# 1) 需要 Python 3.10+；以下命令在项目目录执行
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 
-# 2. 抓取开奖数据（首次全量，之后增量）
+# 2) 配置 LLM（可选）
+cp .env.example .env
+set -a && source .env && set +a      # 让 .env 里的环境变量生效（Windows 建议用 WSL / Git Bash）
+
+# 3) 抓数据 → 回测 → 生成预测（按顺序执行一次即可）
 .venv/bin/python -m lottery.cli fetch
-
-# 3. 运行规律回测（walk-forward + 显著性分级）
 .venv/bin/python -m lottery.cli backtest
-
-# 4. 生成下一期预测（LLM 推理 + 统计模型，约 30-60s）
 .venv/bin/python -m lottery.cli predict
 
-# 5. 启动 Web 界面（http://localhost:18000）
+# 4) 打开 Web 界面 http://localhost:18000
 .venv/bin/python -m lottery.cli serve
 ```
 
 更多命令：`python -m lottery.cli stats`（多尺度统计）、`offline_eval`（离线回测）、
 `online_check`（在线对照）。
+
+### 装好之后
+
+- **全自动**：开奖日（周二/四/日）21:35 后系统自动「抓取 → 在线对照 → 生成下期预测」，无需干预（Docker 方式默认开启）；
+- **换端口**：改 `docker-compose.yml` 里 `"18000:18000"` 左边那个数字后 `docker compose up -d`；
+- **VPS 长期运行**（防火墙、HTTPS、数据迁移、每日备份、故障排查）：见 [DEPLOY.md](DEPLOY.md)。
 
 ## Web 界面
 
@@ -144,13 +192,11 @@ data/              # SQLite 数据库与原始快照（自动生成）
 Dockerfile / docker-compose.yml
 ```
 
-## Docker 部署（VPS 长期运行）
+## 长期运行（VPS）
 
-```bash
-docker compose up -d --build     # 打开 http://服务器IP:18000
-```
-
-详见 [DEPLOY.md](DEPLOY.md)（VPS 部署方案：环境准备、数据迁移、防火墙、备份、升级）。
+新手快速上手见上文「安装部署 —— 方式一」。上生产 / 长期跑在服务器上需要额外处理：
+环境准备、数据热迁移（把本机 `data/` 同步过去，免去首启抓取）、防火墙放行 18000、
+反向代理 + HTTPS、每日备份与恢复 —— 完整步骤见 [DEPLOY.md](DEPLOY.md)。
 
 ## API 一览
 
