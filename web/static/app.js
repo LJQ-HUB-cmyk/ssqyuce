@@ -77,8 +77,9 @@ function toggleTheme() {
 
 function switchTab(name) {
   history.replaceState(null, "", "#" + name);
-  $$(".nav-btn").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
-  $$(".tab-panel").forEach(p => p.classList.toggle("active", p.id === "tab-" + name));
+  $(".nav-btn").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
+  $(".tab-panel").forEach(p => p.classList.toggle("active", p.id === "tab-" + name));
+  if (name === "settings") loadLlmConfig();
   if (name === "analysis" && allFeatures) renderWindow(allFeatures);
   if (name === "patterns" && allPatterns.length) renderPatterns(allPatterns, _summary(allPatterns));
   if (name === "replay") populateReplaySelect();
@@ -849,7 +850,8 @@ async function testLlmConnection() {
     btn.textContent = "🔗 测试连接";
   }
 }
-\nasync function loadAll() {
+
+async function loadAll() {
   try {
     const [feat, pats, preds, health] = await Promise.all([
       api("/api/features"),
