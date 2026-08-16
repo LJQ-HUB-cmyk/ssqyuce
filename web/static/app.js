@@ -77,8 +77,8 @@ function toggleTheme() {
 
 function switchTab(name) {
   history.replaceState(null, "", "#" + name);
-  $(".nav-btn").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
-  $(".tab-panel").forEach(p => p.classList.toggle("active", p.id === "tab-" + name));
+  $$(".nav-btn").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
+  $$(".tab-panel").forEach(p => p.classList.toggle("active", p.id === "tab-" + name));
   if (name === "settings") loadLlmConfig();
   if (name === "analysis" && allFeatures) renderWindow(allFeatures);
   if (name === "patterns" && allPatterns.length) renderPatterns(allPatterns, _summary(allPatterns));
