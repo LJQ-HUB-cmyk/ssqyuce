@@ -212,7 +212,15 @@ td { padding: 6px 8px; border-bottom: 1px solid var(--border); }
 .bar > i { display: block; height: 100%; background: linear-gradient(90deg, var(--blue), var(--purple)); }
 
 /* 底部 */
-footer { color: var(--muted); font-size: 12px; text-align: center; margin-top: 20px; padding: 12px; }
+
+/* LLM 配置表单 */
+.llm-config-form { margin: 16px 0; }
+.form-row { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
+.form-row label { font-size: 13px; color: var(--muted); min-width: 80px; }
+.form-row input { flex: 1; min-width: 200px; background: var(--bg2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; font-size: 13px; }
+.form-row input:disabled { opacity: 0.5; cursor: not-allowed; }
+.form-actions { display: flex; align-items: center; gap: 12px; margin-top: 16px; }
+\nfooter { color: var(--muted); font-size: 12px; text-align: center; margin-top: 20px; padding: 12px; }
 
 /* 移动端 */
 @media (max-width: 768px) {

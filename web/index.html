@@ -34,6 +34,7 @@
       <button class="nav-btn" data-tab="replay" onclick="switchTab('replay')">🗓️ 历史回放</button>
       <button class="nav-btn" data-tab="eval" onclick="switchTab('eval')">📊 评估报告</button>
       <button class="nav-btn" data-tab="data" onclick="switchTab('data')">⚙️ 数据管理</button>
+      <button class="nav-btn" data-tab="settings" onclick="switchTab('settings')">🔧 设置</button>
     </nav>
 
     <!-- 主内容区 -->
@@ -200,7 +201,45 @@
     </main>
   </div>
 
-  <footer>双色球智能预测分析系统 · 仅供研究参考 · 随机性诚实声明 · 数据源 e.17500.cn</footer>
+  
+      <!-- 设置 -->
+      <section id="tab-settings" class="tab-panel">
+        <div class="card">
+          <h2>🔧 系统设置</h2>
+          
+          <h3 style="margin:16px 0 8px;color:var(--gold)">LLM 大模型配置</h3>
+          <div class="llm-config-form">
+            <div class="form-row">
+              <label>状态: <span id="llmStatus">检测中...</span></label>
+              <label><input type="checkbox" id="cfgLlmEnabled" onchange="toggleLlmConfig()"> 启用 LLM</label>
+            </div>
+            <div class="form-row">
+              <label>API 地址:</label>
+              <input type="text" id="cfgBaseUrl" placeholder="https://api.deepseek.com/v1">
+            </div>
+            <div class="form-row">
+              <label>API Key:</label>
+              <input type="password" id="cfgApiKey" placeholder="sk-...">
+            </div>
+            <div class="form-row">
+              <label>模型名称:</label>
+              <input type="text" id="cfgModel" placeholder="deepseek-chat">
+            </div>
+            <div class="form-row">
+              <label>采样轮数:</label>
+              <input type="number" id="cfgSamples" min="1" max="10" value="3" style="width:80px">
+            </div>
+            <div class="form-actions">
+              <button onclick="saveLlmConfig()" class="primary">💾 保存配置</button>
+              <button onclick="testLlmConnection()">🔗 测试连接</button>
+              <span id="llmTestResult" style="margin-left:12px;font-size:12px;"></span>
+            </div>
+          </div>
+          
+          <div id="llmConfigStatus" class="note" style="margin-top:12px;"></div>
+        </div>
+      </section>
+      <footer>双色球智能预测分析系统 · 仅供研究参考 · 随机性诚实声明 · 数据源 e.17500.cn</footer>
 </div>
 
 <div id="toast"></div>

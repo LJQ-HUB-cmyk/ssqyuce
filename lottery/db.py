@@ -290,8 +290,7 @@ def load_eval() -> List[Dict]:
 def create_task(task_id: str, kind: str) -> None:
     now = time.time()
     get_conn().execute(
-        "INSERT INTO tasks (id, kind, status, progress, message, created_at, updated_at)
-         VALUES (?,?,?,?,?,?,?)",
+        "INSERT INTO tasks (id, kind, status, progress, message, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
         (task_id, kind, "pending", 0.0, "", now, now),
     )
     get_conn().commit()

@@ -770,7 +770,86 @@ function escHtml(s) {
 
 // ==================== 加载 ====================
 
-async function loadAll() {
+
+// ==================== LLM 配置 ====================
+
+async function loadLlmConfig() {
+  try {
+    const config = await api("/api/config/llm");
+    $("#llmStatus").textContent = config.configured ? "✅ 已配置" : "❌ 未配置";
+    $("#llmStatus").style.color = config.configured ? "var(--green)" : "var(--red)";
+    $("#cfgBaseUrl").value = config.base_url || "";
+    $("#cfgApiKey").value = config.disabled ? "" : (config.api_key ? "******" : "");
+    $("#cfgModel").value = config.model || "";
+    $("#cfgSamples").value = config.samples || 3;
+    $("#cfgLlmEnabled").checked = !config.disabled;
+    toggleLlmConfig();
+  } catch(e) {
+    $("#llmStatus").textContent = "❌ 加载失败";
+    $("#llmStatus").style.color = "var(--red)";
+  }
+}
+
+function toggleLlmConfig() {
+  const enabled = $("#cfgLlmEnabled")?.checked;
+  const inputs = ["cfgBaseUrl", "cfgApiKey", "cfgModel", "cfgSamples"];
+  inputs.forEach(id => {
+    const el = $("#" + id);
+    if (el) el.disabled = !enabled;
+  });
+}
+
+async function saveLlmConfig() {
+  const payload = {
+    base_url: $("#cfgBaseUrl")?.value?.trim(),
+    api_key: $("#cfgApiKey")?.value?.trim(),
+    model: $("#cfgModel")?.value?.trim(),
+    samples: parseInt($("#cfgSamples")?.value || 3),
+    disabled: !$("#cfgLlmEnabled")?.checked,
+  };
+  
+  if (!payload.disabled && (!payload.base_url || !payload.model)) {
+    toast("请填写 API 地址和模型名称");
+    return;
+  }
+  
+  try {
+    await api("/api/config/llm", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload),
+    });
+    toast("LLM 配置已保存");
+    $("#llmConfigStatus").innerHTML = "<span style='color:var(--green)'>✓ 保存成功，LLM 推理将立即生效</span>";
+    // 更新预测区的 LLM 开关
+    if ($("#cfgLlm")) $("#cfgLlm").checked = !payload.disabled;
+  } catch(e) {
+    toast("保存失败: " + e.message);
+    $("#llmConfigStatus").innerHTML = "<span style='color:var(--red)'>✗ 保存失败</span>";
+  }
+}
+
+async function testLlmConnection() {
+  const btn = event.target;
+  btn.disabled = true;
+  btn.textContent = "测试中...";
+  $("#llmTestResult").textContent = "";
+  
+  try {
+    const result = await api("/api/llm/test", {method: "POST"});
+    if (result.ok) {
+      $("#llmTestResult").innerHTML = "<span style='color:var(--green)'>✓ 连接成功 (" + result.time_ms + "ms)</span>";
+    } else {
+      $("#llmTestResult").innerHTML = "<span style='color:var(--red)'>✗ " + (result.error || "连接失败") + "</span>";
+    }
+  } catch(e) {
+    $("#llmTestResult").innerHTML = "<span style='color:var(--red)'>✗ " + e.message + "</span>";
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "🔗 测试连接";
+  }
+}
+\nasync function loadAll() {
   try {
     const [feat, pats, preds, health] = await Promise.all([
       api("/api/features"),

@@ -101,6 +101,50 @@ def ensemble_mass(red_blend: np.ndarray, blue_blend: np.ndarray,
     return 100.0 * (0.75 * r_mass / norm_r + 0.25 * b_mass / norm_b)
 
 
+def _brier_blend(models_dict: Dict, draws: List[Dict]) -> tuple:
+    """基于 Brier score 的模型概率融合（替代等权平均）。"""
+    n_eval = min(50, len(draws) - 300)
+    if n_eval < 10:
+        # 数据不足，等权
+        n = len(models_dict)
+        red_blend = sum(m["red"] for m in models_dict.values()) / n
+        blue_blend = sum(m["blue"] for m in models_dict.values()) / n
+        return red_blend, blue_blend
+    
+    weights = {}
+    for name, model in models_dict.items():
+        red_p = model["red"]
+        blue_p = model["blue"]
+        brier_red, brier_blue, count = 0.0, 0.0, 0
+        for i in range(-n_eval, 0):
+            t = draws[i]
+            tr = np.zeros(33)
+            for r in t["reds"]: tr[r-1] = 1.0
+            brier_red += float(np.mean((red_p - tr) ** 2))
+            tb = np.zeros(16)
+            tb[t["blue"]-1] = 1.0
+            brier_blue += float(np.mean((blue_p - tb) ** 2))
+            count += 1
+        if count > 0:
+            avg = (brier_red + brier_blue) / (2 * count)
+            weights[name] = max(0.01, 1.0 / max(avg, 0.001))
+        else:
+            weights[name] = 0.01
+    total = sum(weights.values())
+    weights = {k: v/total for k, v in weights.items()}
+    print(f"[engine] Brier 权重: {weights}")
+    
+    red_blend = np.zeros(33)
+    blue_blend = np.zeros(16)
+    for name, model in models_dict.items():
+        w = weights.get(name, 0)
+        red_blend += w * model["red"]
+        blue_blend += w * model["blue"]
+    red_blend = red_blend / red_blend.sum() * 6
+    blue_blend = blue_blend / blue_blend.sum()
+    return red_blend, blue_blend
+
+
 # ---------- 主流程 ----------
 
 def build_context(draws: List[Dict], stats: Dict, patterns: List[Dict]) -> Dict:
@@ -117,21 +161,17 @@ def build_context(draws: List[Dict], stats: Dict, patterns: List[Dict]) -> Dict:
 
 def llm_tickets(draws: List[Dict], stats: Dict, patterns: List[Dict],
                 rng: random.Random) -> List[Dict]:
-    """多模型 LLM 采样生成候选（失败自动降级为空）。
-
-    支持任意数量的模型通道（主通道 LOTT_LLM_MODEL_LIST + 附加通道
-    LOTT_LLM_EXTRA_MODELS），采样预算按模型轮转分配，每个票据标记来源模型。
-    """
+    """多模型 LLM 采样生成候选（失败自动降级为空）。"""
     from concurrent.futures import ThreadPoolExecutor
     if config.LLM_DISABLED:
         return []
     model_cfgs = config.llm_model_list()
     if not model_cfgs:
-        print("[llm] 无可用模型配置（检查 .env 的 LLM 设置），跳过 LLM 通道")
+        print("[llm] 无可用模型配置，跳过 LLM 通道")
         return []
     ctx = build_context(draws, stats, patterns)
 
-    # 观察轮次：用第一个可用模型生成
+    # 观察轮次
     obs = llm_client.chat_json(
         llm_client.SYSTEM_BASE,
         llm_client.observations_prompt(
@@ -174,7 +214,6 @@ def llm_tickets(draws: List[Dict], stats: Dict, patterns: List[Dict],
                 continue
         return out
 
-    # 采样预算按模型轮转分配（保证多模型都被用到）
     calls = [model_cfgs[i % n_models] for i in range(config.LLM_SAMPLES)]
     with ThreadPoolExecutor(max_workers=min(len(calls), 4)) as ex:
         futures = [ex.submit(_ticket_call, cfg) for cfg in calls]
@@ -185,7 +224,7 @@ def llm_tickets(draws: List[Dict], stats: Dict, patterns: List[Dict],
 
 def predict_next(draws: List[Dict], use_llm: Optional[bool] = None,
                  n_tickets: Optional[int] = None, persist: bool = True) -> Dict:
-    """对下一期生成预测。use_llm=None 时按配置；返回预测结果并入库。"""
+    """对下一期生成预测。"""
     if use_llm is None:
         use_llm = not config.LLM_DISABLED
     n_tickets = n_tickets or config.N_TICKETS
@@ -195,29 +234,28 @@ def predict_next(draws: List[Dict], use_llm: Optional[bool] = None,
     patterns = db.load_patterns()
     ctx = constraint_ctx(draws)
 
-    # 统计模型混合概率（等权）
+    # 统计模型混合概率（Brier 加权融合）
     bl = M.build_models(draws)
-    red_blend = sum(bl[m]["red"] for m in bl) / len(bl)
-    blue_blend = sum(bl[m]["blue"] for m in bl) / len(bl)
+    red_blend, blue_blend = _brier_blend(bl, draws)
 
     rng = random.Random()
     candidates: List[Dict] = []
 
-    # 各统计模型分别采样（体现模型多样性）
+    # 各统计模型分别采样
     for name, model in bl.items():
         for _ in range(2):
             t = sample_stat_ticket(model["red"], model["blue"], ctx, rng)
             if t:
                 t["method"] = f"stat:{name}"
                 candidates.append(t)
-    # 均匀对照（随机基线票）
+    # 均匀对照
     for _ in range(2):
         t = sample_stat_ticket(None, None, ctx, rng, uniform=True)
         if t:
             t["method"] = "uniform"
             candidates.append(t)
 
-    # LLM 候选（多模型；票据已带 llm:<模型名> 标记）
+    # LLM 候选
     llm_cands = llm_tickets(draws, stats, patterns, rng) if use_llm else []
     candidates.extend(llm_cands)
     llm_models_used = sorted({
@@ -237,12 +275,11 @@ def predict_next(draws: List[Dict], use_llm: Optional[bool] = None,
             conf = round(20 + 0.45 * (0.5 * t.get("confidence", 50) + 0.5 * em), 1)
         else:
             em = ensemble_mass(red_blend, blue_blend, t["reds"], t["blue"])
-            # 诚实校准：无显著规律证据时，置信度压低至 10-40 区间（结构分而非命中概率）
             conf = round(10 + 0.25 * em, 1)
         t["confidence"] = min(100.0, max(1.0, conf))
         scored.append(t)
 
-    # 蓝球分散：优先保证 Top-N 内蓝球不集中
+    # 蓝球分散
     scored.sort(key=lambda x: -x["confidence"])
     picked: List[Dict] = []
     blue_count = {}
@@ -272,7 +309,6 @@ def predict_next(draws: List[Dict], use_llm: Optional[bool] = None,
         "note": ("样本外回测未发现稳定显著的规律，预测仅基于统计结构的均衡建议；"
                  "置信度为模型结构分，不构成中奖概率。理性购彩。"),
     }
-    db.save_features(issue, stats) if persist else None
     if persist:
         db.save_features(issue, stats)
         db.save_predictions(issue, picked)
