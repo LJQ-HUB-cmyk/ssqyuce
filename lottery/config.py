@@ -86,5 +86,39 @@ SCHEDULER_ENABLED = os.environ.get("LOTT_SCHEDULER", "0") == "1"
 DRAW_WEEKDAYS = (1, 3, 6)  # 周一=0 … 周日=6 -> 周二/四/日
 DRAW_TIME = "21:35"
 
+
+# ---------- 运行时 LLM 配置持久化（Web 界面写入，优先于 .env） ----------
+
+LLM_CONFIG_FILE = DATA_DIR / "llm_config.json"
+
+
+def load_runtime_llm_config() -> None:
+    """启动时读取 data/llm_config.json（若存在），覆盖 LLM 通道配置。"""
+    global LLM_DISABLED, LLM_BASE_URL, LLM_API_KEY, LLM_MODEL, LLM_MODEL_LIST, LLM_SAMPLES
+    if not LLM_CONFIG_FILE.exists():
+        return
+    try:
+        with open(LLM_CONFIG_FILE, "r", encoding="utf-8") as f:
+            conf = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        print("[config] 警告：llm_config.json 解析失败，忽略运行时配置")
+        return
+    if "disabled" in conf:
+        LLM_DISABLED = bool(conf["disabled"])
+    if conf.get("base_url"):
+        LLM_BASE_URL = str(conf["base_url"]).rstrip("/") or None
+    if conf.get("api_key"):
+        LLM_API_KEY = str(conf["api_key"])
+    if conf.get("model"):
+        LLM_MODEL = str(conf["model"])
+        if LLM_MODEL not in LLM_MODEL_LIST:
+            LLM_MODEL_LIST = [LLM_MODEL] + list(LLM_MODEL_LIST)
+    if isinstance(conf.get("samples"), int) and conf["samples"] > 0:
+        LLM_SAMPLES = int(conf["samples"])
+    print(f"[config] 已加载运行时 LLM 配置（{LLM_CONFIG_FILE.name}）")
+
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 RAW_DIR.mkdir(parents=True, exist_ok=True)
+
+# 加载运行时配置（须在 DATA_DIR 创建后）
+load_runtime_llm_config()

@@ -243,7 +243,91 @@ def predictions_history(limit: int = Query(50, ge=1, le=200)):
     return out
 
 
+
+# ---------- LLM 配置管理（前台「设置」页，写入 data/llm_config.json） ----------
+
+@app.get("/api/config/llm")
+def get_llm_config():
+    from . import config
+    return {
+        "disabled": config.LLM_DISABLED,
+        "base_url": config.LLM_BASE_URL,
+        "model": config.LLM_MODEL,
+        "samples": config.LLM_SAMPLES,
+        "configured": config.llm_configured(),
+    }
+
+
+@app.post("/api/config/llm")
+def update_llm_config(payload: dict):
+    from . import config
+    import os
+    if "base_url" in payload:
+        config.LLM_BASE_URL = (payload.get("base_url") or "").strip().rstrip("/") or None
+        os.environ["LOTT_LLM_BASE_URL"] = config.LLM_BASE_URL or ""
+    if "api_key" in payload:
+        config.LLM_API_KEY = (payload.get("api_key") or "").strip() or None
+        os.environ["LOTT_LLM_API_KEY"] = config.LLM_API_KEY or ""
+    if "model" in payload:
+        config.LLM_MODEL = (payload.get("model") or "").strip() or "minimax-m3"
+        os.environ["LOTT_LLM_MODEL"] = config.LLM_MODEL
+        if config.LLM_MODEL not in config.LLM_MODEL_LIST:
+            config.LLM_MODEL_LIST = [config.LLM_MODEL] + config.LLM_MODEL_LIST
+    if "samples" in payload:
+        try:
+            config.LLM_SAMPLES = max(1, min(20, int(payload["samples"])))
+        except (TypeError, ValueError):
+            config.LLM_SAMPLES = 3
+        os.environ["LOTT_LLM_SAMPLES"] = str(config.LLM_SAMPLES)
+    if "disabled" in payload:
+        config.LLM_DISABLED = bool(payload["disabled"])
+        os.environ["LOTT_LLM_DISABLED"] = "1" if config.LLM_DISABLED else "0"
+
+    # 持久化到数据目录（挂载卷，容器重启不丢失）
+    config.LLM_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    conf = {
+        "disabled": config.LLM_DISABLED,
+        "base_url": config.LLM_BASE_URL or "",
+        "api_key": config.LLM_API_KEY or "",
+        "model": config.LLM_MODEL or "",
+        "samples": config.LLM_SAMPLES,
+    }
+    try:
+        config.LLM_CONFIG_FILE.write_text(
+            json.dumps(conf, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as e:
+        return {"ok": False, "error": f"配置写入失败: {e}"}
+    return {"ok": True, "configured": config.llm_configured()}
+
+
+
+@app.post("/api/llm/test")
+def test_llm_connection():
+    """用当前配置发起一次最小对话，验证 LLM 通道连通性。"""
+    from . import config, llm_client
+    import time
+    if config.LLM_DISABLED:
+        return {"ok": False, "error": "LLM 已停用（在设置中启用后重试）"}
+    cfgs = config.llm_model_list()
+    if not cfgs:
+        return {"ok": False, "error": "LLM 未配置（请先填写 API 地址 / Key / 模型并保存）"}
+    cfg = cfgs[0]
+    t0 = time.time()
+    try:
+        text = llm_client.chat(
+            "你是连接测试助手。", "请只回复：连接成功",
+            max_tokens=50, temperature=0.0, timeout=25, model_cfg=cfg)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"调用异常: {e}"}
+    dt_ms = int((time.time() - t0) * 1000)
+    if text:
+        return {"ok": True, "time_ms": dt_ms, "reply": text.strip()[:100]}
+    return {"ok": False, "error": "模型无返回（请检查 API 地址 / Key / 模型名）"}
+
+
 # ---------- 页面 ----------
+
+
 
 @app.get("/")
 def index():
