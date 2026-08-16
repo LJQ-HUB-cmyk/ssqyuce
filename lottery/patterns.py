@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+from collections import defaultdict, Counter
 from typing import Callable, Dict, List
 
 import numpy as np
@@ -12,6 +13,7 @@ import numpy as np
 from . import features as F
 
 REDS, BLUE = 33, 16
+_PRIMES = {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31}
 
 
 # ---------- 工具 ----------
@@ -140,12 +142,288 @@ def _t_sum_extreme(history: List[Dict]) -> bool:
     return s[-1] >= p85 or s[-1] <= p15
 
 
+# ---------- 新增规律（M1 扩展） ----------
+
+
+def _act_prime_rebound(history: List[Dict]) -> Dict:
+    if not history:
+        return {}
+    pr = sum(1 for r in history[-1]["reds"] if r in _PRIMES)
+    if pr >= 4:
+        return {"red_fav": [r for r in range(1, REDS + 1) if r not in _PRIMES]}
+    if pr <= 1:
+        return {"red_fav": [r for r in range(1, REDS + 1) if r in _PRIMES]}
+    return {}
+
+
+def _act_size_rebound(history: List[Dict]) -> Dict:
+    if not history:
+        return {}
+    small = sum(1 for r in history[-1]["reds"] if 1 <= r <= 16)
+    if small >= 4:
+        return {"red_fav": list(range(17, REDS + 1))}
+    if small <= 1:
+        return {"red_fav": list(range(1, 17))}
+    return {}
+
+
+def _act_route_rebound(history: List[Dict]) -> Dict:
+    if not history:
+        return {}
+    r0 = sum(1 for r in history[-1]["reds"] if r % 3 == 0)
+    if r0 >= 3:
+        return {"red_fav": [r for r in range(1, REDS + 1) if r % 3 != 0]}
+    if r0 <= 1:
+        return {"red_fav": [r for r in range(1, REDS + 1) if r % 3 == 0]}
+    return {}
+
+
+def _act_consecutive_groups(history: List[Dict]) -> Dict:
+    if not history:
+        return {}
+    rs = sorted(history[-1]["reds"])
+    fav = set()
+    i = 0
+    while i < len(rs):
+        j = i
+        while j + 1 < len(rs) and rs[j+1] - rs[j] == 1:
+            j += 1
+        if j > i:
+            fav.update(rs[i:j+1])
+        i = j + 1
+    return {"red_fav": sorted(fav)} if fav else {}
+
+
+def _act_tail_groups(history: List[Dict]) -> Dict:
+    if not history:
+        return {}
+    groups = defaultdict(list)
+    for r in history[-1]["reds"]:
+        groups[r % 10].append(r)
+    fav = set()
+    for nums in groups.values():
+        if len(nums) > 1:
+            fav.update(nums)
+    return {"red_fav": sorted(fav)} if fav else {}
+
+
+def _act_head_regression(history: List[Dict]) -> Dict:
+    if not history:
+        return {}
+    h = sorted(history[-1]["reds"])[0]
+    if h <= 3:
+        return {"red_fav": list(range(5, 13))}
+    if h >= 14:
+        return {"red_fav": list(range(1, 9))}
+    return {}
+
+
+def _act_tail_regression(history: List[Dict]) -> Dict:
+    if not history:
+        return {}
+    t = sorted(history[-1]["reds"])[-1]
+    if t >= 32:
+        return {"red_fav": list(range(23, 31))}
+    if t <= 22:
+        return {"red_fav": list(range(26, REDS + 1))}
+    return {}
+
+
+def _act_omit_bin_hot(history: List[Dict]) -> Dict:
+    om = F.current_omission_red(history)
+    fav = [int(i + 1) for i in range(REDS) if 6 <= om[i + 1] <= 15]
+    return {"red_fav": fav} if fav else {}
+
+
+def _act_cold_release(history: List[Dict]) -> Dict:
+    om = F.current_omission_red(history)
+    cold = [int(i + 1) for i in range(REDS) if om[i + 1] >= 20]
+    if len(cold) < 4:
+        return {}
+    sl = history[-30:] if len(history) >= 30 else history
+    hot = F.red_frequency(sl)
+    top = np.argsort(hot[1:])[-3:][::-1] + 1
+    combined = list(set(cold) | set(top.tolist()))
+    return {"red_fav": sorted(combined)[:10]}
+
+
+def _act_hot_retreat(history: List[Dict]) -> Dict:
+    if len(history) < 3:
+        return {}
+    appear = set(history[-1]["reds"]) | set(history[-2]["reds"]) | set(history[-3]["reds"])
+    return {"red_fav": [r for r in range(1, REDS + 1) if r not in appear]}
+
+
+def _act_blue_size_rebound(history: List[Dict]) -> Dict:
+    if not history:
+        return {}
+    b = history[-1]["blue"]
+    if b <= 4:
+        return {"blue_fav": list(range(9, BLUE + 1))}
+    if b >= 13:
+        return {"blue_fav": list(range(1, 8))}
+    return {}
+
+
+def _act_blue_odd_rebound(history: List[Dict]) -> Dict:
+    if not history:
+        return {}
+    b = history[-1]["blue"]
+    if b % 2 == 1:
+        return {"blue_fav": [x for x in range(1, BLUE + 1) if x % 2 == 0]}
+    return {"blue_fav": [x for x in range(1, BLUE + 1) if x % 2 == 1]}
+
+
+def _act_blue_route_rebound(history: List[Dict]) -> Dict:
+    if not history:
+        return {}
+    b = history[-1]["blue"]
+    r = b % 3
+    fav = [x for x in range(1, BLUE + 1) if x % 3 != r]
+    return {"blue_fav": fav}
+
+
+def _act_blue_omit_bin(history: List[Dict]) -> Dict:
+    om = F.current_omission_blue(history)
+    fav = [int(i + 1) for i in range(BLUE) if 5 <= om[i + 1] <= 10]
+    return {"blue_fav": fav} if fav else {}
+
+
+def _act_diagonal(history: List[Dict]) -> Dict:
+    if len(history) < 2:
+        return {}
+    prev2 = history[-2]["reds"]
+    fav = set()
+    for r in prev2:
+        if r - 1 >= 1:
+            fav.add(r - 1)
+        if r + 1 <= REDS:
+            fav.add(r + 1)
+    return {"red_fav": sorted(fav)} if fav else {}
+
+
+def _act_gap(history: List[Dict]) -> Dict:
+    if not history:
+        return {}
+    last = history[-1]["reds"]
+    fav = set()
+    for r in last:
+        if r - 2 >= 1:
+            fav.add(r - 2)
+        if r + 2 <= REDS:
+            fav.add(r + 2)
+    return {"red_fav": sorted(fav)} if fav else {}
+
+
+def _act_repeat_by_count(history: List[Dict]) -> Dict:
+    if len(history) < 2:
+        return {}
+    rp = len(set(history[-2]["reds"]) & set(history[-1]["reds"]))
+    if rp == 0:
+        return {"red_fav": list(history[-1]["reds"])}
+    if rp >= 2:
+        return {"red_fav": [r for r in range(1, REDS + 1) if r not in history[-1]["reds"]]}
+    return {}
+
+
+def _act_pair_cooccur(history: List[Dict]) -> Dict:
+    if len(history) < 50:
+        return {}
+    sl = history[-50:]
+    pairs = Counter()
+    for d in sl:
+        rs = sorted(d["reds"])
+        for i in range(len(rs)):
+            for j in range(i + 1, len(rs)):
+                pairs[(rs[i], rs[j])] += 1
+    top_pairs = [p for p, _ in pairs.most_common(3)]
+    fav = set()
+    for a, b in top_pairs:
+        fav.add(a)
+        fav.add(b)
+    return {"red_fav": sorted(fav)} if fav else {}
+
+
+# ---------- 新增触发器 ----------
+
+
+def _t_prime_extreme(history: List[Dict]) -> bool:
+    if len(history) < 30:
+        return False
+    pr = F.prime_counts(history)
+    return float(pr[-1]) >= 4 or float(pr[-1]) <= 1
+
+
+def _t_size_extreme(history: List[Dict]) -> bool:
+    if len(history) < 30:
+        return False
+    sz = F.size_counts(history)
+    return float(sz[-1]) >= 4 or float(sz[-1]) <= 1
+
+
+def _t_route_extreme(history: List[Dict]) -> bool:
+    if len(history) < 30:
+        return False
+    rt = F.route_counts(history)
+    return float(rt[-1]) >= 3 or float(rt[-1]) <= 1
+
+
+def _t_head_extreme(history: List[Dict]) -> bool:
+    if len(history) < 30:
+        return False
+    fl = F.first_last_reds(history)
+    return int(fl[-1, 0]) <= 3 or int(fl[-1, 0]) >= 14
+
+
+def _t_tail_extreme(history: List[Dict]) -> bool:
+    if len(history) < 30:
+        return False
+    fl = F.first_last_reds(history)
+    return int(fl[-1, 1]) >= 32 or int(fl[-1, 1]) <= 22
+
+
+def _t_cold_pool(history: List[Dict]) -> bool:
+    om = F.current_omission_red(history)
+    return int(np.sum(om[1:] >= 20)) >= 4
+
+
+def _t_hot_streak(history: List[Dict]) -> bool:
+    if len(history) < 3:
+        return False
+    s1 = set(history[-1]["reds"])
+    s2 = set(history[-2]["reds"])
+    s3 = set(history[-3]["reds"])
+    return bool(s1 & s2 & s3)
+
+
+def _t_blue_size_extreme(history: List[Dict]) -> bool:
+    if not history:
+        return False
+    b = history[-1]["blue"]
+    return b <= 4 or b >= 13
+
+
+def _t_blue_odd_extreme(history: List[Dict]) -> bool:
+    if not history:
+        return False
+    return history[-1]["blue"] % 2 != 0
+
+
+def _t_repeat_count(history: List[Dict]) -> bool:
+    if len(history) < 2:
+        return False
+    rp = len(set(history[-2]["reds"]) & set(history[-1]["reds"]))
+    return rp == 0 or rp >= 2
+
+
+# ---------- 规律清单 ----------
+
 PATTERNS: List[Dict] = [
     {
         "key": "blue_cold_back",
         "name_zh": "蓝球冷号回补",
         "kind": "long",
-        "desc": "蓝球遗漏 ≥20 期后，下一期（或数期内）出现概率是否高于均匀基线 1/16",
+        "desc": "蓝球遗漏 >=20 期后，下一期（或数期内）出现概率是否高于均匀基线 1/16",
         "horizon": 1,
         "trigger_fn": _t_always,
         "action_fn": _act_blue_cold_back,
@@ -156,7 +434,7 @@ PATTERNS: List[Dict] = [
         "key": "red_freq_reversion",
         "name_zh": "红球频率均值回归",
         "kind": "long",
-        "desc": "长期频率显著低于期望(z≤-2)的红球，下一期是否补出",
+        "desc": "长期频率显著低于期望(z<=-2)的红球，下一期是否补出",
         "horizon": 1,
         "trigger_fn": _t_always,
         "action_fn": _act_red_freq_reversion,
@@ -167,7 +445,7 @@ PATTERNS: List[Dict] = [
         "key": "red_omission_pressure",
         "name_zh": "红球遗漏压力",
         "kind": "long",
-        "desc": "遗漏≥25 且超过自身平均遗漏 1.5 倍的红球，下一期是否回补",
+        "desc": "遗漏>=25 且超过自身平均遗漏 1.5 倍的红球，下一期是否回补",
         "horizon": 1,
         "trigger_fn": _t_always,
         "action_fn": _act_red_omission_pressure,
@@ -189,7 +467,7 @@ PATTERNS: List[Dict] = [
         "key": "parity_rebound",
         "name_zh": "奇偶比例回归",
         "kind": "mid",
-        "desc": "上期奇数≥4 选偶数、上期奇数≤2 选奇数，验证奇偶是否轮动",
+        "desc": "上期奇数>=4 选偶数、上期奇数<=2 选奇数，验证奇偶是否轮动",
         "horizon": 1,
         "trigger_fn": _t_always,
         "action_fn": _act_parity_rebound,
@@ -211,7 +489,7 @@ PATTERNS: List[Dict] = [
         "key": "repeat_trend",
         "name_zh": "重号延续",
         "kind": "short",
-        "desc": "上期 6 个红球在下一期复出数量是否高于随机期望 6*6/33≈1.09",
+        "desc": "上期 6 个红球在下一期复出数量是否高于随机期望 6*6/33~1.09",
         "horizon": 1,
         "trigger_fn": _t_always,
         "action_fn": _act_repeat,
@@ -222,7 +500,7 @@ PATTERNS: List[Dict] = [
         "key": "adjacent_trend",
         "name_zh": "邻号延续",
         "kind": "short",
-        "desc": "上期红球±1 邻号、蓝球±1 邻号在下一期命中是否高于随机",
+        "desc": "上期红球+/-1 邻号、蓝球+/-1 邻号在下一期命中是否高于随机",
         "horizon": 1,
         "trigger_fn": _t_always,
         "action_fn": _act_adjacent,
@@ -261,6 +539,205 @@ PATTERNS: List[Dict] = [
         "action_fn": lambda h: {"blue_fav": [h[-1]["blue"]]} if h else {},
         "outcome": "blue_fav",
         "base_fn": blue_base,
+    },
+    # ----- M1 新增规律 -----
+    {
+        "key": "prime_rebound",
+        "name_zh": "质合比轮动",
+        "kind": "mid",
+        "desc": "上期质数>=4 选合数、<=1 选质数，验证质合是否轮动",
+        "horizon": 1,
+        "trigger_fn": _t_prime_extreme,
+        "action_fn": _act_prime_rebound,
+        "outcome": "red_fav",
+        "base_fn": red_base,
+    },
+    {
+        "key": "size_rebound",
+        "name_zh": "大小比轮动",
+        "kind": "mid",
+        "desc": "上期小号(1-16)>=4 选大号、<=1 选小号",
+        "horizon": 1,
+        "trigger_fn": _t_size_extreme,
+        "action_fn": _act_size_rebound,
+        "outcome": "red_fav",
+        "base_fn": red_base,
+    },
+    {
+        "key": "route_rebound",
+        "name_zh": "012路比轮动",
+        "kind": "mid",
+        "desc": "上期0路(被3整除)>=3 选非0路、<=1 选0路",
+        "horizon": 1,
+        "trigger_fn": _t_route_extreme,
+        "action_fn": _act_route_rebound,
+        "outcome": "red_fav",
+        "base_fn": red_base,
+    },
+    {
+        "key": "consecutive_groups",
+        "name_zh": "连号组延续",
+        "kind": "short",
+        "desc": "上期连号组内号码在下一期复出的概率",
+        "horizon": 1,
+        "trigger_fn": _t_always,
+        "action_fn": _act_consecutive_groups,
+        "outcome": "red_fav",
+        "base_fn": red_base,
+    },
+    {
+        "key": "tail_groups",
+        "name_zh": "同尾组延续",
+        "kind": "short",
+        "desc": "上期同尾组内号码在下一期复出的概率",
+        "horizon": 1,
+        "trigger_fn": _t_always,
+        "action_fn": _act_tail_groups,
+        "outcome": "red_fav",
+        "base_fn": red_base,
+    },
+    {
+        "key": "head_regression",
+        "name_zh": "龙头回归",
+        "kind": "mid",
+        "desc": "龙头(最小红)<=3 或 >=14 时向均值回归选号",
+        "horizon": 1,
+        "trigger_fn": _t_head_extreme,
+        "action_fn": _act_head_regression,
+        "outcome": "red_fav",
+        "base_fn": red_base,
+    },
+    {
+        "key": "tail_regression",
+        "name_zh": "凤尾回归",
+        "kind": "mid",
+        "desc": "凤尾(最大红)>=32 或 <=22 时向均值回归选号",
+        "horizon": 1,
+        "trigger_fn": _t_tail_extreme,
+        "action_fn": _act_tail_regression,
+        "outcome": "red_fav",
+        "base_fn": red_base,
+    },
+    {
+        "key": "omit_bin_hot",
+        "name_zh": "遗漏适中区间热点",
+        "kind": "short",
+        "desc": "当前遗漏在 6-15 区间的红球是否即将回补",
+        "horizon": 1,
+        "trigger_fn": _t_always,
+        "action_fn": _act_omit_bin_hot,
+        "outcome": "red_fav",
+        "base_fn": red_base,
+    },
+    {
+        "key": "cold_release",
+        "name_zh": "冷号集中释放",
+        "kind": "short",
+        "desc": "冷号池(遗漏>=20)>=4 个时，未来 2 期是否集中爆发",
+        "horizon": 2,
+        "trigger_fn": _t_cold_pool,
+        "action_fn": _act_cold_release,
+        "outcome": "red_fav",
+        "base_fn": red_base,
+    },
+    {
+        "key": "hot_retreat",
+        "name_zh": "超热退潮",
+        "kind": "short",
+        "desc": "连热3期的号码停止热出，应排除",
+        "horizon": 1,
+        "trigger_fn": _t_hot_streak,
+        "action_fn": _act_hot_retreat,
+        "outcome": "red_fav",
+        "base_fn": red_base,
+    },
+    {
+        "key": "blue_size_rebound",
+        "name_zh": "蓝球大小轮动",
+        "kind": "short",
+        "desc": "上期蓝<=4 选大号 9-16、>=13 选小号 1-8",
+        "horizon": 1,
+        "trigger_fn": _t_blue_size_extreme,
+        "action_fn": _act_blue_size_rebound,
+        "outcome": "blue_fav",
+        "base_fn": blue_base,
+    },
+    {
+        "key": "blue_odd_rebound",
+        "name_zh": "蓝球奇偶轮动",
+        "kind": "short",
+        "desc": "上期蓝奇则选偶、偶则选奇",
+        "horizon": 1,
+        "trigger_fn": _t_blue_odd_extreme,
+        "action_fn": _act_blue_odd_rebound,
+        "outcome": "blue_fav",
+        "base_fn": blue_base,
+    },
+    {
+        "key": "blue_route_rebound",
+        "name_zh": "蓝球012路轮动",
+        "kind": "short",
+        "desc": "上期蓝 mod 3 的余数对应的路别轮动",
+        "horizon": 1,
+        "trigger_fn": _t_always,
+        "action_fn": _act_blue_route_rebound,
+        "outcome": "blue_fav",
+        "base_fn": blue_base,
+    },
+    {
+        "key": "blue_omit_bin",
+        "name_zh": "蓝球遗漏适中区间",
+        "kind": "short",
+        "desc": "当前遗漏在 5-10 区间的蓝球是否即将回补",
+        "horizon": 1,
+        "trigger_fn": _t_always,
+        "action_fn": _act_blue_omit_bin,
+        "outcome": "blue_fav",
+        "base_fn": blue_base,
+    },
+    {
+        "key": "diagonal",
+        "name_zh": "斜连号延续",
+        "kind": "short",
+        "desc": "上上期号码 +/-1 邻号在下一期命中",
+        "horizon": 1,
+        "trigger_fn": _t_always,
+        "action_fn": _act_diagonal,
+        "outcome": "red_fav",
+        "base_fn": red_base,
+    },
+    {
+        "key": "gap_number",
+        "name_zh": "间隔号延续",
+        "kind": "short",
+        "desc": "上期号码 +/-2 间隔号在下一期命中",
+        "horizon": 1,
+        "trigger_fn": _t_always,
+        "action_fn": _act_gap,
+        "outcome": "red_fav",
+        "base_fn": red_base,
+    },
+    {
+        "key": "repeat_by_count",
+        "name_zh": "重号个数条件分布",
+        "kind": "mid",
+        "desc": "上期重0个 fav 上期号码(期待回补)；重>=2个则 exclude",
+        "horizon": 1,
+        "trigger_fn": _t_repeat_count,
+        "action_fn": _act_repeat_by_count,
+        "outcome": "red_fav",
+        "base_fn": red_base,
+    },
+    {
+        "key": "pair_cooccur",
+        "name_zh": "号码对共现",
+        "kind": "short",
+        "desc": "近50期最常共现的 top-3 对中的号码",
+        "horizon": 1,
+        "trigger_fn": _t_always,
+        "action_fn": _act_pair_cooccur,
+        "outcome": "red_fav",
+        "base_fn": red_base,
     },
 ]
 

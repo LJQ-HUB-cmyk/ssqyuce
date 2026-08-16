@@ -113,6 +113,96 @@ def ac_value(reds: List[int]) -> int:
     return len(diffs) - (len(rs) - 1)
 
 
+def span(draws: List[Dict]) -> np.ndarray:
+    """每期红球跨度 = max(reds) - min(reds)。"""
+    return np.array([max(d["reds"]) - min(d["reds"]) for d in draws], dtype=float)
+
+
+_PRIMES = {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31}
+
+
+def prime_counts(draws: List[Dict]) -> np.ndarray:
+    """每期红球中质数个数。"""
+    return np.array([sum(1 for r in d["reds"] if r in _PRIMES) for d in draws], dtype=float)
+
+
+def size_counts(draws: List[Dict]) -> np.ndarray:
+    """每期红球中小号(1-16)个数。"""
+    return np.array([sum(1 for r in d["reds"] if 1 <= r <= 16) for d in draws], dtype=float)
+
+
+def route_counts(draws: List[Dict]) -> np.ndarray:
+    """每期红球中0路(能被3整除)个数。"""
+    return np.array([sum(1 for r in d["reds"] if r % 3 == 0) for d in draws], dtype=float)
+
+
+def consecutive_groups_count(draws: List[Dict]) -> float:
+    """所有期数中共现的连号组数的均值（与 consecutive_rate 互补）。"""
+    if not draws:
+        return 0.0
+    total = 0
+    for d in draws:
+        rs = sorted(d["reds"])
+        i = 0
+        while i < len(rs):
+            j = i
+            while j + 1 < len(rs) and rs[j+1] - rs[j] == 1:
+                j += 1
+            if j > i:
+                total += 1
+            i = j + 1
+    return total / len(draws)
+
+
+def tail_groups_count(draws: List[Dict]) -> float:
+    """所有期数中共现的同尾数组数比例。"""
+    if not draws:
+        return 0.0
+    total = 0
+    for d in draws:
+        from collections import Counter
+        tails = Counter(r % 10 for r in d["reds"])
+        total += sum(1 for v in tails.values() if v > 1)
+    return total / len(draws)
+
+
+def first_last_reds(draws: List[Dict]) -> np.ndarray:
+    """每期龙头(r1) / 凤尾(r6) 组成的 (n, 2) 数组。"""
+    out = np.zeros((len(draws), 2), dtype=int)
+    for i, d in enumerate(draws):
+        rs = sorted(d["reds"])
+        out[i] = [rs[0], rs[-1]]
+    return out
+
+
+def omit_bin_distribution(draws: List[Dict]) -> Dict:
+    """按当前遗漏长度分组的号码数统计：{0-5, 6-10, 11-15, 16-20, 21+}。"""
+    om = current_omission_red(draws)
+    bins = {"0-5": 0, "6-10": 0, "11-15": 0, "16-20": 0, "21+": 0}
+    for i in range(1, R_MAX + 1):
+        v = int(om[i])
+        if v <= 5:
+            bins["0-5"] += 1
+        elif v <= 10:
+            bins["6-10"] += 1
+        elif v <= 15:
+            bins["11-15"] += 1
+        elif v <= 20:
+            bins["16-20"] += 1
+        else:
+            bins["21+"] += 1
+    return bins
+
+
+def window_features(draws: List[Dict], window_sizes=(5, 10, 20, 30, 50, 150)) -> Dict:
+    """多窗口频率矩阵：{窗口名: freq数组(34,)}。"""
+    out = {}
+    for w in window_sizes:
+        sl = window_slice(draws, w)
+        out[f"freq_{w}"] = red_frequency(sl)
+    return out
+
+
 # ---------- 汇总 ----------
 
 def window_slice(draws: List[Dict], window: int):
@@ -133,6 +223,14 @@ def red_stats(draws: List[Dict]) -> Dict:
     for z in zc:
         zc_hist[z] = zc_hist.get(z, 0) + 1
     rc = repeat_counts(draws)
+    sp = span(draws)
+    pr = prime_counts(draws)
+    sz = size_counts(draws)
+    rt = route_counts(draws)
+    cg = consecutive_groups_count(draws)
+    tg = tail_groups_count(draws)
+    fl = first_last_reds(draws)
+    ob = omit_bin_distribution(draws)
     return {
         "n_draws": n,
         "freq": freq[1:].tolist(),
@@ -151,6 +249,15 @@ def red_stats(draws: List[Dict]) -> Dict:
         "hot_top6": [int(x) for x in np.argsort(freq[1:])[-6:][::-1] + 1],
         "cold_top6": [int(x) for x in np.argsort(freq[1:])[:6] + 1],
         "omit_top6": [int(x) for x in np.argsort(om_cur[1:])[-6:][::-1] + 1],
+        "span_mean": float(np.mean(sp)) if len(sp) else 0,
+        "span_std": float(np.std(sp)) if len(sp) else 0,
+        "prime_mean": float(np.mean(pr)) if len(pr) else 0,
+        "size_mean": float(np.mean(sz)) if len(sz) else 0,
+        "route_mean": float(np.mean(rt)) if len(rt) else 0,
+        "consecutive_groups_mean": cg,
+        "tail_groups_mean": tg,
+        "first_last": [{"first": int(fl[i, 0]), "last": int(fl[i, 1])} for i in range(len(fl))[-10:]] if len(fl) else [],
+        "omit_bins": ob,
     }
 
 

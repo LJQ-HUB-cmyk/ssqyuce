@@ -93,6 +93,13 @@ def cmd_serve(args):
     uvicorn.run("lottery.api_app:app", host=args.host, port=port, log_level="info")
 
 
+
+def cmd_mine(args):
+    from . import mining
+    draws = _draws()
+    res = mining.run_mining(draws, min_start=args.min_start)
+    print(json.dumps(res, ensure_ascii=False, indent=2))
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="lottery", description="双色球智能预测分析系统")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -107,6 +114,8 @@ def main(argv=None):
     oe.add_argument("--issues", type=int, default=120)
     oe.add_argument("-n", type=int, default=10)
     sub.add_parser("online_check", help="在线预测对照评估")
+    m = sub.add_parser("mine", help="运行规律自动挖掘管道")
+    m.add_argument("--min-start", type=int, default=300)
     s = sub.add_parser("serve", help="启动 Web 服务（默认端口 18000，可用 PORT 环境变量覆盖）")
     s.add_argument("--host", default="0.0.0.0")
     s.add_argument("--port", type=int, default=None)

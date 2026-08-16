@@ -262,6 +262,8 @@ def predict_next(draws: List[Dict], use_llm: Optional[bool] = None,
         "tickets": picked,
         "llm_used": use_llm and bool(llm_cands),
         "llm_models": llm_models_used,
+        "red_probs": red_blend.tolist(),
+        "blue_probs": blue_blend.tolist(),
         "patterns_summary": {
             "A": sum(1 for p in patterns if p["grade"] == "A"),
             "B": sum(1 for p in patterns if p["grade"] == "B"),

@@ -70,6 +70,17 @@ CREATE TABLE IF NOT EXISTS eval_results (
   ticket_count INTEGER DEFAULT 0,
   created_at REAL
 );
+
+CREATE TABLE IF NOT EXISTS tasks (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,           -- predict / backtest / eval / mine
+  status TEXT DEFAULT 'pending',-- pending / running / completed / failed
+  progress REAL DEFAULT 0.0,
+  message TEXT DEFAULT '',
+  result_json TEXT DEFAULT '',
+  created_at REAL,
+  updated_at REAL
+);
 """
 
 _CONN: sqlite3.Connection | None = None
@@ -272,3 +283,68 @@ def save_eval(issue: str, red_hits: int, blue_hit: int, reward: float, ticket_co
 def load_eval() -> List[Dict]:
     rows = get_conn().execute("SELECT * FROM eval_results ORDER BY issue").fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------- tasks ----------
+
+def create_task(task_id: str, kind: str) -> None:
+    now = time.time()
+    get_conn().execute(
+        "INSERT INTO tasks (id, kind, status, progress, message, created_at, updated_at)
+         VALUES (?,?,?,?,?,?,?)",
+        (task_id, kind, "pending", 0.0, "", now, now),
+    )
+    get_conn().commit()
+
+
+def update_task(task_id: str, status: str, progress: float, message: str) -> None:
+    get_conn().execute(
+        "UPDATE tasks SET status=?, progress=?, message=?, updated_at=? WHERE id=?",
+        (status, float(progress), message, time.time(), task_id),
+    )
+    get_conn().commit()
+
+
+def complete_task(task_id: str, result_json: str) -> None:
+    get_conn().execute(
+        "UPDATE tasks SET status='completed', progress=1.0, result_json=?, updated_at=? WHERE id=?",
+        (result_json, time.time(), task_id),
+    )
+    get_conn().commit()
+
+
+def fail_task(task_id: str, message: str) -> None:
+    get_conn().execute(
+        "UPDATE tasks SET status='failed', message=?, updated_at=? WHERE id=?",
+        (message, time.time(), task_id),
+    )
+    get_conn().commit()
+
+
+def load_task(task_id: str) -> Optional[Dict]:
+    row = get_conn().execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    if d.get("result_json"):
+        try:
+            d["result"] = json.loads(d["result_json"])
+        except Exception:
+            pass
+    return d
+
+
+def list_tasks(limit: int = 20) -> List[Dict]:
+    rows = get_conn().execute(
+        "SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?", (int(limit),)
+    ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        if d.get("result_json"):
+            try:
+                d["result"] = json.loads(d["result_json"])
+            except Exception:
+                pass
+        out.append(d)
+    return out

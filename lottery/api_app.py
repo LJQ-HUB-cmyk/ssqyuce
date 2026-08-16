@@ -1,6 +1,7 @@
 """FastAPI 应用：REST API + 静态单页前端。"""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -10,9 +11,9 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import config, data_fetcher, db
-from . import features as F
+from . import features as F, diagnose as D, mining as M
 
-app = FastAPI(title="双色球智能预测分析系统", version="0.4.0")
+app = FastAPI(title="双色球智能预测分析系统", version="0.5.0")
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
@@ -151,6 +152,95 @@ def eval_backtest(issues: int = Query(120), n: int = Query(10)):
 def eval_online():
     from . import evaluate
     return evaluate.online_check()
+
+
+# ---------- 任务系统 ----------
+
+@app.get("/api/tasks")
+def list_tasks(limit: int = Query(20, ge=1, le=100)):
+    return db.list_tasks(limit)
+
+
+@app.get("/api/tasks/{task_id}")
+def get_task(task_id: str):
+    t = db.load_task(task_id)
+    if t is None:
+        return JSONResponse({"ok": False, "error": "task not found"}, status_code=404)
+    return t
+
+
+# ---------- 诊断 ----------
+
+@app.get("/api/diagnose")
+def diagnose_endpoint(
+    reds: str = Query(..., description="逗号分隔的6个红球，如 1,4,7,12,28,31"),
+    blue: int = Query(..., ge=1, le=16),
+):
+    try:
+        r_list = [int(x) for x in reds.split(",")]
+    except ValueError:
+        return JSONResponse({"ok": False, "error": "reds 必须是逗号分隔的整数"}, status_code=400)
+    if len(r_list) != 6 or len(set(r_list)) != 6:
+        return JSONResponse({"ok": False, "error": "必须恰好 6 个不重复红球"}, status_code=400)
+    draws = db.load_draws()
+    if not draws:
+        return JSONResponse({"ok": False, "error": "暂无数据"}, status_code=400)
+    return D.diagnose(r_list, blue, draws)
+
+
+# ---------- 挖掘 ----------
+
+@app.post("/api/mining/run")
+def run_mining(min_start: int = Query(300, ge=120, le=1000)):
+    from . import backtest as BT
+    import uuid
+    task_id = f"mine_{uuid.uuid4().hex[:8]}"
+    draws = db.load_draws()
+    if not draws:
+        return JSONResponse({"ok": False, "error": "暂无数据"}, status_code=400)
+    db.create_task(task_id, "mine")
+    # 同步执行（挖掘较快，通常 <10s）
+    try:
+        db.update_task(task_id, "running", 0.1, "正在计算特征...")
+        result = M.run_mining(draws, min_start=min_start, save_to_db=True)
+        db.update_task(task_id, "completed", 1.0, "完成")
+        db.complete_task(task_id, json.dumps(result, ensure_ascii=False))
+        # 同时刷新规律列表
+        BT.run_all_backtests(draws, min_start=min_start)
+        return {"ok": True, "task_id": task_id, "result": result}
+    except Exception as e:
+        db.fail_task(task_id, str(e))
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.get("/api/mining/latest")
+def get_latest_mining():
+    return M.get_latest_mining_result() or {"status": "none"}
+
+
+# ---------- 历史预测 ----------
+
+@app.get("/api/predictions/history")
+def predictions_history(limit: int = Query(50, ge=1, le=200)):
+    issues = db.recent_prediction_issues(limit)
+    draws_map = {d["issue"]: d for d in db.load_draws()}
+    out = []
+    for issue in issues:
+        preds = db.load_predictions(issue)
+        actual = draws_map.get(issue)
+        if actual and preds:
+            from . import evaluate
+            res = evaluate.tickets_result(preds, actual)
+            out.append({
+                "issue": issue,
+                "date": actual["date"],
+                "actual": {"reds": actual["reds"], "blue": actual["blue"]},
+                "predictions": preds,
+                "result": res,
+            })
+        elif preds:
+            out.append({"issue": issue, "predictions": preds})
+    return out
 
 
 # ---------- 页面 ----------
