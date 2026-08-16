@@ -10,6 +10,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+class _NoCacheStaticFiles(StaticFiles):
+    """静态资源禁用缓存，确保前端更新后浏览器立即拿到新版。"""
+    def file_response(self, *args, **kwargs):
+        resp = super().file_response(*args, **kwargs)
+        resp.headers["Cache-Control"] = "no-store, max-age=0"
+        return resp
+
 from . import config, data_fetcher, db
 from . import features as F, diagnose as D, mining as M
 
@@ -22,7 +29,7 @@ WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 STATIC_DIR = WEB_DIR / "static"
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
 
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+app.mount("/static", _NoCacheStaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 # ---------- 数据 ----------
@@ -331,7 +338,9 @@ def test_llm_connection():
 
 @app.get("/")
 def index():
-    return FileResponse(WEB_DIR / "index.html")
+    resp = FileResponse(WEB_DIR / "index.html")
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    return resp
 
 
 # ---------- 开奖日自动调度（可选，LOTT_SCHEDULER=1） ----------
