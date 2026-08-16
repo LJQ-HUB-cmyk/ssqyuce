@@ -152,6 +152,26 @@ def compact_stats(stats: dict) -> dict:
     return d
 
 
+
+def critique_prompt(stats_json, recent, patterns, observations, tickets):
+    """第3轮：质疑选号"""
+    return (
+        "你是双色球数据分析的批判者。请审查以下选号：\n"
+        "统计报告: " + json.dumps(stats_json, ensure_ascii=False)[:400] + "\n"
+        "候选号码: " + json.dumps(tickets[:5], ensure_ascii=False) + "\n"
+        "请找出问题并输出JSON: {"issues": [...], "suggestions": [...], "red_flag": bool}"
+    )
+
+def refine_prompt(stats_json, critique, tickets):
+    """第3轮：基于批判意见优化"""
+    return (
+        "基于批判意见优化选号：\n"
+        "批判意见: " + json.dumps(critique, ensure_ascii=False)[:400] + "\n"
+        "原始选号: " + json.dumps(tickets[:3], ensure_ascii=False) + "\n"
+        '输出: {"refined_tickets": [{"reds": [...], "blue": N, "confidence": N, "changes": "..."}]}'
+    )
+
+
 SYSTEM_BASE = (
     "你是双色球数据分析助手。双色球每期从1-33中摇出6个红球、从1-16中摇出1个蓝球，"
     "开奖在理论上是独立随机事件。你的任务是：基于给定的统计报告与历史走势，"
