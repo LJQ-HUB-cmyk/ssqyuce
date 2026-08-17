@@ -376,6 +376,9 @@ def train_blue_models(
 
 _ML_CACHE: Dict[str, Dict] = {}
 _CACHE_LOCK = threading.Lock()
+_TRAIN_EVENT: Optional[threading.Event] = None
+_TRAIN_KEY: Optional[str] = None
+_TRAIN_LOCK = threading.Lock()
 
 
 def _cache_key(draws: List[Dict]) -> Optional[str]:
@@ -384,8 +387,27 @@ def _cache_key(draws: List[Dict]) -> Optional[str]:
     return f"{len(draws)}:{draws[-1]['issue']}"
 
 
+def ml_peek(draws: List[Dict]) -> Optional[Dict]:
+    """非阻塞查看缓存（从不触发训练）。"""
+    key = _cache_key(draws)
+    if key is None:
+        return None
+    with _CACHE_LOCK:
+        return _ML_CACHE.get(key)
+
+
+def ml_training_in_progress() -> bool:
+    with _TRAIN_LOCK:
+        return _TRAIN_EVENT is not None
+
+
 def get_ml_models(draws: List[Dict], force: bool = False) -> Optional[Dict]:
-    """返回 {"red":..., "blue":..., "key":..., "ready": bool}，数据变化时自动重训。"""
+    """返回 {"red":..., "blue":..., "key":..., "ready": bool}。
+
+    数据版本未变则命中缓存；多个调用方并发训练时只训一次，
+    其余线程等待同一训练完成后直接读缓存。
+    """
+    global _TRAIN_EVENT, _TRAIN_KEY
     if not HAS_SKLEARN or not config.ML_ENABLED:
         return None
     key = _cache_key(draws)
@@ -394,28 +416,62 @@ def get_ml_models(draws: List[Dict], force: bool = False) -> Optional[Dict]:
     with _CACHE_LOCK:
         if not force and key in _ML_CACHE:
             return _ML_CACHE[key]
-        if not force and "error" in _ML_CACHE and _ML_CACHE["error"].get("key") == key:
+        if not force and _ML_CACHE.get("error", {}).get("key") == key:
             return None
-    red = train_red_models(draws)
-    blue = train_blue_models(draws)
-    if red is None:
+
+    # 已有同 key 训练在进行：等待其完成
+    with _TRAIN_LOCK:
+        wait_ev = _TRAIN_EVENT if (_TRAIN_EVENT is not None and _TRAIN_KEY == key) else None
+    if wait_ev is not None:
+        wait_ev.wait()
         with _CACHE_LOCK:
-            _ML_CACHE["error"] = {"key": key, "reason": "数据不足"}
+            if key in _ML_CACHE:
+                return _ML_CACHE[key]
         return None
-    entry = {
-        "red": red, "blue": blue, "key": key,
-        "trained_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "red_brier": round(float(np.mean([m["brier_cal"]
-                                          for m in red["metrics"].values()])), 4)
-        if red["metrics"] else None,
-        "blue_brier": round(float(np.mean([m["brier_cal"]
-                                           for m in blue["metrics"].values()])), 4)
-        if blue and blue["metrics"] else None,
-    }
-    with _CACHE_LOCK:
-        _ML_CACHE.clear()
-        _ML_CACHE[key] = entry
-    return entry
+
+    # 抢到训练权
+    ev = threading.Event()
+    with _TRAIN_LOCK:
+        if _TRAIN_EVENT is not None and _TRAIN_KEY == key:
+            wait_ev = _TRAIN_EVENT
+            _TRAIN_EVENT = None  # 本线程不重复训练
+        else:
+            wait_ev = None
+            _TRAIN_EVENT = ev
+            _TRAIN_KEY = key
+    if wait_ev is not None:
+        wait_ev.wait()
+        with _CACHE_LOCK:
+            if key in _ML_CACHE:
+                return _ML_CACHE[key]
+        return None
+
+    try:
+        red = train_red_models(draws)
+        blue = train_blue_models(draws)
+        if red is None:
+            with _CACHE_LOCK:
+                _ML_CACHE["error"] = {"key": key, "reason": "数据不足"}
+            return None
+        entry = {
+            "red": red, "blue": blue, "key": key,
+            "trained_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "red_brier": round(float(np.mean([m["brier_cal"]
+                                              for m in red["metrics"].values()])), 4)
+            if red["metrics"] else None,
+            "blue_brier": round(float(np.mean([m["brier_cal"]
+                                               for m in blue["metrics"].values()])), 4)
+            if blue and blue["metrics"] else None,
+        }
+        with _CACHE_LOCK:
+            _ML_CACHE.clear()
+            _ML_CACHE[key] = entry
+        return entry
+    finally:
+        with _TRAIN_LOCK:
+            _TRAIN_EVENT = None
+            _TRAIN_KEY = None
+        ev.set()
 
 
 def ml_status(draws: List[Dict]) -> Dict:
@@ -424,10 +480,10 @@ def ml_status(draws: List[Dict]) -> Dict:
         return {"enabled": False, "sklearn": False, "reason": "scikit-learn 未安装"}
     if not config.ML_ENABLED:
         return {"enabled": False, "sklearn": True, "reason": "LOTT_ML_ENABLED=0"}
-    entry = get_ml_models(draws)
+    entry = ml_peek(draws)
     if entry is None:
-        return {"enabled": True, "sklearn": True, "ready": False,
-                "reason": "历史数据不足或训练尚未完成"}
+        reason = "后台训练中…" if ml_training_in_progress() else "尚未训练（首个预测请求自动触发）"
+        return {"enabled": True, "sklearn": True, "ready": False, "reason": reason}
     return {
         "enabled": True, "sklearn": True, "ready": True,
         "key": entry["key"], "trained_at": entry["trained_at"],
