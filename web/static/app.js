@@ -786,10 +786,10 @@ async function initMlStatus() {
 async function runMlEval() {
   const btn = $("#btnMlEval");
   const st = $("#mlEvalStatus");
-  if (st) st.innerHTML = '<span class="errtxt">⏳ 滚动评估中（1~3 分钟）…</span>';
+  if (st) st.innerHTML = '<span class="errtxt">⏳ 滚动评估中（约 2~5 分钟）…</span>';
   if (btn) btn.disabled = true;
   try {
-    const r = await api("/api/ml/eval?window=60&refit_every=10", {method:"POST"});
+    const r = await api("/api/ml/eval?window=30&refit_every=15", {method:"POST"});
     if (!r.ok) { if (st) st.innerHTML = '<span class="errtxt">✗ ' + escHtml(r.error || "评估失败") + '</span>'; return; }
     renderMlEval(r);
     if (st) st.innerHTML = '<span class="oktxt">✓ 完成（' + r.seconds + 's）</span>';

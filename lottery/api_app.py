@@ -342,18 +342,19 @@ def ml_status():
 
 
 @app.post("/api/ml/eval")
-def ml_eval(window: int = Query(60, ge=10, le=200),
-            refit_every: int = Query(10, ge=1, le=50)):
+def ml_eval(window: int = Query(30, ge=10, le=200),
+            refit_every: int = Query(15, ge=1, le=50),
+            train_window: int = Query(800, ge=200, le=3490)):
     """ML 概率模型 walk-forward 滚动评估：Brier/log-loss/校准曲线 + paired 检验。
 
-    注意：训练 33+16 个集成分类器并反复重训，通常耗时 30s~3min。
+    注意：重训使用最近 train_window 期历史（默认 800），通常耗时 2~5 分钟。
     """
     from . import ml_model
     draws = db.load_draws()
     if not draws:
         return JSONResponse({"ok": False, "error": "本地暂无开奖数据"}, status_code=400)
     return ml_model.evaluate_ml_walkforward(
-        draws, window=window, refit_every=refit_every)
+        draws, window=window, refit_every=refit_every, train_window=train_window)
 
 
 # ---------- 页面 ----------

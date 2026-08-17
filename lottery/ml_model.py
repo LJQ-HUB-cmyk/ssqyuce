@@ -616,10 +616,14 @@ def evaluate_ml_walkforward(
     min_start: Optional[int] = None,
     window: Optional[int] = None,
     refit_every: Optional[int] = None,
+    train_window: Optional[int] = 800,
     seed: int = 7,
 ) -> Dict:
     """滚动评估 ML 概率质量：每 refit_every 期用此刻历史重训一次（防未来信息），
     逐期比较 ML 概率与均匀基线的 Brier / log-loss，并做 paired 显著性检验。
+
+    train_window: 重训时最多使用最近 N 期历史（评估专用，控制耗时；
+                  生产预测仍用全量历史训练）。
     """
     if not HAS_SKLEARN:
         return {"ok": False, "error": "scikit-learn 未安装，无法评估"}
@@ -646,8 +650,10 @@ def evaluate_ml_walkforward(
         history = draws[:i]
         target = draws[i]
         if (i - start) % refit_every == 0 and i > min_start + 5:
-            red_model = train_red_models(history, min_start=min_start)
-            blue_model = train_blue_models(history, min_start=min_start)
+            hist = history[-train_window:] if train_window and len(history) > train_window else history
+            tmin = min(min_start, max(50, int(len(hist) * 0.6)))
+            red_model = train_red_models(hist, min_start=tmin)
+            blue_model = train_blue_models(hist, min_start=tmin)
             refits += 1
 
         # 红球
@@ -706,6 +712,7 @@ def evaluate_ml_walkforward(
         "n_issues": len(red_ml_b),
         "window": window,
         "refit_every": refit_every,
+        "train_window": train_window,
         "refits": refits,
         "seconds": round(time.time() - t0, 1),
         "red": {
