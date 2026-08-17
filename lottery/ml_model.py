@@ -146,7 +146,7 @@ def _make_rf() -> RandomForestClassifier:
 
 def _make_histgb() -> HistGradientBoostingClassifier:
     return HistGradientBoostingClassifier(
-        max_iter=max(30, config.ML_N_ESTIMATORS + 20),
+        max_iter=max(25, config.ML_N_ESTIMATORS),
         max_depth=min(4, max(2, config.ML_MAX_DEPTH)),
         random_state=42,
     )
@@ -274,7 +274,7 @@ def train_red_models(
         clf = _red_voting()
         try:
             clf.fit(X_tr, y_tr, sample_weight=_balanced_weights(y_tr))
-            cal = _calibrated(clf, X_tr, y_tr, cv=3)
+            cal = _calibrated(clf, X_tr, y_tr, cv=config.ML_CAL_CV)
         except Exception as e:  # noqa: BLE001
             print(f"[ml] 红球号码 {num} 训练失败: {e}")
             continue
@@ -340,7 +340,7 @@ def train_blue_models(
         clf = _blue_voting()
         try:
             clf.fit(X_tr, y_tr, sample_weight=_balanced_weights(y_tr))
-            cal = _calibrated(clf, X_tr, y_tr, cv=3)
+            cal = _calibrated(clf, X_tr, y_tr, cv=config.ML_CAL_CV)
         except Exception as e:  # noqa: BLE001
             print(f"[ml] 蓝球号码 {num} 训练失败: {e}")
             continue
@@ -401,6 +401,15 @@ def ml_training_in_progress() -> bool:
         return _TRAIN_EVENT is not None
 
 
+def ml_ready(draws: List[Dict]) -> bool:
+    """缓存是否已就绪（不触发训练）。供 engine 查询。"""
+    return ml_peek(draws) is not None
+
+
+def _model_path(key: str) -> "object":
+    return config.DATA_DIR / "ml_models" / f"{key}.joblib"
+
+
 def get_ml_models(draws: List[Dict], force: bool = False) -> Optional[Dict]:
     """返回 {"red":..., "blue":..., "key":..., "ready": bool}。
 
@@ -418,6 +427,22 @@ def get_ml_models(draws: List[Dict], force: bool = False) -> Optional[Dict]:
             return _ML_CACHE[key]
         if not force and _ML_CACHE.get("error", {}).get("key") == key:
             return None
+
+    # 磁盘持久化：重建容器/重启后直接从 data 卷加载，无需重训
+    if not force:
+        path = _model_path(key)
+        if path.exists():
+            try:
+                import joblib
+                entry = joblib.load(path)
+                if entry and entry.get("key") == key and entry.get("red") and entry.get("blue"):
+                    with _CACHE_LOCK:
+                        _ML_CACHE.clear()
+                        _ML_CACHE[key] = entry
+                    print(f"[ml] 已从磁盘加载模型（{key}）")
+                    return entry
+            except Exception as e:  # noqa: BLE001
+                print(f"[ml] 磁盘模型加载失败，重新训练: {e}")
 
     # 已有同 key 训练在进行：等待其完成
     with _TRAIN_LOCK:
@@ -466,6 +491,14 @@ def get_ml_models(draws: List[Dict], force: bool = False) -> Optional[Dict]:
         with _CACHE_LOCK:
             _ML_CACHE.clear()
             _ML_CACHE[key] = entry
+        try:
+            import joblib
+            path = _model_path(key)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            joblib.dump(entry, path)
+            print(f"[ml] 模型已持久化到 {path.name}")
+        except Exception as e:  # noqa: BLE001
+            print(f"[ml] 模型持久化失败: {e}")
         return entry
     finally:
         with _TRAIN_LOCK:
