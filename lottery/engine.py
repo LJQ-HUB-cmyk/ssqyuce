@@ -280,12 +280,12 @@ def predict_next(draws: List[Dict], use_llm: Optional[bool] = None,
     rng = random.Random()
     candidates: List[Dict] = []
 
-    # 各统计模型分别采样
+    # 各统计模型 + M2 ML 模型分别采样
     for name, model in bl.items():
         for _ in range(2):
             t = sample_stat_ticket(model["red"], model["blue"], ctx, rng)
             if t:
-                t["method"] = f"stat:{name}"
+                t["method"] = "ml" if name == "ml" else f"stat:{name}"
                 candidates.append(t)
     # 均匀对照
     for _ in range(2):
