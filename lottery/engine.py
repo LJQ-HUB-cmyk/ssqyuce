@@ -160,12 +160,21 @@ def build_context(draws: List[Dict], stats: Dict, patterns: List[Dict]) -> Dict:
 
 
 def llm_tickets(draws: List[Dict], stats: Dict, patterns: List[Dict],
-                rng: random.Random) -> List[Dict]:
-    """多模型 LLM 采样生成候选（失败自动降级为空）。"""
+                rng: random.Random, llm_samples: Optional[int] = None) -> List[Dict]:
+    """多模型 LLM 采样生成候选（失败自动降级为空）。
+
+    llm_samples: 覆盖全局 LLM_SAMPLES（离线评估可传 1 以控制成本与时长）。
+    """
     from concurrent.futures import ThreadPoolExecutor
     if config.LLM_DISABLED:
         return []
     model_cfgs = config.llm_model_list()
+    if config.LLM_EVAL_MODEL:
+        # 评估专用模型（LOTT_LLM_EVAL_MODEL）：评估期间限定单模型，控制成本
+        filtered = [c for c in model_cfgs
+                    if c.get("model") == config.LLM_EVAL_MODEL or c.get("name") == config.LLM_EVAL_MODEL]
+        if filtered:
+            model_cfgs = filtered
     if not model_cfgs:
         print("[llm] 无可用模型配置，跳过 LLM 通道")
         return []
@@ -214,7 +223,8 @@ def llm_tickets(draws: List[Dict], stats: Dict, patterns: List[Dict],
                 continue
         return out
 
-    calls = [model_cfgs[i % n_models] for i in range(config.LLM_SAMPLES)]
+    n_samples = int(llm_samples) if llm_samples else config.LLM_SAMPLES
+    calls = [model_cfgs[i % n_models] for i in range(n_samples)]
     with ThreadPoolExecutor(max_workers=min(len(calls), 4)) as ex:
         futures = [ex.submit(_ticket_call, cfg) for cfg in calls]
         for f in futures:
@@ -243,7 +253,9 @@ def _ml_result_block(ml_entry: Optional[Dict], use_ml: bool,
 
 def predict_next(draws: List[Dict], use_llm: Optional[bool] = None,
                  n_tickets: Optional[int] = None, persist: bool = True,
-                 use_ml: Optional[bool] = None) -> Dict:
+                 use_ml: Optional[bool] = None,
+                 rng: Optional[random.Random] = None,
+                 llm_samples: Optional[int] = None) -> Dict:
     """对下一期生成预测。
 
     use_ml: 是否把 M2 ML 概率模型（GBDT+RF 集成）并入 Brier 加权融合；
@@ -277,7 +289,7 @@ def predict_next(draws: List[Dict], use_llm: Optional[bool] = None,
             ml_extra["warming_up"] = True
     red_blend, blue_blend = _brier_blend(bl, draws)
 
-    rng = random.Random()
+    rng = rng if rng is not None else random.Random()
     candidates: List[Dict] = []
 
     # 各统计模型 + M2 ML 模型分别采样
@@ -295,7 +307,8 @@ def predict_next(draws: List[Dict], use_llm: Optional[bool] = None,
             candidates.append(t)
 
     # LLM 候选
-    llm_cands = llm_tickets(draws, stats, patterns, rng) if use_llm else []
+    llm_cands = llm_tickets(draws, stats, patterns, rng,
+                               llm_samples=llm_samples) if use_llm else []
     candidates.extend(llm_cands)
     llm_models_used = sorted({
         t["method"].split(":", 1)[1] for t in llm_cands if t["method"].startswith("llm:")

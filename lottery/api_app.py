@@ -178,6 +178,54 @@ def eval_online():
     return evaluate.online_check()
 
 
+# ---------- M3.1 LLM 离线评估 ----------
+
+@app.post("/api/eval/llm/run")
+def llm_eval_run(issues: int = Query(60, ge=3, le=200),
+                 n: int = Query(5, ge=1, le=20),
+                 seed: Optional[int] = Query(None, ge=0)):
+    """M3.1 LLM 离线评估：三通道 walk-forward（stat / stat+llm / random）后台任务。"""
+    import threading
+    import uuid
+    from . import llm_eval
+    draws = db.load_draws()
+    if not draws:
+        return JSONResponse({"ok": False, "error": "本地暂无开奖数据"}, status_code=400)
+    if len(draws) < 305:
+        return JSONResponse({"ok": False, "error": f"数据不足（需 ≥305 期，当前 {len(draws)}）"},
+                            status_code=400)
+    if not config.llm_configured():
+        return JSONResponse({"ok": False,
+                             "error": "LLM 通道未配置，无法运行 stat_llm 对比（请先在设置页配置并保存）"},
+                            status_code=400)
+    task_id = f"llm_eval_{uuid.uuid4().hex[:8]}"
+    db.create_task(task_id, "llm_eval")
+
+    def _work():
+        try:
+            db.update_task(task_id, "running", 0.01, "三通道 walk-forward 评估准备中...")
+            res = llm_eval.run_llm_eval(
+                draws, issues=issues, n_tickets=n, seed=seed,
+                progress_cb=lambda p, m: db.update_task(task_id, "running", round(p, 4), m))
+            db.complete_task(task_id, json.dumps(res, ensure_ascii=False))
+        except Exception as e:  # noqa: BLE001
+            db.fail_task(task_id, str(e))
+
+    threading.Thread(target=_work, daemon=True).start()
+    return {"ok": True, "task_id": task_id,
+            "note": ("后台任务运行中（60 期 × 三通道，LLM 通道较慢，约 5~30 分钟）。"
+                     "轮询 /api/tasks/<task_id> 完成后查看 /api/eval/llm/latest。")}
+
+
+@app.get("/api/eval/llm/latest")
+def llm_eval_latest():
+    from . import llm_eval
+    report = llm_eval.load_latest_report()
+    if report is None:
+        return {"status": "none"}
+    return {"status": "ready", "report": report}
+
+
 # ---------- 任务系统 ----------
 
 @app.get("/api/tasks")

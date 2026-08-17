@@ -100,6 +100,48 @@ def cmd_mine(args):
     res = mining.run_mining(draws, min_start=args.min_start)
     print(json.dumps(res, ensure_ascii=False, indent=2))
 
+def cmd_doctor(args):
+    """系统自检：数据库/版本徽标/缓存号/ECharts 本地 vendor/LLM 配置。"""
+    import re
+    from . import config, db
+    ok, warn = [], []
+    try:
+        n = db.count_draws()
+        ok.append(f"数据库 {config.DB_PATH.name}: {n} 期开奖")
+    except Exception as e:  # noqa: BLE001
+        warn.append(f"数据库异常: {e}")
+    web_dir = config.BASE / "web"
+    idx = (web_dir / "index.html").read_text(encoding="utf-8") if (web_dir / "index.html").exists() else ""
+    for marker in ("verBadge", "verText"):
+        (ok if marker in idx else warn).append(
+            f"index.html 版本徽标 {marker} 存在" if marker in idx else f"index.html 缺少 {marker}")
+    tokens = list(dict.fromkeys(re.findall(r"[?&]v=([\w.]+)", idx)))
+    if len(tokens) == 1:
+        ok.append(f"静态资源缓存号统一: ?v={tokens[0]}")
+    elif not tokens:
+        warn.append("index.html 未找到 ?v= 缓存号")
+    else:
+        warn.append(f"缓存号不一致: {tokens}")
+    vendor = web_dir / "static" / "vendor" / "echarts.min.js"
+    if vendor.exists():
+        ok.append(f"ECharts 本地 vendor 存在 ({vendor.stat().st_size / 1024:.0f} KB)")
+    else:
+        warn.append("web/static/vendor/echarts.min.js 缺失（断网会白屏）")
+    if config.LLM_CONFIG_FILE.exists():
+        ok.append("存在运行时 LLM 配置 data/llm_config.json")
+    if config.llm_configured():
+        ok.append("LLM 通道已配置")
+    else:
+        warn.append("LLM 通道未配置（纯统计模式）")
+    print("=== doctor 系统自检 ===")
+    for s in ok:
+        print("  [OK]   " + s)
+    for s in warn:
+        print("  [WARN] " + s)
+    print(f"总计: {len(ok)} OK / {len(warn)} WARN")
+    return {"ok": len(ok), "warn": warn}
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="lottery", description="双色球智能预测分析系统")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -116,6 +158,7 @@ def main(argv=None):
     sub.add_parser("online_check", help="在线预测对照评估")
     m = sub.add_parser("mine", help="运行规律自动挖掘管道")
     m.add_argument("--min-start", type=int, default=300)
+    sub.add_parser("doctor", help="系统自检（数据库/版本徽标/缓存号/vendor/LLM 配置）")
     s = sub.add_parser("serve", help="启动 Web 服务（默认端口 18000，可用 PORT 环境变量覆盖）")
     s.add_argument("--host", default="0.0.0.0")
     s.add_argument("--port", type=int, default=None)

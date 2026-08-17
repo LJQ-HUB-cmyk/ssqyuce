@@ -21,6 +21,12 @@ services:
       - LOTT_LLM_EXTRA_MODELS=${LOTT_LLM_EXTRA_MODELS:-}
       - LOTT_LLM_SAMPLES=${LOTT_LLM_SAMPLES:-3}
       - LOTT_N_TICKETS=${LOTT_N_TICKETS:-10}
+      - LOTT_LLM_EVAL_ISSUES=${LOTT_LLM_EVAL_ISSUES:-60}
+      - LOTT_LLM_EVAL_TICKETS=${LOTT_LLM_EVAL_TICKETS:-5}
+      - LOTT_LLM_EVAL_SEED=${LOTT_LLM_EVAL_SEED:-42}
+      - LOTT_LLM_EVAL_MODEL=${LOTT_LLM_EVAL_MODEL:-}
+      - LOTT_LLM_EVAL_PRICE_PER_1M=${LOTT_LLM_EVAL_PRICE_PER_1M:-1.0}
+      - LOTT_LLM_VERIFY_MODEL=${LOTT_LLM_VERIFY_MODEL:-}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:18000/api/health', timeout=5)"]

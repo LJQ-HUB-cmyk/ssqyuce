@@ -659,6 +659,122 @@ function renderOnline(rows) {
   ev.appendChild(add);
 }
 
+// ==================== LLM 离线评估（M3.1） ====================
+
+async function runLlmEval() {
+  setBusy("#btnLlmEval", "提交评估…");
+  try {
+    const r = await api("/api/eval/llm/run?issues=60&n=5", {method:"POST"});
+    if (!r.ok) throw new Error(r.error || "提交失败");
+    const taskId = r.task_id;
+    $("#llmEvalArea").innerHTML = "<div class='note'>⏳ 后台评估中（60期×3通道，LLM 通道较慢，约 5~30 分钟）。页面可继续使用，完成后自动刷新本区域。</div>";
+    const iv = setInterval(async () => {
+      try {
+        const t = await api("/api/tasks/" + taskId);
+        if (t.status === "completed") {
+          clearInterval(iv);
+          const rep = await api("/api/eval/llm/latest");
+          renderLlmEval(rep);
+          toast("LLM 离线评估完成");
+        } else if (t.status === "failed") {
+          clearInterval(iv);
+          $("#llmEvalArea").innerHTML = "<div class='note' style='color:#e63946'>评估失败：" + escHtml(t.message || "未知错误") + "</div>";
+        } else {
+          const pctv = Math.round((t.progress || 0) * 100);
+          $("#llmEvalArea").innerHTML = "<div class='note'>⏳ 评估中：" + escHtml(t.message || "") + "（" + pctv + "%）</div>";
+        }
+      } catch(e) {}
+    }, 4000);
+    toast("已提交 LLM 离线评估（后台运行）");
+  } catch(e) {
+    $("#llmEvalArea").innerHTML = "<div class='note' style='color:#e63946'>提交失败：" + escHtml(e.message) + "</div>";
+  }
+  setFree("#btnLlmEval", "🧠 LLM 离线评估");
+}
+
+function renderLlmEval(rep) {
+  const area = $("#llmEvalArea");
+  if (!area) return;
+  if (!rep || rep.status !== "ready" || !rep.report) {
+    area.innerHTML = "<div class='note'>暂无 LLM 离线评估结果（点击「🧠 LLM 离线评估」运行）。</div>";
+    return;
+  }
+  const r = rep.report;
+  const sum = r.summary || {};
+  const order = ["stat", "stat_llm", "random"];
+  const name = {stat:"纯统计", stat_llm:"统计+LLM", random:"随机基线"};
+  const rows = order.map(ch => {
+    const s = (sum[ch]||{}).metrics || {};
+    const u = sum[ch] || {};
+    return "<tr><td>" + name[ch] + "</td>" +
+      "<td>" + fmt(s.red_hits_mean) + "</td>" +
+      "<td>" + pct(s.blue_hit_rate) + "</td>" +
+      "<td>" + pct(s.prize_rate_ge5) + "</td>" +
+      "<td>" + pct(s.roi) + "</td>" +
+      "<td>" + (u.calls||0) + "</td>" +
+      "<td>$" + fmt((u.cost_usd||0), 4) + "</td>" +
+      "<td>" + Math.round((u.duration_ms||0)/1000) + "s</td></tr>";
+  }).join("");
+  const comparisons = ((sum.stat_llm||{}).p_values) || [];
+  const cmp = comparisons.filter(c => !String(c.metric).endsWith("_adj")).map(c => {
+    const label = {stat_llm_vs_stat:"统计+LLM vs 纯统计", stat_llm_vs_random:"统计+LLM vs 随机", stat_vs_random:"纯统计 vs 随机"}[c.pair] || c.pair;
+    const mlabel = {red_hits_mean:"红球平均命中", blue_hit_rate:"蓝球命中率", prize_rate_ge5:"≥五等率", roi:"ROI"}[c.metric] || c.metric;
+    const sig = c.p < 0.05 ? "<span class='badge gradeA'>显著</span>" : "<span class='badge gradeC'>不显著</span>";
+    return "<tr><td>" + label + "</td><td>" + mlabel + "</td><td>" + fmt(c.mean_delta) + "</td><td>" + c.p + " (" + c.method + ")</td><td>" + sig + "</td></tr>";
+  }).join("");
+  area.innerHTML =
+    "<div class='note' style='margin-bottom:6px'>🧠 LLM 离线评估（M3.1）：run " + r.run_id +
+    " · " + r.window_issues + " 期 × " + r.tickets + " 注/期 · seed=" + r.seed +
+    " · " + (r.created_at||"") + "</div>" +
+    "<div class='scroll'><table><thead><tr><th>通道</th><th>红球平均命中</th><th>蓝球命中率</th><th>≥五等率</th><th>ROI</th><th>LLM调用</th><th>估算成本$</th><th>LLM耗时</th></tr></thead><tbody>" + rows + "</tbody></table></div>" +
+    "<div class='chart' id='chLlmCmp' style='height:220px;margin-top:8px'></div>" +
+    "<div class='scroll' style='margin-top:8px'><table><thead><tr><th>对比</th><th>指标</th><th>Δ均值</th><th>p 值</th><th>结论</th></tr></thead><tbody>" + cmp + "</tbody></table></div>" +
+    "<div class='note'>结论：paired 检验（BH 校正后 p<0.05 才视为显著）；cost 为按 token 估算，仅作展示。LLM 通道存在模型噪声，stat/random 通道固定种子可复现。</div>";
+  const ch = echartsInit("chLlmCmp");
+  if (ch) {
+    const cats = ["红球平均命中", "蓝球命中率", "≥五等率", "ROI"];
+    const keys = ["red_hits_mean", "blue_hit_rate", "prize_rate_ge5", "roi"];
+    ch.setOption({
+      backgroundColor:"transparent", grid:{left:40,right:8,top:26,bottom:24},
+      tooltip:{trigger:"axis"},
+      legend:{textStyle:{color:"#8b949e"}, top:0},
+      xAxis:{type:"category", data:cats, axisLabel:{color:"#8b949e"}},
+      yAxis:{type:"value", splitLine:{lineStyle:{color:"#2d333b"}}, axisLabel:{color:"#8b949e"}},
+      series: order.map(chName => ({
+        name: name[chName], type:"bar",
+        data: keys.map(k => { const v = ((sum[chName]||{}).metrics||{})[k]; return v == null ? null : +(+v).toFixed(4); }),
+      })),
+    });
+  }
+  const trendId = "chLlmTrend";
+  const trend = document.createElement("div");
+  trend.className = "chart";
+  trend.id = trendId;
+  trend.style.cssText = "height:180px;margin-top:8px";
+  area.appendChild(trend);
+  const ch2 = echartsInit(trendId);
+  if (ch2 && r.per_issue) {
+    const iss = (r.per_issue.stat||[]).map(x => x.issue);
+    const win = 10;
+    ch2.setOption({
+      backgroundColor:"transparent", grid:{left:36,right:8,top:26,bottom:24},
+      tooltip:{trigger:"axis"},
+      legend:{textStyle:{color:"#8b949e"}, top:0},
+      xAxis:{type:"category", data:iss, axisLabel:{color:"#8b949e", interval: Math.max(1, Math.ceil(iss.length/8))}},
+      yAxis:{type:"value", splitLine:{lineStyle:{color:"#2d333b"}}, axisLabel:{color:"#8b949e"}},
+      series: order.map(chName => {
+        const arr = (r.per_issue[chName]||[]).map(x => x.red_hits);
+        const smooth = arr.map((_,i) => {
+          const s0 = Math.max(0, i - win + 1);
+          const seg = arr.slice(s0, i+1);
+          return seg.length ? +(seg.reduce((a,b)=>a+b,0)/seg.length).toFixed(3) : null;
+        });
+        return {name:name[chName], type:"line", smooth:true, showSymbol:false, data:smooth, lineStyle:{width:2}};
+      }),
+    });
+  }
+}
+
 // ==================== 数据管理 ====================
 
 async function refreshData() {
@@ -973,6 +1089,10 @@ async function loadAll() {
       renderOnline(ev);
     } catch(e) {}
     initMlStatus();
+    try {
+      const llmRep = await api("/api/eval/llm/latest");
+      renderLlmEval(llmRep);
+    } catch(e) {}
   } catch(e) {
     toast("加载失败: " + e.message);
   }

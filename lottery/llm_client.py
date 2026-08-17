@@ -3,9 +3,14 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from typing import Dict, List, Optional
 
 import requests
+
+# 调用计量（M3.1 LLM 离线评估用；线程安全累加，仅统计成功返回的调用）
+_usage = {"calls": 0, "prompt_chars": 0, "completion_chars": 0}
+_usage_lock = threading.Lock()
 
 from . import config
 
@@ -89,6 +94,11 @@ def chat(system: str, user: str, max_tokens: int = 2000,
             msg = data["choices"][0]["message"]
             content = msg.get("content") or ""
             if content:
+                with _usage_lock:
+                    _usage["calls"] += 1
+                    _usage["prompt_chars"] += sum(
+                        len(m.get("content") or "") for m in payload["messages"])
+                    _usage["completion_chars"] += len(content)
                 return content
             # content 为空：可能 reasoning_content 吃光了 max_tokens
             finish = data["choices"][0].get("finish_reason")
@@ -199,3 +209,15 @@ def tickets_prompt(stats_json: dict, recent: list, patterns: list, observations:
         "约束：和值尽量落在历史常见区间，三区比/奇偶比不要极端，蓝球尽量分散。"
         "若某尺度没有可靠信号，请如实降低置信度并说明。"
     )
+
+
+def usage_reset() -> None:
+    """清空调用计量（评估每期前调用）。"""
+    with _usage_lock:
+        _usage.update({"calls": 0, "prompt_chars": 0, "completion_chars": 0})
+
+
+def usage_snapshot() -> Dict:
+    """返回调用计量快照：{calls, prompt_chars, completion_chars}。"""
+    with _usage_lock:
+        return dict(_usage)

@@ -73,7 +73,7 @@ CREATE TABLE IF NOT EXISTS eval_results (
 
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY,
-  kind TEXT NOT NULL,           -- predict / backtest / eval / mine
+  kind TEXT NOT NULL,           -- predict / backtest / eval / mine / llm_eval
   status TEXT DEFAULT 'pending',-- pending / running / completed / failed
   progress REAL DEFAULT 0.0,
   message TEXT DEFAULT '',
@@ -81,6 +81,22 @@ CREATE TABLE IF NOT EXISTS tasks (
   created_at REAL,
   updated_at REAL
 );
+
+CREATE TABLE IF NOT EXISTS llm_eval_results (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL,              -- 如 llm_eval_20260817_100001
+  created_at TEXT NOT NULL,
+  window_issues INTEGER NOT NULL,    -- 窗口期数
+  tickets INTEGER NOT NULL,          -- 每期每通道注数
+  channel TEXT NOT NULL,             -- stat | stat_llm | random
+  issue TEXT,                        -- 逐期明细行填期号；汇总行(NULL)
+  red_hits REAL, blue_hit INTEGER, prize_level INTEGER, roi REAL,
+  tokens INTEGER DEFAULT 0, cost_usd REAL DEFAULT 0.0, duration_ms INTEGER DEFAULT 0,
+  metrics_json TEXT DEFAULT '',      -- 汇总行：EV.aggregate 结果
+  p_values_json TEXT DEFAULT '',     -- 汇总行：paired 检验结果
+  seed INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_llm_eval_run ON llm_eval_results(run_id);
 """
 
 _CONN: sqlite3.Connection | None = None
@@ -347,3 +363,71 @@ def list_tasks(limit: int = 20) -> List[Dict]:
                 pass
         out.append(d)
     return out
+
+
+# ---------- LLM 离线评估（M3.1） ----------
+
+def save_llm_eval_rows(run_id: str, created_at: str, window_issues: int,
+                       tickets: int, seed: int, rows: List[Dict]) -> None:
+    """写入一次 LLM 评估 run 的全部行（逐期明细 + 每通道汇总）。"""
+    conn = get_conn()
+    conn.execute("DELETE FROM llm_eval_results WHERE run_id=?", (run_id,))
+    sql = (
+        "INSERT INTO llm_eval_results"
+        "(run_id,created_at,window_issues,tickets,channel,issue,red_hits,blue_hit,prize_level,roi,"
+        "tokens,cost_usd,duration_ms,metrics_json,p_values_json,seed)"
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+    )
+    for r in rows:
+        conn.execute(sql, (
+            run_id, created_at, window_issues, tickets, r["channel"], r.get("issue"),
+            r.get("red_hits"), r.get("blue_hit"), r.get("prize_level", 0), r.get("roi", 0.0),
+            r.get("tokens", 0), r.get("cost_usd", 0.0), r.get("duration_ms", 0),
+            json.dumps(r.get("metrics_json") or {}, ensure_ascii=False),
+            json.dumps(r.get("p_values_json") or {}, ensure_ascii=False),
+            seed,
+        ))
+    conn.commit()
+
+
+def latest_llm_eval_run() -> Optional[str]:
+    row = get_conn().execute(
+        "SELECT run_id FROM llm_eval_results WHERE issue IS NULL ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    return row["run_id"] if row else None
+
+
+def load_llm_eval_run(run_id: str) -> Optional[Dict]:
+    rows = get_conn().execute(
+        "SELECT * FROM llm_eval_results WHERE run_id=? ORDER BY id", (run_id,)).fetchall()
+    if not rows:
+        return None
+    first = rows[0]
+    summary: Dict[str, Dict] = {}
+    per_issue: Dict[str, List[Dict]] = {}
+    for r in rows:
+        ch = r["channel"]
+        if r["issue"] is None:
+            summary[ch] = {
+                "metrics": json.loads(r["metrics_json"] or "{}"),
+                "p_values": json.loads(r["p_values_json"] or "{}"),
+                "tokens": r["tokens"] or 0,
+                "cost_usd": r["cost_usd"] or 0.0,
+                "duration_ms": r["duration_ms"] or 0,
+            }
+        else:
+            per_issue.setdefault(ch, []).append({
+                "issue": r["issue"],
+                "red_hits": r["red_hits"],
+                "blue_hit": r["blue_hit"],
+                "roi": r["roi"],
+            })
+    return {
+        "run_id": run_id,
+        "created_at": first["created_at"],
+        "window_issues": first["window_issues"],
+        "tickets": first["tickets"],
+        "seed": first["seed"],
+        "summary": summary,
+        "per_issue": per_issue,
+    }
