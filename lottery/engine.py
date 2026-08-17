@@ -8,7 +8,7 @@ from typing import Dict, List, Optional
 import numpy as np
 
 from . import backtest as BT
-from . import config, db, features as F, llm_client, models as M
+from . import config, db, features as F, llm_client, ml_model, models as M
 
 R_MAX, B_MAX = 33, 16
 
@@ -222,11 +222,37 @@ def llm_tickets(draws: List[Dict], stats: Dict, patterns: List[Dict],
     return tickets
 
 
+def _ml_result_block(ml_entry: Optional[Dict], use_ml: bool,
+                         extra: Optional[Dict] = None) -> Dict:
+    """构造预测结果里的 ML 元数据块。"""
+    extra = extra or {}
+    if not use_ml or ml_entry is None:
+        return {"enabled": bool(use_ml), "ready": ml_entry is not None, **extra}
+    metrics = ml_model.get_ml_metrics(ml_entry["red"], ml_entry["blue"])
+    return {
+        "enabled": True,
+        "ready": True,
+        "red_avg_brier": metrics.get("red_avg_brier_cal"),
+        "blue_avg_brier": metrics.get("blue_avg_brier_cal"),
+        "red_ece": metrics.get("red_ece"),
+        "blue_ece": metrics.get("blue_ece"),
+        "trained_at": ml_entry.get("trained_at"),
+        **extra,
+    }
+
+
 def predict_next(draws: List[Dict], use_llm: Optional[bool] = None,
-                 n_tickets: Optional[int] = None, persist: bool = True) -> Dict:
-    """对下一期生成预测。"""
+                 n_tickets: Optional[int] = None, persist: bool = True,
+                 use_ml: Optional[bool] = None) -> Dict:
+    """对下一期生成预测。
+
+    use_ml: 是否把 M2 ML 概率模型（GBDT+RF 集成）并入 Brier 加权融合；
+            默认跟随 config.ML_ENABLED。
+    """
     if use_llm is None:
         use_llm = not config.LLM_DISABLED
+    if use_ml is None:
+        use_ml = config.ML_ENABLED
     n_tickets = n_tickets or config.N_TICKETS
     issue = BT.next_issue(draws[-1]["issue"])
 
@@ -234,8 +260,21 @@ def predict_next(draws: List[Dict], use_llm: Optional[bool] = None,
     patterns = db.load_patterns()
     ctx = constraint_ctx(draws)
 
-    # 统计模型混合概率（Brier 加权融合）
+    # 统计模型 + M2 ML 概率模型 → 混合概率（Brier 加权融合）
     bl = M.build_models(draws)
+    ml_entry, ml_extra = None, {}
+    if use_ml and ml_model.HAS_SKLEARN and len(draws) >= config.ML_MIN_START + 10:
+        if ml_model.ml_ready(draws):
+            ml_entry = ml_model.get_ml_models(draws)
+            if ml_entry is not None:
+                bl["ml"] = {
+                    "red": ml_model.predict_red_probs(ml_entry["red"], draws),
+                    "blue": ml_model.predict_blue_probs(ml_entry["blue"], draws),
+                    "name": "ml",
+                }
+        else:
+            # 尚未训练完成（如后台预热中）：本轮先不阻塞请求，仅标记状态
+            ml_extra["warming_up"] = True
     red_blend, blue_blend = _brier_blend(bl, draws)
 
     rng = random.Random()
@@ -306,6 +345,7 @@ def predict_next(draws: List[Dict], use_llm: Optional[bool] = None,
             "B": sum(1 for p in patterns if p["grade"] == "B"),
             "C": sum(1 for p in patterns if p["grade"] == "C"),
         },
+        "ml": _ml_result_block(ml_entry, use_ml, ml_extra),
         "note": ("样本外回测未发现稳定显著的规律，预测仅基于统计结构的均衡建议；"
                  "置信度为模型结构分，不构成中奖概率。理性购彩。"),
     }

@@ -761,6 +761,79 @@ function exportData() {
   a.click();
 }
 
+// ==================== M2 ML 模型评估 ====================
+
+async function initMlStatus() {
+  try {
+    const r = await api("/api/ml/status");
+    const area = $("#mlEvalArea");
+    if (!area) return;
+    if (!r.enabled) {
+      area.innerHTML = '<div class="note">🤖 ML 概率模型未启用：' + escHtml(r.reason || "reason unknown") + '</div>';
+      return;
+    }
+    if (!r.ready) {
+      area.innerHTML = '<div class="note">🤖 ML 概率模型：' + escHtml(r.reason || "后台训练中…") + '</div>';
+      return;
+    }
+    area.innerHTML = '<div class="note">🤖 ML 概率模型已就绪：红球 Brier ' + fmt(r.red_brier, 4) +
+      ' · 蓝球 Brier ' + fmt(r.blue_brier, 4) +
+      ' · ECE 红 ' + fmt(r.red_calibration_ece, 4) + ' / 蓝 ' + fmt(r.blue_calibration_ece, 4) +
+      ' · 训练于 ' + escHtml(r.trained_at || "") + '</div>';
+  } catch(e) { /* 静默：评估页未打开也无需报错 */ }
+}
+
+async function runMlEval() {
+  const btn = $("#btnMlEval");
+  const st = $("#mlEvalStatus");
+  if (st) st.innerHTML = '<span class="errtxt">⏳ 滚动评估中（1~3 分钟）…</span>';
+  if (btn) btn.disabled = true;
+  try {
+    const r = await api("/api/ml/eval?window=60&refit_every=10", {method:"POST"});
+    if (!r.ok) { if (st) st.innerHTML = '<span class="errtxt">✗ ' + escHtml(r.error || "评估失败") + '</span>'; return; }
+    renderMlEval(r);
+    if (st) st.innerHTML = '<span class="oktxt">✓ 完成（' + r.seconds + 's）</span>';
+    toast("ML 模型评估完成");
+  } catch(e) {
+    if (st) st.innerHTML = '<span class="errtxt">✗ ' + escHtml(e.message) + '</span>';
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+function calTable(bins) {
+  if (!bins || !bins.length) return "";
+  const rows = bins.filter(b => b.n > 0).map(b =>
+    "<tr><td class='mono'>" + (b.bin || "") + "</td><td>" + b.n + "</td><td>" + fmt(b.mean_pred, 4) +
+    "</td><td>" + fmt(b.freq, 4) + "</td><td>" + Math.abs((b.mean_pred||0) - (b.freq||0)).toFixed(4) + "</td></tr>").join("");
+  return '<div class="scroll" style="max-height:220px"><table><thead><tr><th>预测区间</th><th>n</th><th>平均预测</th><th>实际频率</th><th>偏差</th></tr></thead><tbody>' +
+    rows + '</tbody></table></div>';
+}
+
+function renderMlEval(r) {
+  const red = r.red || {}, blue = r.blue || {};
+  const rp = red.paired || {}, bp = blue.paired || {};
+  $("#mlEvalArea").innerHTML =
+    '<div class="metrics">' +
+      metricItem("红球 Brier(ML)", fmt(red.brier_ml, 4)) +
+      metricItem("红球 Brier(均匀)", fmt(red.brier_uniform, 4)) +
+      metricItem("红球 logloss(ML)", fmt(red.logloss_ml, 4)) +
+      metricItem("红球 logloss(均匀)", fmt(red.logloss_uniform, 4)) +
+      metricItem("红球 paired p", fmt(rp.p, 4), rp.method === "wilcoxon" ? "Wilcoxon" : rp.method) +
+      metricItem("蓝球 Brier(ML)", fmt(blue.brier_ml, 4)) +
+      metricItem("蓝球 Brier(均匀)", fmt(blue.brier_uniform, 4)) +
+      metricItem("蓝球 logloss(ML)", fmt(blue.logloss_ml, 4)) +
+      metricItem("蓝球 logloss(均匀)", fmt(blue.logloss_uniform, 4)) +
+      metricItem("蓝球 paired p", fmt(bp.p, 4), bp.method === "wilcoxon" ? "Wilcoxon" : bp.method) +
+      metricItem("评估期数", r.n_issues, "重训 " + (r.refits || 0) + " 次") +
+    '</div>' +
+    '<div style="margin-top:10px" class="note">红球校准曲线（可靠性图）：预测概率 vs 实际命中频率，越贴对角线越准</div>' +
+    calTable(red.calibration) +
+    '<div style="margin-top:10px" class="note">蓝球校准曲线：</div>' +
+    calTable(blue.calibration) +
+    '<div style="margin-top:10px" class="note">' + escHtml(r.conclusion || "") + '</div>';
+}
+
 // ==================== 工具 ====================
 
 function escHtml(s) {
@@ -893,6 +966,7 @@ async function loadAll() {
       const ev = await api("/api/eval");
       renderOnline(ev);
     } catch(e) {}
+    initMlStatus();
   } catch(e) {
     toast("加载失败: " + e.message);
   }

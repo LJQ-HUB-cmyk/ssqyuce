@@ -24,6 +24,15 @@ def next_issue(issue: str) -> str:
     return f"{year:04d}{seq:03d}"
 
 
+def _draw_value(outcome: str, draw: Dict) -> float:
+    """数值类规律的目标值：和值 / 跨度 / AC 值。"""
+    if outcome == "numeric_span":
+        return float(max(draw["reds"]) - min(draw["reds"]))
+    if outcome == "numeric_ac":
+        return float(F.ac_value(draw["reds"]))
+    return float(sum(draw["reds"]))
+
+
 def bh_adjust(pvals: List[float]) -> List[float]:
     """Benjamini-Hochberg FDR 校正。"""
     m = len(pvals)
@@ -72,14 +81,15 @@ def backtest_pattern(pattern: Dict, draws: List[Dict], min_start: int = 120) -> 
         n_triggers += 1
         action = res["action"]
 
-        if outcome == "numeric_sum":
-            s = F.sums(history)
-            mean = float(np.mean(s))
+        if outcome.startswith("numeric_"):
+            hist_vals = np.array([_draw_value(outcome, d) for d in history])
+            mean = float(np.mean(hist_vals)) if len(hist_vals) else 0.0
             target = draws[i]
-            numeric_vals.append(abs(sum(target["reds"]) - mean))
+            numeric_vals.append(abs(_draw_value(outcome, target) - mean))
             if numeric_base is None:
-                numeric_all = [abs(sum(d["reds"]) - mean) for d in draws[min_start:]]
-                numeric_base = float(np.mean(numeric_all))
+                numeric_all = [abs(_draw_value(outcome, d) - mean)
+                               for d in draws[min_start:]]
+                numeric_base = float(np.mean(numeric_all)) if numeric_all else 0.0
             continue
 
         fav = action.get(outcome, [])
@@ -119,7 +129,7 @@ def backtest_pattern(pattern: Dict, draws: List[Dict], min_start: int = 120) -> 
               "desc": pattern["desc"], "horizon": horizon, "n": n_triggers,
               "backtest": {}}
 
-    if outcome == "numeric_sum":
+    if outcome.startswith("numeric_"):
         if len(numeric_vals) >= 10 and numeric_base is not None:
             arr = np.array(numeric_vals)
             margin = float(numeric_base - np.mean(arr))
@@ -130,8 +140,11 @@ def backtest_pattern(pattern: Dict, draws: List[Dict], min_start: int = 120) -> 
             result["p_value"] = min(1.0, p_two / 2 if direction == "toward_mean" else 1.0 - p_two / 2)
             result["direction"] = direction
             lo, hi = _wilson_ci(int(np.mean(arr) < np.mean(numeric_all)), len(arr))
+            metric_name = {"numeric_sum": "均值偏差|sum|",
+                            "numeric_span": "均值偏差|span|",
+                            "numeric_ac": "均值偏差|AC|"}.get(outcome, "numeric")
             result["backtest"] = {
-                "metric": "mean|sum-mean|", "avg_triggered": float(np.mean(arr)),
+                "metric": metric_name, "avg_triggered": float(np.mean(arr)),
                 "avg_baseline": numeric_base, "margin": margin,
                 "ci_lower": round(lo, 4), "ci_upper": round(hi, 4),
             }

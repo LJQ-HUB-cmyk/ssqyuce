@@ -4,10 +4,10 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>双色球智能预测分析系统</title>
-<link rel="stylesheet" href="/static/style.css?v=20260816.3">
+<link rel="stylesheet" href="/static/style.css?v=20260816.4">
 <!-- ECharts CDN + 本地 fallback -->
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"
-  onerror="this.src='/static/vendor/echarts.min.js?v=20260816.3'"></script>
+  onerror="this.src='/static/vendor/echarts.min.js?v=20260816.4'"></script>
 </head>
 <body>
 <div class="app">
@@ -178,8 +178,11 @@
           <div class="eval-actions">
             <button onclick="runOfflineEval()">📊 离线评估</button>
             <button onclick="runOnline()">✔ 在线对照</button>
+            <button id="btnMlEval" onclick="runMlEval()">🤖 ML 模型评估</button>
+            <span id="mlEvalStatus" class="test-result"></span>
           </div>
           <div id="evalArea"><div class="note">点击「离线评估」生成结果（约需 30~120 秒）。</div></div>
+          <div id="mlEvalArea" style="margin-top:12px;"><div class="note">🤖 ML 概率模型状态加载中…</div></div>
         </div>
       </section>
 
@@ -271,6 +274,6 @@
 </div>
 
 <div id="toast"></div>
-<script src="/static/app.js?v=20260816.3"></script>
+<script src="/static/app.js?v=20260816.4"></script>
 </body>
 </html>

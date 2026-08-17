@@ -93,7 +93,9 @@ def offline_backtest(draws: List[Dict], issues: int = 120,
     for i in range(start, len(draws) - 1):
         history = draws[:i]
         target = draws[i]  # 实际开奖 (第 i 期)
-        res = E.predict_next(history, use_llm=use_llm, n_tickets=n_tickets, persist=False)
+        # 引擎离线回测不启用 ML：ML 的诚实证据由 /api/ml/eval 单独给出
+        res = E.predict_next(history, use_llm=use_llm, n_tickets=n_tickets,
+                             persist=False, use_ml=False)
         runs_sys.append(tickets_result(res["tickets"], target))
         # 随机基线：均匀约束票
         if ctx is None:

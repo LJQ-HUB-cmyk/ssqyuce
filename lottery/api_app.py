@@ -332,6 +332,30 @@ def test_llm_connection():
     return {"ok": False, "error": "模型无返回（请检查 API 地址 / Key / 模型名）"}
 
 
+# ---------- M2 ML 概率模型 ----------
+
+@app.get("/api/ml/status")
+def ml_status():
+    from . import ml_model
+    draws = db.load_draws()
+    return ml_model.ml_status(draws)
+
+
+@app.post("/api/ml/eval")
+def ml_eval(window: int = Query(60, ge=10, le=200),
+            refit_every: int = Query(10, ge=1, le=50)):
+    """ML 概率模型 walk-forward 滚动评估：Brier/log-loss/校准曲线 + paired 检验。
+
+    注意：训练 33+16 个集成分类器并反复重训，通常耗时 30s~3min。
+    """
+    from . import ml_model
+    draws = db.load_draws()
+    if not draws:
+        return JSONResponse({"ok": False, "error": "本地暂无开奖数据"}, status_code=400)
+    return ml_model.evaluate_ml_walkforward(
+        draws, window=window, refit_every=refit_every)
+
+
 # ---------- 页面 ----------
 
 
@@ -376,6 +400,14 @@ def _scheduler_loop():
             print("[scheduler] 异常:", e)
         _time.sleep(1800)
 
+
+# M2：后台预热 ML 模型（首个预测请求不阻塞；训练结果按数据版本缓存）
+try:
+    from . import ml_model
+    _boot_draws = db.load_draws()
+    ml_model.start_ml_warmup(_boot_draws)
+except Exception:  # noqa: BLE001
+    pass
 
 if config.SCHEDULER_ENABLED:
     import threading

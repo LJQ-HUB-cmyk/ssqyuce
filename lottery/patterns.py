@@ -289,6 +289,34 @@ def _act_blue_omit_bin(history: List[Dict]) -> Dict:
     return {"blue_fav": fav} if fav else {}
 
 
+def _act_blue_adjacent(history: List[Dict]) -> Dict:
+    """蓝球邻号延续：上期蓝球 +/-1 的号码。"""
+    if not history:
+        return {}
+    b = history[-1]["blue"]
+    fav = sorted({x for x in (b - 1, b + 1) if 1 <= x <= 16})
+    return {"blue_fav": fav} if fav else {}
+
+
+def _act_blue_alt_repeat(history: List[Dict]) -> Dict:
+    """蓝球隔期复出：上上期蓝球在下一期出现。"""
+    if len(history) < 2:
+        return {}
+    return {"blue_fav": [history[-2]["blue"]]}
+
+
+def _act_blue_hot_cold_switch(history: List[Dict]) -> Dict:
+    """蓝球热冷切换：近 20 期最热的蓝球（排除上期）延续热度。"""
+    sl = history[-20:] if len(history) >= 20 else history
+    if len(sl) < 3:
+        return {}
+    f = F.blue_frequency(sl)
+    last = sl[-1]["blue"]
+    order = np.argsort(-f[1:]) + 1
+    fav = [int(x) for x in order if int(x) != last and f[x] > 0][:2]
+    return {"blue_fav": fav} if fav else {}
+
+
 def _act_diagonal(history: List[Dict]) -> Dict:
     if len(history) < 2:
         return {}
@@ -739,7 +767,107 @@ PATTERNS: List[Dict] = [
         "outcome": "red_fav",
         "base_fn": red_base,
     },
+    # ----- M2 新增规律（29 -> 35） -----
+    {
+        "key": "blue_adjacent",
+        "name_zh": "蓝球邻号延续",
+        "kind": "short",
+        "desc": "上期蓝球 +/-1 邻号在下一期命中是否高于 2/16",
+        "horizon": 1,
+        "trigger_fn": _t_always,
+        "action_fn": _act_blue_adjacent,
+        "outcome": "blue_fav",
+        "base_fn": blue_base,
+    },
+    {
+        "key": "blue_alt_repeat",
+        "name_zh": "蓝球隔期复出",
+        "kind": "short",
+        "desc": "上上期蓝球在下一期再次出现是否高于 1/16",
+        "horizon": 1,
+        "trigger_fn": _t_always,
+        "action_fn": _act_blue_alt_repeat,
+        "outcome": "blue_fav",
+        "base_fn": blue_base,
+    },
+    {
+        "key": "blue_hot_cold_switch",
+        "name_zh": "蓝球热冷切换",
+        "kind": "short",
+        "desc": "近20期最热蓝球（排除上期）延续热度是否高于基线",
+        "horizon": 1,
+        "trigger_fn": _t_always,
+        "action_fn": _act_blue_hot_cold_switch,
+        "outcome": "blue_fav",
+        "base_fn": blue_base,
+    },
+    {
+        "key": "span_regression",
+        "name_zh": "跨度回归",
+        "kind": "mid",
+        "desc": "上期跨度处于极端分位时，下期跨度是否向均值回归",
+        "horizon": 1,
+        "trigger_fn": _t_span_extreme,
+        "action_fn": lambda h: {},
+        "outcome": "numeric_span",
+        "base_fn": None,
+    },
+    {
+        "key": "ac_regression",
+        "name_zh": "AC值回归",
+        "kind": "mid",
+        "desc": "上期 AC 值处于极端分位时，下期 AC 值是否向均值回归",
+        "horizon": 1,
+        "trigger_fn": _t_ac_extreme,
+        "action_fn": lambda h: {},
+        "outcome": "numeric_ac",
+        "base_fn": None,
+    },
+    {
+        "key": "sum_var_contract",
+        "name_zh": "和值方差收缩",
+        "kind": "mid",
+        "desc": "近10期和值波动收窄到低位后，下期和值是否回归均值",
+        "horizon": 1,
+        "trigger_fn": _t_sum_var_contract,
+        "action_fn": lambda h: {},
+        "outcome": "numeric_sum",
+        "base_fn": None,
+    },
 ]
+
+
+def _t_span_extreme(history: List[Dict]) -> bool:
+    """上期跨度处于历史极端分位（<=P15 或 >=P85）时触发。"""
+    if len(history) < 60:
+        return False
+    sp = F.span(history)
+    lo, hi = np.percentile(sp, 15), np.percentile(sp, 85)
+    cur = sp[-1]
+    return bool(cur <= lo or cur >= hi)
+
+
+def _t_ac_extreme(history: List[Dict]) -> bool:
+    """上期 AC 值处于历史极端分位时触发。"""
+    if len(history) < 60:
+        return False
+    acs = np.array([F.ac_value(d["reds"]) for d in history], dtype=float)
+    lo, hi = np.percentile(acs, 15), np.percentile(acs, 85)
+    cur = acs[-1]
+    return bool(cur <= lo or cur >= hi)
+
+
+def _t_sum_var_contract(history: List[Dict]) -> bool:
+    """近 10 期和值波动收窄到历史低位（<=P30）时触发。"""
+    if len(history) < 40:
+        return False
+    sums = F.sums(history)
+    cur_std = float(np.std(sums[-10:]))
+    stds = np.array([float(np.std(sums[j:j + 10]))
+                     for j in range(len(sums) - 10)], dtype=float)
+    if len(stds) < 20:
+        return False
+    return bool(cur_std <= np.percentile(stds, 30))
 
 
 def run_pattern(pattern: Dict, history: List[Dict]) -> Dict:
