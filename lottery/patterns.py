@@ -444,6 +444,39 @@ def _t_repeat_count(history: List[Dict]) -> bool:
     return rp == 0 or rp >= 2
 
 
+def _t_span_extreme(history: List[Dict]) -> bool:
+    """上期跨度处于历史极端分位（<=P15 或 >=P85）时触发。"""
+    if len(history) < 60:
+        return False
+    sp = F.span(history)
+    lo, hi = np.percentile(sp, 15), np.percentile(sp, 85)
+    cur = sp[-1]
+    return bool(cur <= lo or cur >= hi)
+
+
+def _t_ac_extreme(history: List[Dict]) -> bool:
+    """上期 AC 值处于历史极端分位时触发。"""
+    if len(history) < 60:
+        return False
+    acs = np.array([F.ac_value(d["reds"]) for d in history], dtype=float)
+    lo, hi = np.percentile(acs, 15), np.percentile(acs, 85)
+    cur = acs[-1]
+    return bool(cur <= lo or cur >= hi)
+
+
+def _t_sum_var_contract(history: List[Dict]) -> bool:
+    """近 10 期和值波动收窄到历史低位（<=P30）时触发。"""
+    if len(history) < 40:
+        return False
+    sums = F.sums(history)
+    cur_std = float(np.std(sums[-10:]))
+    stds = np.array([float(np.std(sums[j:j + 10]))
+                     for j in range(len(sums) - 10)], dtype=float)
+    if len(stds) < 20:
+        return False
+    return bool(cur_std <= np.percentile(stds, 30))
+
+
 # ---------- 规律清单 ----------
 
 PATTERNS: List[Dict] = [
@@ -835,39 +868,6 @@ PATTERNS: List[Dict] = [
         "base_fn": None,
     },
 ]
-
-
-def _t_span_extreme(history: List[Dict]) -> bool:
-    """上期跨度处于历史极端分位（<=P15 或 >=P85）时触发。"""
-    if len(history) < 60:
-        return False
-    sp = F.span(history)
-    lo, hi = np.percentile(sp, 15), np.percentile(sp, 85)
-    cur = sp[-1]
-    return bool(cur <= lo or cur >= hi)
-
-
-def _t_ac_extreme(history: List[Dict]) -> bool:
-    """上期 AC 值处于历史极端分位时触发。"""
-    if len(history) < 60:
-        return False
-    acs = np.array([F.ac_value(d["reds"]) for d in history], dtype=float)
-    lo, hi = np.percentile(acs, 15), np.percentile(acs, 85)
-    cur = acs[-1]
-    return bool(cur <= lo or cur >= hi)
-
-
-def _t_sum_var_contract(history: List[Dict]) -> bool:
-    """近 10 期和值波动收窄到历史低位（<=P30）时触发。"""
-    if len(history) < 40:
-        return False
-    sums = F.sums(history)
-    cur_std = float(np.std(sums[-10:]))
-    stds = np.array([float(np.std(sums[j:j + 10]))
-                     for j in range(len(sums) - 10)], dtype=float)
-    if len(stds) < 20:
-        return False
-    return bool(cur_std <= np.percentile(stds, 30))
 
 
 def run_pattern(pattern: Dict, history: List[Dict]) -> Dict:
