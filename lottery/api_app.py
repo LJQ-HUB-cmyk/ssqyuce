@@ -20,7 +20,7 @@ class _NoCacheStaticFiles(StaticFiles):
 from . import config, data_fetcher, db
 from . import features as F, diagnose as D, mining as M
 
-app = FastAPI(title="双色球智能预测分析系统", version="0.5.0")
+app = FastAPI(title="双色球智能预测分析系统", version=config.APP_VERSION)
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
@@ -36,7 +36,24 @@ app.mount("/static", _NoCacheStaticFiles(directory=str(STATIC_DIR)), name="stati
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "issues": db.count_draws(), "max_issue": db.max_issue()}
+    return {
+        "status": "ok",
+        "version": config.APP_VERSION,
+        "issues": db.count_draws(),
+        "max_issue": db.max_issue(),
+    }
+
+
+@app.get("/api/info")
+def app_info():
+    """系统版本与里程碑状态（主页页脚徽标与「关于」展示用）。"""
+    return {
+        "name": "双色球智能预测分析系统",
+        "version": config.APP_VERSION,
+        "build": config.APP_BUILD,
+        "milestones": config.APP_MILESTONES,
+        "plan": "docs/UPGRADE_PLAN.md + docs/M3_M4_PLAN.md",
+    }
 
 
 @app.post("/api/refresh")

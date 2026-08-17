@@ -15,6 +15,17 @@ DB_PATH = Path(os.environ.get("LOTT_DB", str(DATA_DIR / "ssq.db")))
 
 DATA_URL = "http://e.17500.cn/getData/ssq.TXT"
 
+# ---------- 版本信息（前端主页 / API / GitHub 说明统一引用） ----------
+
+APP_VERSION = "0.6.0"          # 语义化版本：M1 前端工作台 + M2 模型升级已上线
+APP_BUILD = "2026-08-M2"       # 构建标识（M3/M4 规划中，见 docs/M3_M4_PLAN.md）
+APP_MILESTONES = {
+    "M1": {"status": "done",    "desc": "前端 Tab 工作台 + 规律库扩容 29 条 + 自动挖掘管道 + 任务系统"},
+    "M2": {"status": "done",    "desc": "GBDT/RF 概率模型 + 滚动 Brier 加权融合 + 概率校准 + 蓝球独立投票 + ML walk-forward 评估"},
+    "M3": {"status": "planned", "desc": "研究闭环：LLM 三轮辩论完善与离线评估、挖掘管道增强、规律研究台"},
+    "M4": {"status": "planned", "desc": "长期运营：在线累积报表、方法 A/B 开关、通知、多源对账、运维工程"},
+}
+
 # ---------- LLM 通道（全部来自环境变量，无仓库内置密钥/地址） ----------
 
 LLM_DISABLED = os.environ.get("LOTT_LLM_DISABLED", "0") == "1"

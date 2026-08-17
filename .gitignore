@@ -5,3 +5,7 @@ __pycache__/
 *.pyc
 .env
 双色球预测系统方案.md
+
+# 运行时数据（含密钥与训练产物，禁止入库）
+data/llm_config.json
+data/ml_models/

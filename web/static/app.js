@@ -961,6 +961,12 @@ async function loadAll() {
     await renderHistory();
     if (health) {
       $("#dataStatus").textContent = health.issues + " 期 | " + (health.max_issue || "");
+      if (health.version) {
+        const ver = "v" + health.version;
+        const vb = $("#verBadge"), vt = $("#verText");
+        if (vb) { vb.textContent = ver; vb.title = "系统版本 " + ver + "（M1 · M2 已上线，M3/M4 规划中）"; }
+        if (vt) vt.textContent = ver;
+      }
     }
     try {
       const ev = await api("/api/eval");

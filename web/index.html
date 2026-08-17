@@ -4,10 +4,10 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>双色球智能预测分析系统</title>
-<link rel="stylesheet" href="/static/style.css?v=20260816.4">
+<link rel="stylesheet" href="/static/style.css?v=20260816.5">
 <!-- ECharts CDN + 本地 fallback -->
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"
-  onerror="this.src='/static/vendor/echarts.min.js?v=20260816.4'"></script>
+  onerror="this.src='/static/vendor/echarts.min.js?v=20260816.5'"></script>
 </head>
 <body>
 <div class="app">
@@ -17,6 +17,7 @@
     <div class="brand">
       <h1>🎱 双色球智能预测分析系统</h1>
       <span class="badge" id="dataStatus">加载中…</span>
+      <span class="badge badge-ver" id="verBadge" title="系统版本">v·</span>
     </div>
     <div class="topbar-actions">
       <button onclick="toggleTheme()" title="切换主题">🌓 主题</button>
@@ -270,10 +271,10 @@
 
   
   
-      <footer>双色球智能预测分析系统 · 仅供研究参考 · 随机性诚实声明 · 数据源 e.17500.cn</footer>
+      <footer>双色球智能预测分析系统 <span class="badge badge-ver" id="verText">v0.6.0</span>（M1 · M2 已上线）· 仅供研究参考 · 随机性诚实声明 · 数据源 e.17500.cn</footer>
 </div>
 
 <div id="toast"></div>
-<script src="/static/app.js?v=20260816.4"></script>
+<script src="/static/app.js?v=20260816.5"></script>
 </body>
 </html>
