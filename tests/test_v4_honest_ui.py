@@ -150,11 +150,25 @@ def test_cache_bust_version_bumped():
 
 
 def test_app_version_and_milestone_bumped():
-    """config.py 的 APP_VERSION/APP_BUILD 与里程碑必须含 V4 条目。"""
+    """V4 交付必须有版本提升与里程碑条目。
+
+    版本号断言刻意写成「不低于 V4 交付时的 2.0.0」而非硬编码当前值：
+    后续批次（V5 → 2.1.0）再升版本时无需回来改这个测试，
+    但仍能抓住真实回归 —— 把版本号退回 1.x、或删掉 V4 里程碑，测试必须失败。
+    """
     from lottery import config
-    assert config.APP_VERSION == "2.0.0", f"APP_VERSION 应为 2.0.0，实际 {config.APP_VERSION}"
-    assert config.APP_BUILD == "2026-10-V4", f"APP_BUILD 应为 2026-10-V4，实际 {config.APP_BUILD}"
+
+    def _ver(v: str):
+        return tuple(int(x) for x in str(v).split(".") if x.isdigit())
+
+    assert _ver(config.APP_VERSION) >= (2, 0, 0), (
+        f"APP_VERSION 不应低于 V4 交付时的 2.0.0，实际 {config.APP_VERSION}")
+    # V4 是历史事实：该里程碑条目必须长期保留，不随批次前进而删除
     assert "V4" in config.APP_MILESTONES, "APP_MILESTONES 缺少 V4 条目"
+    assert config.APP_MILESTONES["V4"].get("status") == "done"
+    # APP_BUILD 采用 `YYYY-MM-VN` 形态
+    assert "2026-10-V" in config.APP_BUILD, (
+        f"APP_BUILD 形态应为 2026-10-VN，实际 {config.APP_BUILD}")
 
 
 # ---------- 5. 后端：端点存在 + 缺依赖时优雅降级 ----------

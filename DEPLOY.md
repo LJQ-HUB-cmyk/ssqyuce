@@ -73,7 +73,7 @@ curl http://<VPS_IP>:18000/api/health
 > 的版本号（缓存键含 query，改版本号即换新键），否则用户拿到的仍是旧前端。
 > 只有 `index.html` 本身不缓存，所以只改版本号、无需清入口缓存。
 >
-> 当前版本：`?v=20261015.1`（V4 诚实口径交付，`APP_VERSION=2.0.0` / `APP_BUILD=2026-10-V4`）。
+> 当前版本：`?v=20261015.2`（V5 自进化交付，`APP_VERSION=2.1.0` / `APP_BUILD=2026-10-V5`）。
 
 ## 四·补、V4 诚实口径端点的部署验证
 
@@ -97,6 +97,27 @@ curl -s http://127.0.0.1:18000/api/portfolio/expected-value
 curl -sI "https://ssq.ff88.de/static/app.js?v=20261015.1" | grep -i x-cache-status
 ```
 
+
+## 四·补二、V5 自进化端点的部署验证
+
+V5 新增三个端点。**注意其中两个是重操作**，验证时务必带小窗口参数，
+避免在部署脚本里触发 5 分钟以上的全量回放：
+
+```bash
+# 快：假说库与进化进度（毫秒级）
+curl -s http://127.0.0.1:18000/api/evolution/status
+# 期望：{"available":true,"total":N,"by_status":{...},"active_overrides":{...}}
+
+# 慢：方法级战斗回放。limit=0 是**全量约 5 分钟**，验证请用 limit=400（约 10~20 秒）
+curl -s "http://127.0.0.1:18000/api/battle/report?limit=400&start=300" | head -c 300
+# 期望含：methods / comparison{pairs,n_significant_uncorrected,n_significant_corrected} / n_issues / gate_zh
+```
+
+`POST /api/evolution/run` 会**写** `data/hypotheses.json` 并调用 LLM，
+耗时可能超过 10 分钟，**不要**放进自动验证脚本；需要时手动触发。
+
+另：`data/hypotheses.json` 是运行时状态，已在 `.gitignore` 中，
+升级时若要把本机假说库带到别的节点，需手动 `scp`（不要指望 git）。
 
 ## 五、防火墙 / 安全组
 

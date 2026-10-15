@@ -226,3 +226,22 @@ def test_api_run_endpoint_returns_503_when_module_missing(monkeypatch):
     r = TestClient(api_app.app).post("/api/evolution/run")
     assert r.status_code == 503
     assert r.json().get("available") is False
+
+
+# ---------- 4. V5 交付必须被记录（版本/里程碑） ----------
+
+def test_v5_delivery_is_recorded():
+    """V5 自进化批次必须有版本提升与里程碑条目，且不破坏 V4 的历史记录。"""
+    from lottery import config
+
+    def _ver(v: str):
+        return tuple(int(x) for x in str(v).split(".") if x.isdigit())
+
+    assert _ver(config.APP_VERSION) >= (2, 1, 0), (
+        f"V5 交付后 APP_VERSION 应 >= 2.1.0，实际 {config.APP_VERSION}")
+    assert config.APP_BUILD == "2026-10-V5", (
+        f"APP_BUILD 应为 2026-10-V5，实际 {config.APP_BUILD}")
+    assert "V5" in config.APP_MILESTONES, "APP_MILESTONES 缺少 V5 条目"
+    assert config.APP_MILESTONES["V5"].get("status") == "done"
+    # V4 的历史记录不得因 V5 而丢失
+    assert "V4" in config.APP_MILESTONES

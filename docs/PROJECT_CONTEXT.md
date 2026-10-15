@@ -8,9 +8,9 @@
 
 ## 2. 当前发布状态
 
-- 发布版本：`v2.0.0`
-- 构建标识：`2026-10-V4`
-- 当前主分支提交：见 `git log -1`（V4 诚实口径重构提交）
+- 发布版本：`v2.1.0`
+- 构建标识：`2026-10-V5`
+- 当前主分支提交：见 `git log -1`（V5 自进化系统提交）
 - GitHub：`https://github.com/jiam9069/ssqyuce`
 - 部署站点（均为 Docker Compose，容器 `ssq-predictor`，端口 `18000`）：
   - **本机**：`/root/DSH/应用/ssqyuce`，公网入口 `https://ssq.ff88.de`
@@ -18,13 +18,55 @@
   - **R71s.AI**（192.168.5.5）：`/opt/ssq`，GitHub/Docker Hub 直连均不通；升级用「BF.US `docker save|gzip` → 本机中转 → `docker load` + `compose up -d --no-build`」（135MB 镜像传输验证可行）；docker-compose.yml 有本地代理注入改动（SSQ_PROXY），属预期保留
   - **ZT.JP.Plus**（jp6.ff88.xx.kg）：`/opt/ssqyuce`，GitHub/Docker Hub 均可直连，标准 git clone + 构建；数据与 .env 由 ivy-ray-EU 迁移接替
 - **ivy-ray-EU 已于 2026-09-17 下线删除**（容器/目录/镜像清除，18000 释放，数据已迁往 ZT.JP.Plus）
-- 最近验证（2026-10-15，本机）：容器 `healthy`，`/api/info` 返回 v2.0.0 / 2026-10-V4，
-  3514 期（max 2026117）；三个 V4 新端点均 200；公网 `https://ssq.ff88.de` 同样返回 v2.0.0，
-  `/static/app.js?v=20261015.1` 返回 `x-cache-status: MISS`（缓存已换新键）。
+- 最近验证（2026-10-15，本机）：容器 `healthy`，`/api/info` 返回 v2.1.0 / 2026-10-V5，
+  3514 期（max 2026117）；三个 V4 新端点均 200；公网 `https://ssq.ff88.de` 同样返回 v2.1.0，
+  `/static/app.js?v=20261015.2` 返回 `x-cache-status: MISS`（缓存已换新键）。
   R71s / ZT.JP.Plus 启动预热期 healthcheck 可能短暂 `unhealthy`（回测占满 CPU 使 8s 探活超时），非故障。
 - **api.b.ai 网关账户余额已耗尽**（`insufficient_user_quota`，balance=0）：LLM 通道自检返回“模型无返回”，纯统计模式不受影响；需充值或换通道后 LLM 才恢复。
 
 ## 3. 已完成能力
+
+### v2.1.0：V5 自进化系统（2026-10）★ 首次具备自我完善能力
+
+**用户口径**：准确性 = 基于历史数据查找规律特点 → 用于实战 → **通过实战结果对比**。
+（用户已明确表示充分明白彩票随机独立性、不需要反复提醒；故一律用实战对比口径表述。）
+
+**四段闭环**：历史数据 → 战斗回放逐期验证 → LLM 提炼规律 → A/B 实战验证 → 裁决 → 用已验证规律预测。
+
+- **`lottery/battle.py`（49 测试）**：方法级 walk-forward 战斗回放。`replay_method`/`replay_all`/
+  `compare_methods`/`battle_report`；红球 Wilcoxon + 蓝球 McNemar + Fisher 合并 +
+  Bonferroni/BH 校正；严格只用 `draws[:t]`（双向泄漏测试）；`ml`/`llm` 标 `replayable: False`。
+- **`lottery/hypothesis.py`（46 测试）**：确定性统计挖掘 + LLM 提炼可验证假说；
+  LLM 失败必降级；假说库生命周期 proposed→validated/rejected/retired，statement 去重累加 attempts；
+  落盘 `data/hypotheses.json`（**运行时状态，已 gitignore**）。
+- **`lottery/evolution.py`（32 测试）**：`apply_hypotheses`（**只消费 validated**）、
+  `apply_structure_rules`、`verify_hypothesis_ab`（配对 A/B）、`predict_with_evolution`、`evolution_status`。
+- **每期自动进化**：`api_app._evolution_step()` 接入调度器，在开奖→抓取→在线对照之后、
+  生成预测之前跑一轮（挖掘→注册→A/B 验证→裁决）；失败不影响当期预测生成。
+- **端点**：`/api/battle/report`、`/api/evolution/status`、`/api/evolution/run`（缺模块降级 503）。
+- **前端**：「评估报告 → 🧬 实战战绩」子页（进化总览/战绩榜/两两对比/规律库/进化操作）。
+
+**实测数字（3515 期全量回放，3215 期可评估 × 10 注）**：
+
+| 方法 | 红球均值 | 蓝球命中率 | ≥五等奖率 |
+|---|---|---|---|
+| stat:freq | 1.0951 | 6.24% | 6.67% |
+| blue_coverage | 1.0951 | 6.32% | 6.76% |
+| uniform | 1.0926 | 6.30% | 6.69% |
+| stat:bayes | 1.0864 | 6.33% | 6.75% |
+
+- 11 组配对：**未校正显著 3 组 → 校正后仅 1 组**（stat:bayes 显著差于 blue_coverage，BH p=0.0187）。
+- `uniform` 的 ROI +203.9% 是**单期离群值**（2022128 期 1 注全中 6 红 = 二等奖 ¥180,000）→
+  新增稳健口径 `roi_ex_top`（各方法 −75%~−78%），前端两口径并排。
+- 9 条假说各 515 期配对 A/B：Δ红球全部落在 ±0.015 → **0 validated / 0 rejected / 9 unchanged**。
+  **目前没有任何规律达到显著**，故预测输出等同基线（系统不因「有假说库」宣称超出基线能力）。
+
+**修掉的三个集成缺陷**（都属「看起来能跑、实际断链」）：
+1. 71% 挖掘结果被静默丢弃（挖掘端产 `prefer_structure`，白名单不含）→ 2/7 → 7/7。
+2. 假说永远停在 proposed：`evolve_once` 无任何环节送 A/B 验证 → 新增 `_evolution_step`。
+3. `evolve_once` 把假说库 dict 当假说；`_registry_path` 传 str 时 `path.parent` 崩。
+
+**测试**：全量 **356 → 380 passed**；`?v=` → 20261015.2；APP_VERSION → 2.1.0 / APP_BUILD → 2026-10-V5。
 
 ### v2.0.0：V4 诚实口径重构（2026-10）★ 方向纠正型交付
 
