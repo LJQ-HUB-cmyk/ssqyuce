@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>双色球智能预测分析系统</title>
-<link rel="stylesheet" href="/static/style.css?v=20261007.2">
+<link rel="stylesheet" href="/static/style.css?v=20261015.1">
 <!-- ECharts CDN + 本地 fallback -->
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"
   onerror="this.src='/static/vendor/echarts.min.js?v=20260817.7'"></script>
@@ -92,6 +92,14 @@
         <div class="card">
           <h2>🏆 历史战绩 <span class="tag" id="trackRecordTag">加载中…</span></h2>
           <div id="trackRecord"></div>
+        </div>
+
+        <!-- 随机性检验（V4）：回答「为什么准确率上不去」——数据与均匀随机不可区分，
+             且给出当前样本量下能检出的最小提升幅度。样本不足时明确不下结论。 -->
+        <div class="card" id="rigorCard">
+          <h2>🎲 随机性检验 <span class="tag" id="rigorTag">加载中…</span></h2>
+          <div id="rigorBody"></div>
+          <div class="note">双色球为独立随机事件，本系统不承诺中奖率。</div>
         </div>
       </section>
 
@@ -468,6 +476,6 @@
 </div>
 
 <div id="toast"></div>
-<script src="/static/app.js?v=20261007.2"></script>
+<script src="/static/app.js?v=20261015.1"></script>
 </body>
 </html>

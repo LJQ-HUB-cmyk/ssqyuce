@@ -8,20 +8,77 @@
 
 ## 2. 当前发布状态
 
-- 发布版本：`v1.0.0`
-- 构建标识：`2026-10-U6`
-- 当前主分支提交：见 `git log -1`（v1.0.0 发布提交）
+- 发布版本：`v2.0.0`
+- 构建标识：`2026-10-V4`
+- 当前主分支提交：见 `git log -1`（V4 诚实口径重构提交）
 - GitHub：`https://github.com/jiam9069/ssqyuce`
 - 部署站点（均为 Docker Compose，容器 `ssq-predictor`，端口 `18000`）：
+  - **本机**：`/root/DSH/应用/ssqyuce`，公网入口 `https://ssq.ff88.de`
   - **BF.US**：`/opt/ssqyuce`，GitHub 可直连，构建正常；也是本机推 GitHub 的中转
   - **R71s.AI**（192.168.5.5）：`/opt/ssq`，GitHub/Docker Hub 直连均不通；升级用「BF.US `docker save|gzip` → 本机中转 → `docker load` + `compose up -d --no-build`」（135MB 镜像传输验证可行）；docker-compose.yml 有本地代理注入改动（SSQ_PROXY），属预期保留
   - **ZT.JP.Plus**（jp6.ff88.xx.kg）：`/opt/ssqyuce`，GitHub/Docker Hub 均可直连，标准 git clone + 构建；数据与 .env 由 ivy-ray-EU 迁移接替
 - **ivy-ray-EU 已于 2026-09-17 下线删除**（容器/目录/镜像清除，18000 释放，数据已迁往 ZT.JP.Plus）
-- 最近验证（2026-09-17）：三站容器均 `healthy`，本机外部访问 `/api/info` 均返回 v0.9.0 / 2026-09-M5.1；ZT.JP.Plus 3505 期（max 2026108）、自动生成了 2026109 预测、累计评估含 LLM 方法。
+- 最近验证（2026-10-15，本机）：容器 `healthy`，`/api/info` 返回 v2.0.0 / 2026-10-V4，
+  3514 期（max 2026117）；三个 V4 新端点均 200；公网 `https://ssq.ff88.de` 同样返回 v2.0.0，
+  `/static/app.js?v=20261015.1` 返回 `x-cache-status: MISS`（缓存已换新键）。
   R71s / ZT.JP.Plus 启动预热期 healthcheck 可能短暂 `unhealthy`（回测占满 CPU 使 8s 探活超时），非故障。
 - **api.b.ai 网关账户余额已耗尽**（`insufficient_user_quota`，balance=0）：LLM 通道自检返回“模型无返回”，纯统计模式不受影响；需充值或换通道后 LLM 才恢复。
 
 ## 3. 已完成能力
+
+### v2.0.0：V4 诚实口径重构（2026-10）★ 方向纠正型交付
+
+**触发**：用户实报「准确性过低」，要求分析提升准确性的方法、必要时推倒核心算法重做。
+
+**诊断（先量化再动手，见 `docs/V4_ACCURACY_DIAGNOSIS.md`）**：本机 3514 期数据显示
+开奖与均匀随机**不可区分**（红卡方 45.18/p=0.061，蓝卡方 8.84/p=0.886）；
+7 类规律策略经多重检验校正后**无一显著**；累计评估样本仅 25 注。
+结论：**命中率不可提升**，故本次不追命中率，改为「修真实缺陷 + 做数学上可优化的事」。
+
+- **V4-A `lottery/rigor.py`（新增，严格统计检验层）**：`randomness_report`（9 项检验 +
+  综合 verdict + `min_detectable_effect`）、`strategy_significance`（t/符号检验 +
+  Bonferroni 与 BH-FDR 校正）、`strategy_significance_multi`（整组 p 值上做真 BH）、
+  `min_sample_size`、`evaluate_signal`（walk-forward，`hit_series` 含 issue）。
+  检验**双向自证**：注入偏置必判 deviation、真随机不得误报。
+  **关键约定**：单策略无法做 BH 时 `bh_p=None` + `not-applicable-single-p`，
+  **绝不**用 `min()` 把不可计算值当更优值选中（这曾使校正被静默废掉）。
+- **V4-B 修掉 `_brier_blend` 样本内过拟合**：原用最近 50 期**样本内** Brier +
+  `1/brier` **无界倒数放大**（brier=0.001 时达均匀模型 148.8×）；现为严格
+  **walk-forward 样本外** Brier → softmax（温度 0.05/0.02）→ 上限 `MAX_MODEL_WEIGHT=0.6`
+  → 收缩 `WEIGHT_SHRINKAGE=0.5`；不可回放方法标注 `weight_source="fixed-fallback"`。
+- **V4-C 核心目标改为覆盖优化 + 奖金期望**：`blue_coverage_plan`（n≤16 蓝球互不相同，
+  「至少中 1 蓝」n=5: 27.58%→31.25%、n=10: 47.55%→62.50%、n=16: 100%）、
+  `portfolio_expected_value`（含 `ev_ratio`/`sixth_ev_ratio`/`jackpot_assumption`）、
+  `coverage_optimize(objective="expected_value")`；**修复 `_apply_blue_mode` 在噪声上决策**
+  （回退门槛 30 期 → 统计反推的 735 期）。
+- **V4-D 诚实口径落到界面**：新增 `/api/rigor/randomness`、`/api/rigor/signal`、
+  `/api/portfolio/expected-value`（缺 rigor 时降级 503）；前端比率指标一律带样本量，
+  不足时显示「样本不足，不构成结论」；新增「🎲 随机性检验」卡回答「为什么准确率上不去」。
+- 测试：新增 4 个 V4 测试文件（rigor 53 / blend 23 / coverage 43 / honest_ui 17），
+  全量 **89 → 229 passed**；顺带修掉 2 个测试隔离缺陷（`config.DB_PATH` 裸赋值泄漏空库、
+  `builtins.__import__` 打桩拦不住 `from . import rigor`）。
+- 前端缓存击穿 `?v=` → `20261015.1`。
+
+**两条必须与功能同时呈现的诚实边界（已写进代码断言）**：
+1. 覆盖优化提高**中奖频率**而非期望收益——六等奖 EV 比恒为 `5/32=0.15625`，与注数无关；
+   覆盖满 16 蓝「必中」但成本 ¥32 只换回 ¥5，**净亏 ¥27**。
+2. 单注完整期望回报约 **¥0.9135**/成本 ¥2.00 → **返还率 45.67%**（每 ¥100 期望亏 ¥54.33）。
+
+### v1.0.2：U9 历史战绩样本口径修正（2026-10）
+
+- 历史战绩卡的期数改为接口实际返回的**去重样本**（跨方法按 issue 求并集），
+  不再用字面量 `N`、也不再把各方法 `issues` 相加；`sample_limit` 明确为**查询上限**。
+- 样本不足（< 60 期，对齐 `LOTT_METHOD_RECOMMENDATION_MIN_ISSUES`）不给「最佳方法」结论；
+  取数失败显式报错，不再伪装成「样本为 0」。
+- 「🏆 历史战绩」卡移至「🎫 上期开奖回执」下方。
+
+### v1.0.1：U8 推理型模型适配 + 回执补全（2026-10）
+
+- 设置页保存的模型成为**唯一事实来源**（原为前插，导致旧模型残留在轮转列表产生 404）。
+- 推理型模型输出预算自适应（`content` 空而 `reasoning_content` 非空 → 抬到
+  `LOTT_LLM_MAX_TOKENS` 重试并持久化到 `data/llm_budget.json`）+ `LOTT_LLM_LONG_TIMEOUT`。
+- 观察轮报错聚合全部模型原因；`/api/llm/test` 改为结构化出文探测。
+- 上期开奖回执列出上期推荐逐注命中（含红中 X/6、蓝球、奖级）。
 
 ### v1.0.0：v3 方案 U1–U7（2026-10）
 

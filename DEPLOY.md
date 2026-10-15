@@ -72,6 +72,31 @@ curl http://<VPS_IP>:18000/api/health
 > `web/index.html` 里 `/static/style.css?v=<日期>.<序号>` 与 `/static/app.js?v=<日期>.<序号>`
 > 的版本号（缓存键含 query，改版本号即换新键），否则用户拿到的仍是旧前端。
 > 只有 `index.html` 本身不缓存，所以只改版本号、无需清入口缓存。
+>
+> 当前版本：`?v=20261015.1`（V4 诚实口径交付，`APP_VERSION=2.0.0` / `APP_BUILD=2026-10-V4`）。
+
+## 四·补、V4 诚实口径端点的部署验证
+
+V4 新增三个端点，部署后应逐一确认（缺 `lottery/rigor.py` 时前两个会降级为 503，
+**这是预期行为、不是故障**，不影响服务启动与其它功能）：
+
+```bash
+curl -s http://127.0.0.1:18000/api/rigor/randomness | head -c 200
+# 期望：{"baseline":...,"verdict":"consistent-with-random","n_draws":3514,...}
+
+curl -s "http://127.0.0.1:18000/api/rigor/signal?strategy=hot&window=100"
+# 期望：survives_correction=false（热号 W=100 是预期中的假阳性，校正后不显著）
+
+curl -s http://127.0.0.1:18000/api/portfolio/expected-value
+# 期望：expected_roi 为负（彩票是负期望游戏）
+```
+
+公网入口另需确认缓存已换新键（应返回 `x-cache-status: MISS`）：
+
+```bash
+curl -sI "https://ssq.ff88.de/static/app.js?v=20261015.1" | grep -i x-cache-status
+```
+
 
 ## 五、防火墙 / 安全组
 

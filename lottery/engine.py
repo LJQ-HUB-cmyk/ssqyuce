@@ -103,81 +103,350 @@ def ensemble_mass(red_blend: np.ndarray, blue_blend: np.ndarray,
     return 100.0 * (0.75 * r_mass / norm_r + 0.25 * b_mass / norm_b)
 
 
+# ---------- V4-B：融合权重（walk-forward 样本外 + softmax + 上限 + 收缩） ----------
+#
+# 历史缺陷（v4 前）：_brier_blend 用「最近 50 期」算样本内 Brier，再以
+#   weights = max(0.01, 1/brier) 定权。三重错误叠加：
+#   (a) 样本内：模型本身就是在这些期上拟合/平滑出来的，Brier 系统性偏乐观；
+#   (b) 1/brier 无上界：样本内 brier→0 时权重→+∞（实测样本内 brier 0.001
+#       会拿到约 149x 于均匀模型的权重），是追逐噪声而非贝叶斯融合；
+#   (c) 无权重上限、无收缩：小样本抖动直接变成单一方法独裁。
+# 现改为：严格 walk-forward 样本外 Brier → softmax(-brier/T) → 权重上限 → 收缩。
+
+# 融合权重评估窗口（期）。旧值 50 保持不变，仅用于样本外评估。
+BLEND_EVAL_WINDOW = 50
+# walk-forward 评估时必须保留的最小训练历史（期）。用于把评估窗口截断到
+# len(draws)-300 之内，保证每个评估点都有足够历史重建模型。
+BLEND_MIN_TRAIN = 300
+# 少于该期数不做样本外评估 → 退化为等权（数据不足时诚实等权，不假装有信息）。
+BLEND_MIN_EVAL = 10
+# softmax 温度 T：w ∝ exp(-brier/T)。T 越大越接近等权。红球 Brier 的合理量级
+# 约 0.10-0.20（均匀模型 33 维、单期 6 命中约 0.149），取 0.05 使「brier 相差
+# 0.05」≈ 权重比 e≈2.7x —— 有区分度但远不到独裁。旧 1/brier 在同样差距下可
+# 达数十倍。蓝球 16 维 Brier 量级更小，用单独的温度。
+BLEND_SOFTMAX_TEMP_RED = 0.05
+BLEND_SOFTMAX_TEMP_BLUE = 0.02
+# 任一方法在融合中的权重上限。防止单一方法独裁（旧逻辑无上限）。
+MAX_MODEL_WEIGHT = 0.6
+# softmax 前的 Brier 保护下限，避免极端 0 值导致 exp 溢出/独裁。
+# 注意：这不是旧的「1/brier 放大」——它只用于数值稳定，权重动态范围仍由温度控制。
+BLEND_BRIER_FLOOR = 0.001
+# 权重收缩系数 λ：final = (1-λ)·uniform + λ·data。λ=0.5 防小样本抖动。
+WEIGHT_SHRINKAGE = 0.5
+
+
+class _BlendArray(np.ndarray):
+    """带 .attrs 的 float ndarray，用于携带融合明细。
+
+    纯 ndarray 无法挂属性；子类化后对调用方完全透明（算术、切片、sum、
+    np.asarray 行为不变），仅多出 `.attrs` 供审计字段（weight_source /
+    n_eval / raw_briers / weights）传递，避免改动 _brier_blend 的返回签名。
+    """
+
+    def __new__(cls, data, attrs: Optional[Dict] = None):
+        obj = np.asarray(data, dtype=float).view(cls)
+        obj.attrs = dict(attrs or {})
+        return obj
+
+    def __array_finalize__(self, obj):
+        if obj is None:
+            return
+        self.attrs = getattr(obj, "attrs", None)
+        # 视图/切片默认丢弃明细，避免携带过期元数据
+        if self.attrs is not None and self.base is not None:
+            self.attrs = None
+
+
+def _with_meta(arr: np.ndarray, meta: Dict) -> "_BlendArray":
+    """把融合明细挂到红球融合向量上（返回 ndarray 子类，调用方无感）。"""
+    return _BlendArray(arr, meta)
+
+
+def _softmax_weights(briers: Dict[str, float], temp: float) -> Dict[str, float]:
+    """softmax over -brier：w_m ∝ exp(-brier_m / T)，再做权重上限 + 均匀收缩。
+
+    相比旧的 1/brier 倒数放大：
+    - 指数形式天然有界（任一权重 ≤ 1，且差异由温度 T 控制）；
+    - 再经 MAX_MODEL_WEIGHT 截断 + (1-λ) 均匀收缩，杜绝单一方法独裁；
+    - 全为 nan/inf 或空池时回退等权。
+    """
+    if not briers:
+        return {}
+    names = list(briers)
+    vals = np.array([briers[n] for n in names], dtype=float)
+    vals = np.where(np.isfinite(vals), vals, np.nanmax(vals[np.isfinite(vals)]) if np.isfinite(vals).any() else 1.0)
+    logits = -np.maximum(vals, BLEND_BRIER_FLOOR) / max(temp, 1e-9)
+    logits = logits - logits.max()          # 数值稳定
+    w = np.exp(logits)
+    s = w.sum()
+    weights = (w / s) if s > 0 else np.full(len(names), 1.0 / len(names))
+
+    # 权重收缩：向均匀权重靠拢，防小样本抖动
+    n = len(names)
+    lam = float(min(max(WEIGHT_SHRINKAGE, 0.0), 1.0))
+    weights = (1.0 - lam) * (1.0 / n) + lam * weights
+
+    # 权重上限（迭代截断：被截的部分按比例回补给未达上限的方法）
+    weights = _cap_weights(weights, MAX_MODEL_WEIGHT)
+    return {name: float(v) for name, v in zip(names, weights)}
+
+
+def _cap_weights(weights: np.ndarray, cap: float) -> np.ndarray:
+    """把每个权重截断到 cap，并把超出的质量按比例回补给未达上限的分量。
+
+    若 cap·n < 1（上限不可行），退化为均匀权重。
+    """
+    w = np.asarray(weights, dtype=float).copy()
+    n = w.size
+    if n == 0:
+        return w
+    if cap * n <= 1.0:
+        return np.full(n, 1.0 / n)
+    for _ in range(n + 1):
+        over = w > cap + 1e-12
+        if not over.any():
+            break
+        excess = float((w[over] - cap).sum())
+        w[over] = cap
+        free = ~over & (w < cap)
+        if not free.any():
+            break
+        w[free] += excess * (w[free] / w[free].sum())
+    w = np.clip(w, 0.0, cap)
+    s = w.sum()
+    return w / s if s > 0 else np.full(n, 1.0 / n)
+
+
+def _rebuild_probs(name: str, hist: List[Dict]) -> Optional[Dict[str, np.ndarray]]:
+    """用**给定的历史**（下标 < t 的期）重建某个方法的概率分布。
+
+    这是 walk-forward 的核心：评估第 t 期时，只允许看见 hist = draws[:t]。
+
+    可重建的只有模块内的统计基线（models.build_models 的成员）与
+    models.blue_specialist；其余（ml / 外部注入 / LLM 通道）无法用历史回放，
+    返回 None，由调用方按 fixed-fallback 处理。
+    """
+    try:
+        if name == "blue_specialist":
+            return {"blue": M.blue_specialist(hist)}
+        models = M.build_models(hist)
+        if name in models:
+            m = models[name]
+            return {"red": np.asarray(m["red"], dtype=float),
+                    "blue": np.asarray(m["blue"], dtype=float)}
+    except Exception as e:  # noqa: BLE001
+        print(f"[engine] walk-forward 重建 {name} 失败（{len(hist)} 期）: {e}")
+    return None
+
+
+def _walk_forward_brier(pool: Dict[str, Dict], draws: List[Dict],
+                        n_eval: int) -> Dict[str, Dict[str, float]]:
+    """严格 walk-forward 样本外 Brier。
+
+    对每个评估期 t（绝对下标），**只用 draws[:t] 重建该方法的概率分布**，
+    再与第 t 期真实结果比较。绝不使用第 t 期及以后的数据。
+
+    注意：调用方传入的向量只用于**确定方法池与维度**，不用于算分——算分一律
+    用重建结果。这正是修掉「样本内评估」缺陷的关键：旧实现拿调用方那条已经在
+    （含评估窗口的）全量历史上拟合好的向量去和同期真实结果比，Brier 必然乐观。
+
+    返回 {method: {"red": b, "blue": b, "n": n}}，仅含成功评估的方法。
+    """
+    out: Dict[str, Dict[str, float]] = {}
+    if n_eval <= 0 or not draws:
+        return out
+
+    n = len(draws)
+    start = n - n_eval                     # 首个评估期的绝对下标
+    acc: Dict[str, Dict[str, float]] = {}
+
+    for t in range(start, n):
+        hist = draws[:t]                   # ← 严格样本外：只到第 t-1 期
+        if len(hist) < 2:
+            continue
+        cur = draws[t]
+        tr = np.zeros(R_MAX)
+        for r in cur["reds"]:
+            tr[r - 1] = 1.0
+        tb = np.zeros(B_MAX)
+        tb[cur["blue"] - 1] = 1.0
+
+        for name, m in pool.items():
+            rebuilt = _rebuild_probs(name, hist)
+            if rebuilt is None:
+                continue                   # 无法用历史重建 → 不参与样本外定权
+            slot = acc.setdefault(name, {"red": 0.0, "blue": 0.0, "n": 0})
+            hit = False
+            if m.get("red") is not None and rebuilt.get("red") is not None:
+                if rebuilt["red"].shape == np.asarray(m["red"]).shape:
+                    slot["red"] += float(np.mean((rebuilt["red"] - tr) ** 2))
+                    hit = True
+            if m.get("blue") is not None and rebuilt.get("blue") is not None:
+                if rebuilt["blue"].shape == np.asarray(m["blue"]).shape:
+                    slot["blue"] += float(np.mean((rebuilt["blue"] - tb) ** 2))
+                    hit = True
+            if hit:
+                slot["n"] += 1
+
+    for name, slot in acc.items():
+        if slot["n"] > 0:
+            out[name] = {"red": slot["red"] / slot["n"],
+                         "blue": slot["blue"] / slot["n"],
+                         "n": slot["n"]}
+    return out
+
+
 def _brier_blend(models_dict: Dict, draws: List[Dict], adaptive: Optional[Dict] = None) -> tuple:
-    """基于 Brier score 的模型概率融合（替代等权平均），叠加 U3 自适应降权。
+    """基于 **walk-forward 样本外** Brier 的模型概率融合，叠加 U3 自适应降权。
+
+    权重策略（V4-B）：
+    1. 严格 walk-forward：只用第 t 期之前的历史重建每个方法的概率，再与第 t
+       期真实结果算 Brier（默认窗口 50 期，且截断到 len(draws)-300 之内）。
+    2. softmax(-brier/T) 取代旧的 1/brier 倒数放大。
+    3. 权重上限 MAX_MODEL_WEIGHT=0.6，防止单一方法独裁。
+    4. 权重收缩 WEIGHT_SHRINKAGE=0.5：final = 0.5·uniform + 0.5·data。
+    无法用历史重建的方法（ml / 外部注入）**不参与**定权，以预设等权参与融合，
+    并在返回值中标注 weight_source="fixed-fallback"。
 
     adaptive: {method: weight}，来自 METH.adaptive_weights()；None = 不施加。
     蓝球始终并入 M.blue_specialist()（U2），避免蓝球“裸奔”。
+
+    返回 (red_blend, blue_blend)。函数签名与返回类型保持不变（red_blend 仍是
+    ndarray，调用方无需改动）；融合明细（weights / raw_briers / weight_source /
+    n_eval）挂在 red_blend.attrs 上，供 API 审计暴露。
     """
     models_dict = dict(models_dict)
     # U2：蓝球专用模型恒在混合里（红球仅按调用方给定的模型池）
     blue_spec = {"blue_specialist": {
         "red": None, "blue": M.blue_specialist(draws), "name": "blue_specialist"}}
-    n_eval = min(50, len(draws) - 300)
+    n_eval = min(BLEND_EVAL_WINDOW, len(draws) - BLEND_MIN_TRAIN)
     # 融合用模型池：red 用 models_dict，blue 用 models_dict + blue_specialist
     red_pool = {k: m["red"] for k, m in models_dict.items() if m.get("red") is not None}
     blue_pool = {k: m["blue"] for k, m in models_dict.items() if m.get("blue") is not None}
     blue_pool["blue_specialist"] = blue_spec["blue_specialist"]["blue"]
 
-    if n_eval < 10:
-        # 数据不足，等权（blue_specialist 权重与统计模型对等）
+    if n_eval < BLEND_MIN_EVAL:
+        # 数据不足：等权（blue_specialist 权重与统计模型对等），不假装有信息
         n = len(red_pool) or 1
         red_blend = sum(red_pool.values()) / n if red_pool else np.full(R_MAX, 1.0 / R_MAX)
         blue_blend = sum(blue_pool.values()) / len(blue_pool) if blue_pool else np.full(B_MAX, 1.0 / B_MAX)
-        return _apply_adaptive_red(red_blend, adaptive, red_pool), blue_blend
-
-    weights_red: Dict[str, float] = {}
-    weights_blue: Dict[str, float] = {}
-    for name, red_p in red_pool.items():
-        brier_red, count = 0.0, 0
-        for i in range(-n_eval, 0):
-            t = draws[i]
-            tr = np.zeros(33)
-            for r in t["reds"]: tr[r-1] = 1.0
-            brier_red += float(np.mean((red_p - tr) ** 2))
-            count += 1
-        if count > 0:
-            weights_red[name] = max(0.01, 1.0 / max(brier_red / count, 0.001))
+        red_blend = _apply_adaptive_red(red_blend, adaptive, red_pool)
+        red_blend = np.asarray(red_blend, dtype=float)
+        if red_blend.sum() <= 0:
+            red_blend = np.full(R_MAX, 1.0 / R_MAX)
         else:
-            weights_red[name] = 0.01
-    for name, blue_p in blue_pool.items():
-        brier_blue, count = 0.0, 0
-        for i in range(-n_eval, 0):
-            t = draws[i]
-            tb = np.zeros(16)
-            tb[t["blue"]-1] = 1.0
-            brier_blue += float(np.mean((blue_p - tb) ** 2))
-            count += 1
-        if count > 0:
-            weights_blue[name] = max(0.01, 1.0 / max(brier_blue / count, 0.001))
-        else:
-            weights_blue[name] = 0.01
+            red_blend = red_blend / red_blend.sum() * 6
+        blue_blend = np.asarray(blue_blend, dtype=float)
+        blue_blend = (blue_blend / blue_blend.sum() if blue_blend.sum() > 0
+                      else np.full(B_MAX, 1.0 / B_MAX))
+        meta = {
+            "weight_source": "fixed-fallback",
+            "reason": "insufficient_history",
+            "n_eval": max(n_eval, 0),
+            "raw_briers": {},
+            "weights": {"red": {k: 1.0 / (len(red_pool) or 1) for k in red_pool},
+                        "blue": {k: 1.0 / (len(blue_pool) or 1) for k in blue_pool}},
+        }
+        return _with_meta(red_blend, meta), blue_blend
 
-    # U3 自适应降权：对 red 池的方法按权重打折
+    # ---- 严格 walk-forward 样本外 Brier ----
+    # 蓝球侧：blue_specialist 同样可用历史重建，纳入评估
+    wf_pool: Dict[str, Dict] = dict(models_dict)
+    # ---- 严格 walk-forward 样本外 Brier ----
+    # 传入的是「方法池 + 各自需要的维度」，算分一律用 draws[:t] 重建的结果，
+    # 不使用调用方传入的（已在含评估窗口的全量历史上拟合的）向量。
+    wf_pool: Dict[str, Dict] = {}
+    for name, m in models_dict.items():
+        if m.get("red") is not None or m.get("blue") is not None:
+            wf_pool[name] = m
+    wf_pool["blue_specialist"] = blue_spec["blue_specialist"]
+    wf = _walk_forward_brier(wf_pool, draws, n_eval)
+
+    raw_briers: Dict[str, Dict[str, float]] = {}
+    # 无法重建的方法 → 预设等权（fixed-fallback）
+    evaluated = set(wf.keys())
+    fallback_red = sorted(k for k in red_pool if k not in evaluated)
+    fallback_blue = sorted(k for k in blue_pool if k not in evaluated)
+    partial = bool(fallback_red or fallback_blue)
+
+    # 红球权重：可评估者用样本外 Brier 定权；不可评估者取池内「有效权重的中位数」
+    # 作为预设权重，使其以对等地位参与，而**不**使用其样本内 Brier。
+    red_briers = {k: wf[k]["red"] for k in red_pool if k in evaluated}
+    blue_briers = {k: wf[k]["blue"] for k in blue_pool if k in evaluated}
+    raw_briers["red"] = {k: round(float(v), 6) for k, v in red_briers.items()}
+    raw_briers["blue"] = {k: round(float(v), 6) for k, v in blue_briers.items()}
+    for k in fallback_red:
+        raw_briers["red"][k] = None
+    for k in fallback_blue:
+        raw_briers["blue"][k] = None
+
+    weights_red = _softmax_weights(red_briers, BLEND_SOFTMAX_TEMP_RED) if red_briers else {}
+    weights_blue = _softmax_weights(blue_briers, BLEND_SOFTMAX_TEMP_BLUE) if blue_briers else {}
+    # 回退方法：给「可评估方法」的最大权重（即对等参与，而非靠样本内 Brier 抢权）
+    for k in fallback_red:
+        weights_red[k] = (max(weights_red.values()) if weights_red
+                          else 1.0 / max(1, len(red_pool)))
+    for k in fallback_blue:
+        weights_blue[k] = (max(weights_blue.values()) if weights_blue
+                           else 1.0 / max(1, len(blue_pool)))
+    if not red_pool:
+        weights_red = {}
+    if not blue_pool:
+        weights_blue = {}
+
+    # U3 自适应降权：对 red 池的方法按权重打折（在融合权重上施加，语义不变）
     if adaptive:
         for name in list(weights_red.keys()):
-            aw = adaptive.get(name, 1.0)
-            weights_red[name] = weights_red.get(name, 0.01) * aw
+            weights_red[name] = weights_red[name] * float(adaptive.get(name, 1.0))
+        weights_red = _renormalize(weights_red)
 
-    wtr = sum(weights_red.values()) or 1.0
-    wtb = sum(weights_blue.values()) or 1.0
-    weights_red = {k: v / wtr for k, v in weights_red.items()}
-    weights_blue = {k: v / wtb for k, v in weights_blue.items()}
-    print(f"[engine] Brier 红球权重: {weights_red} | 蓝球权重: {weights_blue}")
+    def _norm_red_blend(d: Dict[str, float]) -> np.ndarray:
+        out = np.zeros(R_MAX)
+        for name, m in red_pool.items():
+            out += d.get(name, 0.0) * np.asarray(m, dtype=float)
+        return out
 
-    red_blend = np.zeros(33)
-    for name, m in red_pool.items():
-        red_blend += weights_red.get(name, 0) * m
-    blue_blend = np.zeros(16)
+    red_blend = _apply_adaptive_red(
+        _norm_red_blend(weights_red) if weights_red else np.zeros(R_MAX),
+        adaptive, red_pool)
+    red_blend = np.asarray(red_blend, dtype=float)
+    norm_b = sum(weights_blue.values()) or 1.0
+    weights_blue_pct = {k: v / norm_b for k, v in weights_blue.items()}
+    blue_blend = np.zeros(B_MAX)
     for name, m in blue_pool.items():
-        blue_blend += weights_blue.get(name, 0) * m
-    red_blend = _apply_adaptive_red(red_blend, adaptive, red_pool)
+        blue_blend += weights_blue_pct.get(name, 0.0) * np.asarray(m, dtype=float)
+
+    weight_source = "fixed-fallback" if partial else "walk-forward"
+    print(f"[engine] walk-forward 融合 (n_eval={n_eval}, source={weight_source}) "
+          f"红球权重: { {k: round(v, 4) for k, v in weights_red.items()} } | "
+          f"蓝球权重: { {k: round(v, 4) for k, v in weights_blue_pct.items()} }")
+
     if red_blend.sum() <= 0:
         red_blend = np.full(R_MAX, 1.0 / R_MAX)
     else:
         red_blend = red_blend / red_blend.sum() * 6
-    blue_blend = blue_blend / blue_blend.sum()
-    return red_blend, blue_blend
+    blue_blend = (blue_blend / blue_blend.sum() if blue_blend.sum() > 0
+                  else np.full(B_MAX, 1.0 / B_MAX))
+    meta = {
+        "weight_source": weight_source,
+        "n_eval": int(n_eval),
+        "raw_briers": raw_briers,
+        "weights": {"red": {k: round(float(v), 6) for k, v in weights_red.items()},
+                    "blue": {k: round(float(v), 6) for k, v in weights_blue_pct.items()}},
+        "max_model_weight": MAX_MODEL_WEIGHT,
+        "shrinkage": WEIGHT_SHRINKAGE,
+        "fallback_methods": {"red": fallback_red, "blue": fallback_blue},
+    }
+    return _with_meta(red_blend, meta), blue_blend
+
+
+def _renormalize(weights: Dict[str, float]) -> Dict[str, float]:
+    """把权重表归一到 sum=1（空表或全 0 时回退等权）。"""
+    tot = sum(v for v in weights.values() if v > 0)
+    if tot <= 0:
+        n = len(weights) or 1
+        return {k: 1.0 / n for k in weights}
+    return {k: (v / tot if v > 0 else 0.0) for k, v in weights.items()}
 
 
 def _apply_adaptive_red(red_blend: np.ndarray, adaptive: Optional[Dict],
@@ -450,22 +719,209 @@ def _ml_result_block(ml_entry: Optional[Dict], use_ml: bool,
 
 # ---------- U2 蓝球模式与覆盖 ----------
 
+def _min_significant_blue_sample(base_rate: Optional[float] = None,
+                                 target_rate: Optional[float] = None,
+                                 z: float = 1.96) -> int:
+    """反推「能把 base_rate 与 target_rate 区分开」所需的最小样本量。
+
+    单期蓝球命中是伯努利变量（命中 1 / 未中 0），命中率估计的标准误为
+    sd/sqrt(n)，其中 sd = sqrt(p*(1-p))。要让观测到的下跌不是噪声，样本量必须
+    满足 z * sd / sqrt(n) <= |base_rate - target_rate|，即
+
+        n >= (z * sd / delta)^2
+
+    取 p = 1/16（sd ≈ 0.2421）、delta = 6.25% - 4.5% = 0.0175、z = 1.96：
+    n >= (1.96 * 0.2421 / 0.0175)^2 ≈ 735 期。
+
+    也就是说 30 期窗口（标准误 ≈ 4.42%）在数学上**根本不可能**判定
+    「4.5% 与 6.25% 谁更好」——一个标准误就覆盖了整个 1.75% 的差额。
+    """
+    if base_rate is None:
+        base_rate = getattr(config, "BLUE_RANDOM_RATE", 1.0 / B_MAX)
+    if target_rate is None:
+        target_rate = config.BLUE_FALLBACK_MIN_RATE
+    delta = abs(float(base_rate) - float(target_rate))
+    if delta <= 0:
+        return 2 ** 31 - 1                     # 两者不可区分 → 永不触发
+    p = min(max(float(base_rate), 1e-9), 1.0 - 1e-9)
+    sd = (p * (1.0 - p)) ** 0.5
+    return int(np.ceil((z * sd / delta) ** 2))
+
+
+def _blue_fallback_min_sample() -> int:
+    """回退判定所要求的最小样本量（期）。
+
+    优先级：显式配置 config.BLUE_FALLBACK_MIN_SAMPLE (>0) → 统计反推值。
+    结果再与 BLUE_FALLBACK_WINDOW 取大，保证修复后只会**更严**、不会更松。
+    """
+    window = max(int(getattr(config, "BLUE_FALLBACK_WINDOW", 30)), 1)
+    explicit = int(getattr(config, "BLUE_FALLBACK_MIN_SAMPLE", 0) or 0)
+    if explicit > 0:
+        return max(window, explicit)
+    return max(window, _min_significant_blue_sample())
+
+
 def _apply_blue_mode(blue_blend: np.ndarray) -> np.ndarray:
     """按配置把蓝球概率切到目标口径：uniform 模式 / 运行命中率回退 → 均匀 16。
 
-    蓝球命中理论基线 1/16=6.25%。若模型长期（近 BLUE_FALLBACK_WINDOW 期）
-    命中率显著低于该值，则该期回退均匀，避免被模型“带偏”。
+    蓝球单注命中理论基线恒为 1/16 = 6.25%，任何模型都无法提高其长期期望。
+    本函数只做一件事：当**样本量足够**且模型长期命中率**统计显著**低于基线时，
+    回退均匀 16，避免被一个确实失效的模型带偏。
+
+    修复要点（V4）：旧实现用 BLUE_FALLBACK_WINDOW = 30 期做判定，是**在噪声上
+    做决策**。30 期命中率的标准误 = sqrt(0.0625*0.9375/30) ≈ 4.42%，已远大于
+    6.25% - 4.5% = 1.75% 的差额——30 期观测到 2/30（6.67%）与「真值 4.5%」或
+    「真值 6.25%」都完全相容，p 值远不显著。所以本函数改为：
+
+    1. 由 _blue_fallback_min_sample() 得到最小显著样本量（默认 ≈ 735 期，
+       见 _min_significant_blue_sample 的推导）；
+    2. 样本量不足 → **恒用覆盖计划**，绝不因短期波动回退；
+    3. 样本量达标且命中率仍显著低于阈值 → 才回退均匀 16。
+
+    BLUE_FALLBACK_WINDOW 保留为「至少要看多少期」的下限（向后兼容），真正决定
+    是否允许触发的是最小显著样本量；可用 config.BLUE_FALLBACK_MIN_SAMPLE 显式
+    覆盖（设 0 走统计反推，不支持放松到低于 window）。
     """
-    import numpy as _np
     if config.BLUE_MODE == "uniform":
-        return _np.full(B_MAX, 1.0 / B_MAX)
-    # 运行命中率回退（读近 N 期蓝球命中）
-    rate = METH._blue_running_rate(config.BLUE_FALLBACK_WINDOW)
-    if rate is not None and rate < config.BLUE_FALLBACK_MIN_RATE:
-        print(f"[engine] 蓝球模型近{config.BLUE_FALLBACK_WINDOW}期命中率 "
-              f"{rate:.3f} < {config.BLUE_FALLBACK_MIN_RATE}，本周期回退均匀 16")
-        return _np.full(B_MAX, 1.0 / B_MAX)
+        return np.full(B_MAX, 1.0 / B_MAX)
+    window = max(int(getattr(config, "BLUE_FALLBACK_WINDOW", 30)), 1)
+    rate = METH._blue_running_rate(window)
+    if rate is None:
+        return blue_blend
+    min_n = _blue_fallback_min_sample()
+    observed = window
+    try:
+        # _blue_running_rate 按「每期每方法」展开，用同口径估算实际样本量
+        rows = METH._per_method_issue_rows(window * 50)
+        observed = len(sum(rows.values(), [])) or window
+    except Exception:  # noqa: BLE001 —— 样本口径不可得时保守退回窗口期数
+        observed = window
+    if observed < min_n:
+        # 样本不足：不得在噪声上做决策（30 期标准误 4.42% >> 1.75% 差额）
+        return blue_blend
+    if rate < config.BLUE_FALLBACK_MIN_RATE:
+        print(f"[engine] 蓝球模型近 {observed} 期命中率 {rate:.3f} < "
+              f"{config.BLUE_FALLBACK_MIN_RATE}（已达最小显著样本量 {min_n}），"
+              f"本周期回退均匀 16")
+        return np.full(B_MAX, 1.0 / B_MAX)
     return blue_blend
+
+
+def blue_coverage_plan(n_tickets: int,
+                       blue_probs: Optional[np.ndarray] = None) -> List[int]:
+    """蓝球覆盖计划：在固定注数预算下，决定 n 注各自应分配的蓝球号。
+
+    ========== 为什么这是本系统唯一真实可得的改进 ==========
+    双色球是独立随机事件，**任何算法都无法提高单注命中率**：
+      * 红球平均命中恒为 6*6/33 = 1.0909 个/注（与用什么模型选号无关）；
+      * 蓝球单注命中恒为 1/16 = 6.25%。
+    一等奖需 6 红全中，概率 1/C(33,6) = 1/1_107_568，多注只能线性叠加，
+    没有算法空间。所以「提高命中率」是假目标。
+
+    真正可优化的是**多注组合的覆盖结构**：六等奖只需蓝球命中（固定 ¥5）。
+    若把 n 注的蓝球**取为互不相同**，则「至少中一个蓝球」的概率从
+    「n 次独立重复」变成「n 个不同号覆盖」：
+
+        随机重复（可重复抽样）：P = 1 - (15/16)^n
+        去重覆盖（本函数）    ：P = min(n, 16) / 16
+
+    ========== 概率对照表（至少中 1 个蓝球） ==========
+        n    随机重复 1-(15/16)^n   去重覆盖 min(n,16)/16   相对提升
+        1         6.25%                  6.25%               0%   ← 单注无任何优化空间
+        2        12.11%                 12.50%              +3.2%
+        3        17.61%                 18.75%              +6.5%
+        5        27.58%                 31.25%             +13.3%
+       10        47.55%                 62.50%             +31.4%
+       16        64.39%                100.00%             +55.3%
+       20        72.47%                100.00%            (已饱和，仅成本翻倍)
+
+    ========== 诚实结论（必须明示，不可省略） ==========
+    覆盖优化提高的是**中奖频率（体感）**，**不是期望收益**：
+      * 六等奖期望返奖比 = (5 * p) / (2 * n) **恒为 0.156（15.6%）**，与 n 无关
+        ——因为 p 与 n 同步增长，成本也同步增长，覆盖改变的是分布而非期望；
+      * n = 16 覆盖满 16 个蓝球时 p = 100%，但成本 16 注 = ¥32，而六等奖只有
+        ¥5，**必然亏本 ¥27**（净回报 -84.4%）；
+      * 一/二等奖为浮动奖金且概率极小，任何覆盖方案都不能把负期望变成正期望。
+    因此正确口径是：**同样 10 注，「中个蓝球（¥5）」的概率从 47.6% 提到 62.5%**，
+    而不是「更容易赚钱」。理性购彩。
+
+    ========== 选取规则 ==========
+    按 blue_probs **降序**取号，因此既是「最多不同号」也是「概率最高的一组号」；
+    n > 16 时蓝球只有 16 个可用，超出部分按概率加权循环重复，并**优先补齐当前
+    出现次数最少的号**，让重复在 16 个号之间尽量均匀。
+    blue_probs 为 None / 形状非 (16,) / 含非有限值 / 和 <= 0 时回退均匀 1/16 权重。
+
+    与旧 `_pick_blue_coverage` 的区别：旧逻辑是在**候选票池里挑**，候选不足时只能
+    重复，覆盖数是候选池大小的副产物；新逻辑**先定蓝球计划，再配对红球**，
+    覆盖数只由 n 决定，结构性最优。
+    """
+    if n_tickets <= 0:
+        return []
+    k = int(n_tickets)
+    probs: Optional[np.ndarray]
+    try:
+        probs = np.asarray(blue_probs, dtype=float) if blue_probs is not None else None
+    except (TypeError, ValueError):
+        probs = None
+    if probs is None or probs.shape != (B_MAX,) or not np.all(np.isfinite(probs)) \
+            or float(probs.sum()) <= 0:
+        probs = np.full(B_MAX, 1.0 / B_MAX)
+    else:
+        probs = np.clip(probs, 0.0, None)
+        if float(probs.sum()) <= 0:
+            probs = np.full(B_MAX, 1.0 / B_MAX)
+    # 降序排号：概率最高的号先上；n <= 16 时天然互不相同
+    order = [int(i) + 1 for i in np.argsort(-probs, kind="stable")]
+    plan = order[:min(k, B_MAX)]
+    if k > B_MAX:
+        # 超出 16 注：按概率加权重复，优先补齐当前出现次数最少的号
+        counts: Dict[int, int] = {b: 1 for b in plan}
+        for _ in range(k - B_MAX):
+            b = min(order, key=lambda x: (counts.get(x, 0), -float(probs[x - 1]), x))
+            counts[b] = counts.get(b, 0) + 1
+            plan.append(b)
+    return plan
+
+
+def _plan_blue_coverage(scored: List[Dict], n_tickets: int,
+                        blue_probs: Optional[np.ndarray] = None) -> List[Dict]:
+    """V4 single 模式：**先定蓝球覆盖计划，再配对红球**。
+
+    实现方式是在候选池里为计划中的每个蓝球挑一注置信度最高的候选，并把该候选的
+    蓝球改写为计划值（红球保持不变）。若某计划号的候选不足，则取当前置信度最高且
+    未被选用的候选改写。
+
+    候选池比注数还小时（例如候选池只有 10 注却请求 16 注）：**不凭空补齐**（不复制
+    已选票），输出注数上限 = 候选池大小 m。但覆盖计划继续生效——此时只取计划的
+    前 m 个蓝球，仍保证这 m 注的蓝球**互不相同**，覆盖恰为 min(m, 16) 个号。
+    这正是旧 `_pick_blue_coverage` 做不到的：它的覆盖数是候选池里「恰好有哪些蓝球」
+    的副产物，而本函数的覆盖数只由 m 决定。
+
+    因此「至少中一个蓝球」的概率严格等于 min(m, 16)/16（m = 实际输出注数）。
+    """
+    if n_tickets <= 0 or not scored:
+        return []
+    # 候选池大小即输出注数上限：不复制已选票、不凭空补齐
+    m = min(int(n_tickets), len(scored))
+    plan = blue_coverage_plan(m, blue_probs)
+    ordered = sorted(scored, key=lambda x: -float(x.get("confidence", 0.0)))
+    picked: List[Dict] = []
+    chosen: set = set()
+    for b in plan:
+        if len(picked) >= m:
+            break
+        hit = next((t for t in ordered if t["blue"] == b and id(t) not in chosen), None)
+        if hit is None:
+            # 候选池里没有该蓝球 → 取当前置信度最高且未被选用的候选，改写其蓝球
+            hit = next((t for t in ordered if id(t) not in chosen), None)
+        if hit is None:
+            break                      # 候选池耗尽：不复制已选票
+        chosen.add(id(hit))
+        t = dict(hit)
+        t["blue"] = int(b)
+        t["blue_planned"] = True
+        picked.append(t)
+    return picked
 
 
 def _pick_blue_coverage(scored: List[Dict], n_tickets: int) -> List[Dict]:
@@ -531,6 +987,137 @@ def _pick_legacy_blue(scored: List[Dict], n_tickets: int) -> List[Dict]:
         blue_count[t["blue"]] = blue_count.get(t["blue"], 0) + 1
         picked.append(t)
     return picked
+
+
+# ---------- V4-C：奖金期望模型（覆盖优化的目标函数） ----------
+#
+# 奖级规则（中国福利彩票双色球官方口径，与 lottery/evaluate.py:prize_level 一致）：
+#   一等奖 6 红 + 蓝      二等奖 6 红           三等奖 5 红 + 蓝
+#   四等奖 5 红 / 4 红+蓝  五等奖 4 红 / 3 红+蓝  六等奖 蓝（3 红以下也可能六等奖）
+# 单注成本固定 ¥2。
+#
+# **浮动奖金诚实声明**：一/二等奖为浮动奖（奖池分配），既无固定值也不可预知。
+# 本模块强制要求调用方传入一个**明确的假设常量**，并在返回结果里以
+# `jackpot_assumption` 字段原样标注，绝不假装知道真实金额。默认假设取自
+# evaluate.PRIZE_CASH 的历史均值近似（一等 ¥6,500,000 / 二等 ¥180,000）。
+TICKET_COST = 2.0
+PRIZE_CASH_FIXED = {3: 3000.0, 4: 200.0, 5: 10.0, 6: 5.0}   # 固定奖级（元）
+JACKPOT_ASSUMPTION = {
+    "first": 6_500_000.0,    # 一等奖浮动奖假设（历史均值近似，非真实值）
+    "second": 180_000.0,     # 二等奖浮动奖假设（历史均值近似，非真实值）
+    "source": "evaluate.PRIZE_CASH 历史均值近似；一/二等奖为浮动奖，此处仅为假设常量",
+}
+
+
+def expected_prize(reds: List[int], blue: int,
+                   jackpot: Optional[Dict[str, float]] = None) -> Dict:
+    """单注期望奖金（元）与其奖级概率分解。
+
+    对 6 红 + 1 蓝的单注，枚举「实际开奖的红球命中数 r」的分布并求和：
+    实际开奖的 6 个红球是从 33 个中均匀取出的 6 个，预测的 6 个红球中命中 r 个的
+    概率服从超几何分布
+
+        P(r) = C(6, r) * C(27, 6-r) / C(33, 6)
+
+    蓝球命中概率恒为 1/16（独立）。于是各奖级概率为 P(r) × p_blue 的组合。
+
+    诚实边界：任何「选号算法」都无法改变 P(r) 与 p_blue——它们只由组合数学决定。
+    本函数的作用是给出**目标函数**，让「覆盖优化」比的是期望值而不是幻觉命中率。
+    """
+    from math import comb
+    jp = dict(JACKPOT_ASSUMPTION)
+    if jackpot:
+        jp.update({k: float(v) for k, v in jackpot.items() if k in ("first", "second")})
+    total = comb(33, 6)
+    p_blue = 1.0 / B_MAX
+    cash = dict(PRIZE_CASH_FIXED)
+    cash[1] = float(jp["first"])
+    cash[2] = float(jp["second"])
+    ev = 0.0
+    prob_by_level: Dict[int, float] = {}
+    for lvl in range(1, 7):
+        prob_by_level[lvl] = 0.0
+    prob_by_hit: Dict[int, float] = {}
+    for r in range(0, 7):
+        p_r = comb(6, r) * comb(27, 6 - r) / total
+        prob_by_hit[r] = p_r
+        # 与 evaluate.prize_level 完全一致的奖级判定
+        if r == 6:
+            prob_by_level[1] += p_r * p_blue
+            prob_by_level[2] += p_r * (1.0 - p_blue)
+        elif r == 5:
+            prob_by_level[3] += p_r * p_blue
+            prob_by_level[4] += p_r * (1.0 - p_blue)
+        elif r == 4:
+            prob_by_level[4] += p_r * p_blue
+            prob_by_level[5] += p_r * (1.0 - p_blue)
+        elif r == 3:
+            prob_by_level[5] += p_r * p_blue
+            prob_by_level[6] += p_r * (1.0 - p_blue)
+        else:
+            prob_by_level[6] += p_r * p_blue
+    for lvl, p in prob_by_level.items():
+        ev += p * cash.get(lvl, 0.0)
+    return {
+        "expected_reward": ev,
+        "cost": TICKET_COST,
+        "ev_ratio": ev / TICKET_COST,
+        "prob_by_level": prob_by_level,
+        "prob_by_red_hits": prob_by_hit,
+        "blue_hit_prob": p_blue,
+        "jackpot_assumption": dict(jp),
+        "prize_cash": cash,
+    }
+
+
+def _portfolio_blue_hit_prob(blues: List[int]) -> float:
+    """一组蓝球的「至少中 1 个蓝球」概率 = 不同蓝球数 / 16（独立均匀开奖）。"""
+    if not blues:
+        return 0.0
+    return min(len(set(int(b) for b in blues)), B_MAX) / float(B_MAX)
+
+
+def portfolio_expected_value(tickets: List[Dict],
+                             jackpot: Optional[Dict[str, float]] = None) -> Dict:
+    """整组注单的期望奖金与覆盖指标。
+
+    返回 {expected_reward, cost, ev_ratio, blue_coverage_count,
+          blue_hit_prob, prize_prob_by_level, jackpot_assumption}。
+
+    **同注数下期望奖金恒等**：因为每注的红球命中分布都是同一个超几何分布、
+    蓝球命中恒为 1/16，n 注的期望严格是单注的 n 倍——覆盖优化**不改变期望**，
+    只改变「中奖频率的分布」（例如把「至少中 1 个蓝球」的概率从
+    1-(15/16)^n 提到 min(n,16)/16）。这是本项目最重要的诚实边界：
+    同样 10 注，中个蓝球的概率从 47.6% 提到 62.5%，但期望返奖比始终是 15.6%。
+    """
+    tickets = list(tickets or [])
+    n = len(tickets)
+    one = expected_prize(tickets[0]["reds"] if n else [],
+                         int(tickets[0]["blue"]) if n else 1, jackpot=jackpot)
+    blues = [int(t["blue"]) for t in tickets]
+    distinct = len(set(blues))
+    ev = one["expected_reward"] * n
+    cost = TICKET_COST * n
+    # 至少中一个蓝球：随机重复 vs 去重覆盖（对照展示）
+    p_naive = 1.0 - (1.0 - 1.0 / B_MAX) ** n if n > 0 else 0.0
+    p_cover = _portfolio_blue_hit_prob(blues)
+    return {
+        "tickets": n,
+        "expected_reward": ev,
+        "cost": cost,
+        "net": ev - cost,
+        "ev_ratio": (ev / cost) if cost > 0 else 0.0,
+        "blue_coverage_count": distinct,
+        "blue_hit_prob": p_cover,
+        "blue_hit_prob_naive": p_naive,
+        # 六等奖（蓝球命中 ¥5）期望返奖比：(5*p)/(2*n) —— 与 p/n 口径同构
+        "sixth_ev_ratio": (cash6 := 5.0) and ((cash6 * p_cover) / cost if cost > 0 else 0.0),
+        # 全部注单的奖级概率（取并集的上界近似：不同注之间不独立，此处按独立求和）
+        "prize_prob_by_level": {k: v * n for k, v in one["prob_by_level"].items()},
+        "prize_prob_by_level_note": "按各注独立求和的上界近似，非精确联合分布",
+        "jackpot_assumption": one["jackpot_assumption"],
+        "prize_cash": one["prize_cash"],
+    }
 
 
 def _expand_blue_compound(base_reds: List[int], blue_probs: np.ndarray,
@@ -609,39 +1196,89 @@ def _expand_dan_tuo(dan: List[int], blue: int, n_tickets: int,
 
 # ---------- U4 组合覆盖优化 ----------
 
+def _ticket_objective(tickets: List[Dict], objective: str, r: int) -> float:
+    """覆盖优化的目标函数（V4：从「红球覆盖数」扩展为「奖金期望」）。
+
+    objective="expected_value"（默认）：整组注单的期望奖金（元）+ 蓝球覆盖奖金。
+        诚实说明：**同注数下期望奖金与选号无关**（每注红球命中都服从同一个超几何
+        分布），所以这一项近似常数；真正拉开差距的是蓝球去重带来的
+        「至少中 1 个蓝球」概率提升（min(n,16)/16 vs 1-(15/16)^n）。因此目标函数
+        里蓝球覆盖的权重必须显式存在，否则优化器没有可爬的梯度。
+    objective="coverage"：旧口径，红球并集大小 + 蓝球覆盖数权重（体感覆盖）。
+    """
+    if not tickets:
+        return 0.0
+    n = len(tickets)
+    distinct_blue = len({int(t["blue"]) for t in tickets})
+    if objective == "coverage":
+        union: set = set()
+        for t in tickets:
+            union.update(t["reds"])
+        return float(len(union)) + 1.5 * distinct_blue
+    # expected_value：以奖金期望为主项，蓝球覆盖概率作为可优化项加权进入
+    ev = portfolio_expected_value(tickets)["expected_reward"]
+    # 蓝球覆盖的体感价值：六等奖 ¥5 × 覆盖率提升；用 ¥5×distinct/16 表达
+    cover_bonus = 5.0 * (distinct_blue / float(B_MAX))
+    return float(ev) + cover_bonus * n / max(1, n)
+
+
 def coverage_optimize(pool: List[Dict], n_tickets: int, r: int = 3,
                       n_blues: int = 4,
-                      trials: int = 3000, rng: Optional[random.Random] = None) -> List[Dict]:
+                      trials: int = 3000, rng: Optional[random.Random] = None,
+                      objective: str = "expected_value",
+                      blue_probs: Optional[np.ndarray] = None) -> List[Dict]:
     """U4 覆盖优化器：从候选池选 n_tickets 注，最大化红球“至少命中 r 个”覆盖 +
     蓝球覆盖。贪心初始化 + 模拟退火精修。
 
-    双色球独立随机，无法让期望命中率超数学极限；此处目标是“覆盖尽可能多
-    不同红球组合”，让用户“中一次小奖”的体感覆盖最大化（结构层面）。
+    objective（V4 新增）：
+      - "expected_value"（默认）：目标 = 奖金期望 + 蓝球覆盖奖金（见
+        _ticket_objective）。与 "coverage" 的区别在于它把**奖金口径**作为主项，
+        而不是把「红球并集大小」这种与中奖无直接关系的量当目标。
+      - "coverage"：旧口径（红球并集 + 蓝球覆盖数），保留向后兼容。
+
+    blue_probs：可选蓝球概率分布；给定时会把选中注的蓝球**按覆盖计划重排**
+    （blue_coverage_plan），保证 n <= 16 时蓝球互不相同——这是唯一在数学上
+    真实可得的改进。不给定时沿用候选池自带的蓝球。
+
+    双色球独立随机，无法让期望命中率超数学极限。**同注数下期望奖金恒等**，
+    本优化器改变的是「中奖频率的分布」，不是期望收益。诚实口径见
+    blue_coverage_plan 的 docstring。
     """
     rng = rng if rng is not None else random.Random()
     pool = [dict(t) for t in pool]
+    if objective not in ("coverage", "expected_value"):
+        objective = "expected_value"
     if n_tickets <= 0 or not pool:
         return []
+
+    # 蓝球覆盖计划前置：先把蓝球按概率降序铺满（n<=16 时互不相同），再配对红球
+    plan = blue_coverage_plan(n_tickets, blue_probs) if blue_probs is not None else None
+
     if len(pool) <= n_tickets:
-        return pool[:n_tickets]
+        out = pool[:n_tickets]
+        if plan:
+            for t, b in zip(out, plan):
+                t["blue"] = int(b)
+        return out
 
-    # 贪心：逐步加入使“覆盖红球并集”增益最大的一注（红球并集是 r-覆盖的上近似）
-    def _union_gain(current: set, t: Dict) -> int:
-        return len(set(t["reds"]) - current)
-
+    # 贪心：逐步加入使目标函数增益最大的一注
     selected: List[Dict] = []
-    covered: set = set()
     remaining = list(pool)
+    cur = 0.0
     while len(selected) < n_tickets and remaining:
-        best = max(remaining, key=lambda t: _union_gain(covered, t))
+        best, best_gain = None, None
+        for t in remaining:
+            sc = _ticket_objective(selected + [t], objective, r)
+            gain = sc - cur
+            if best_gain is None or gain > best_gain:
+                best, best_gain = t, gain
         remaining.remove(best)
-        covered.update(best["reds"])
         selected.append(best)
+        cur = _ticket_objective(selected, objective, r)
 
-    # 模拟退火：交换单注，评分 = 红球并集大小 + 蓝球覆盖数权重
-    blue_w = 1.5
+    # 模拟退火：交换单注
     current = list(selected)
-    cur_score = len(covered) + blue_w * len({t["blue"] for t in current})
+    cur_score = cur
     best_sel = list(current)
     best_score = cur_score
     for it in range(trials):
@@ -654,10 +1291,7 @@ def coverage_optimize(pool: List[Dict], n_tickets: int, r: int = 3,
         old_t = current[i]
         new_t = remaining[j]
         current[i] = new_t
-        cur_union = set()
-        for t in current:
-            cur_union.update(t["reds"])
-        nb_score = len(cur_union) + blue_w * len({t["blue"] for t in current})
+        nb_score = _ticket_objective(current, objective, r)
         delta = nb_score - cur_score
         # 接受更优；等分时以随温度衰减的概率接受（探索），随迭代降温
         if delta > 0 or rng.random() < (0.5 / (1 + it ** 0.6)):
@@ -667,7 +1301,49 @@ def coverage_optimize(pool: List[Dict], n_tickets: int, r: int = 3,
                 best_sel = list(current)
         else:
             current[i] = old_t
-    return best_sel[:n_tickets]
+    out = best_sel[:n_tickets]
+    if plan:
+        # 计划重排蓝球：保证 n<=16 时覆盖满不同蓝球（覆盖是结构性保证）
+        for t, b in zip(out, plan):
+            t["blue"] = int(b)
+            t["blue_planned"] = True
+    return out
+
+
+def coverage_optimize_compare(pool: List[Dict], n_tickets: int, r: int = 3,
+                              n_blues: int = 4, trials: int = 3000,
+                              rng: Optional[random.Random] = None,
+                              objective: str = "expected_value",
+                              blue_probs: Optional[np.ndarray] = None) -> Dict:
+    """覆盖优化前后对比（V4）：返回优化前的朴素基线指标与优化后的指标。
+
+    优化前基线 = 候选池按置信度降序取前 n 注（不做任何覆盖优化）。
+    返回 {"before": {...}, "after": {...}, "improvement": {...}}，
+    其中指标为 portfolio_expected_value 的关键字段。
+    """
+    rng = rng if rng is not None else random.Random()
+    pool = [dict(t) for t in pool]
+    before = sorted(pool, key=lambda x: -float(x.get("confidence", 0.0)))[:n_tickets]
+    after = coverage_optimize(pool, n_tickets, r=r, n_blues=n_blues,
+                              trials=trials, rng=rng, objective=objective,
+                              blue_probs=blue_probs)
+    b = portfolio_expected_value(before)
+    a = portfolio_expected_value(after)
+    return {
+        "before": b,
+        "after": a,
+        "improvement": {
+            "blue_coverage_count": a["blue_coverage_count"] - b["blue_coverage_count"],
+            "blue_hit_prob": a["blue_hit_prob"] - b["blue_hit_prob"],
+            "blue_hit_prob_relative": (
+                (a["blue_hit_prob"] - b["blue_hit_prob"]) / b["blue_hit_prob"]
+                if b["blue_hit_prob"] > 0 else 0.0),
+            "expected_reward": a["expected_reward"] - b["expected_reward"],
+            "ev_ratio": a["ev_ratio"] - b["ev_ratio"],
+        },
+        "objective": objective,
+        "jackpot_assumption": a["jackpot_assumption"],
+    }
 
 
 def predict_next(draws: List[Dict], use_llm: Optional[bool] = None,
@@ -848,12 +1524,14 @@ def predict_next(draws: List[Dict], use_llm: Optional[bool] = None,
         # 但**不补齐**到 n_tickets——LLM 产出多少就展示多少。
         llm_scored.sort(key=lambda x: -x["confidence"])
         picked = llm_scored[:n_tickets]
-    # U4：coverage 模式 — 从候选池做组合覆盖优化
+    # U4/V4：coverage 模式 — 从候选池做组合覆盖优化（默认奖金期望目标）
     elif coverage:
         cr = int(coverage_r if coverage_r is not None else config.COVERAGE_R)
         picked = coverage_optimize(scored, n_tickets, r=cr,
                                    n_blues=config.COVERAGE_BLUE_K,
-                                   trials=config.COVERAGE_TRIALS, rng=rng)
+                                   trials=config.COVERAGE_TRIALS, rng=rng,
+                                   objective=config.COVERAGE_OBJECTIVE,
+                                   blue_probs=blue_blend)
     elif bet_mode == "blue_compound":
         # U2 蓝球复式：取红球置信度最高的一注红（固定），展开 k 个蓝球
         k = max(1, min(config.BLUE_COMPOUND_K, B_MAX, n_tickets))
@@ -870,9 +1548,12 @@ def predict_next(draws: List[Dict], use_llm: Optional[bool] = None,
         picked = _expand_dan_tuo(dan, blue, n_tickets, rng, red_blend, ctx,
                                  blue_blend=blue_blend)
     else:
-        # 默认 single：蓝球覆盖优先
+        # 默认 single：蓝球覆盖优先（V4：先定蓝球计划，再配对红球）
         scored.sort(key=lambda x: -x["confidence"])
-        picked = _pick_blue_coverage(scored, n_tickets) if config.BLUE_COVER else _pick_legacy_blue(scored, n_tickets)
+        if config.BLUE_COVER:
+            picked = _plan_blue_coverage(scored, n_tickets, blue_blend)
+        else:
+            picked = _pick_legacy_blue(scored, n_tickets)
 
     shortfall_reason = None
     if len(picked) < n_tickets:
@@ -882,6 +1563,10 @@ def predict_next(draws: List[Dict], use_llm: Optional[bool] = None,
         else:
             shortfall_reason = "all_methods_disabled" if not scored else "candidate_pool_exhausted"
     n_distinct_blue = len({t["blue"] for t in picked})
+    # V4-C：覆盖指标与期望奖金（诚实口径：覆盖提高中奖频率，不提高期望收益）
+    _blue_hit_prob = _portfolio_blue_hit_prob([t["blue"] for t in picked])
+    _blue_hit_naive = (1.0 - (1.0 - 1.0 / B_MAX) ** len(picked)) if picked else 0.0
+    _portfolio_ev = portfolio_expected_value(picked) if picked else None
     result = {
         "issue": issue,
         "requested_tickets": n_tickets,
@@ -898,8 +1583,12 @@ def predict_next(draws: List[Dict], use_llm: Optional[bool] = None,
         "blue_probs": blue_blend.tolist(),
         "bet_mode": bet_mode,
         "coverage_mode": coverage,
+        "coverage_objective": config.COVERAGE_OBJECTIVE if coverage else None,
         "blue_covered": n_distinct_blue,
         "blue_coverage_rate": round(n_distinct_blue / B_MAX, 4),
+        "blue_hit_prob": round(_blue_hit_prob, 6),
+        "blue_hit_prob_naive": round(_blue_hit_naive, 6),
+        "portfolio_ev": _portfolio_ev,
         "adaptive": METH.adaptive_status() if config.ADAPTIVE_ENABLED else None,
         "patterns_summary": {
             "A": sum(1 for p in patterns if p["grade"] == "A"),

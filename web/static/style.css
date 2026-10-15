@@ -476,6 +476,25 @@ footer { color: var(--muted); font-size: 12px; text-align: center; margin-top: 2
 .track-item .v.pos { color: var(--green); }
 .track-item .v.neg { color: var(--red); }
 .track-note { font-size: 11px; color: var(--muted); margin-top: 6px; }
+.track-note.warn { color: var(--yellow, #d29922); }
+
+/* V4：样本不足状态 —— 不展示看起来像能力的数字 */
+.track-item .v.insufficient { color: var(--muted); font-size: 14px; font-weight: 600; }
+
+/* V4：随机性检验卡 */
+.rigor-verdict { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
+.rigor-badge { font-size: 12px; font-weight: 700; padding: 3px 10px; border-radius: 12px;
+  border: 1px solid var(--border); color: var(--muted); }
+.rigor-badge.ok { color: var(--green); border-color: var(--green); }
+.rigor-badge.warn { color: var(--yellow, #d29922); border-color: var(--yellow, #d29922); }
+.rigor-n { font-size: 11px; color: var(--muted); }
+.rigor-concl { font-size: 12px; line-height: 1.6; }
+.rigor-mde { font-size: 12px; color: var(--muted); margin-top: 8px; padding: 10px 12px;
+  background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; line-height: 1.7; }
+.rigor-mde b { color: var(--fg); }
+.rigor-tests { margin-top: 10px; }
+.rigor-tests summary { cursor: pointer; font-size: 12px; color: var(--muted); }
+.rigor-tests td.warn { color: var(--yellow, #d29922); }
 
 /* 齿轮弹层（常用设置：注数 / LLM开关） */
 .gear-pop {

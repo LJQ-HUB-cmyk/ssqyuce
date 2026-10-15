@@ -546,7 +546,10 @@ function runDiagnose() {
             Object.entries(data.similar_red_hits_dist || {}).map(([k,v]) =>
               metricItem("命中" + k + "红", v + "次")
             ).join("") +
-            (data.similar_blue_hit_rate > 0 ? metricItem("蓝球命中率", pct(data.similar_blue_hit_rate)) : "") +
+            (data.similar_blue_hit_rate > 0
+              ? metricItem("蓝球命中率", pct(data.similar_blue_hit_rate),
+                           "样本 " + (data.similar_count || 0) + " 注 · 非能力指标")
+              : "") +
           '</div>' +
           (data.note ? '<div class="note">' + escHtml(data.note) + '</div>' : '') +
         '</div>';
@@ -1263,7 +1266,8 @@ async function runReplayDiag() {
       '<div class="note" style="margin-top:8px">汇总：' + a.issues + " 期 × " + a.tickets + " 注 · 红球平均命中 " +
       fmt(a.red_hits_mean, 3) + " · 蓝球命中率 " + pct(a.blue_hit_rate) + " · ≥五等率 " + pct(a.prize_rate_ge5) +
       " · 总奖金 ¥" + fmt(a.reward_total, 1) + " · ROI " + pct(a.roi) +
-      ' <span style="color:var(--muted)">（对照：随机基线期望红球 1.09/注、蓝球 6.25%）</span></div>' +
+      ' <span style="color:var(--muted)">（样本 ' + a.issues + ' 期；对照随机基线期望红球 1.09/注、蓝球 6.25%。' +
+      '样本不足 ' + METHOD_MIN_ISSUES + ' 期时，上述比率与基线之差属随机波动，不构成能力结论）</span></div>' +
       '<div class="note" style="color:var(--muted)">' + escHtml(r.note || "") + "</div>";
   } catch(e) { el.innerHTML = '<div class="note" style="color:var(--red)">诊断失败: ' + escHtml(e.message) + "</div>"; }
 }
@@ -1330,10 +1334,10 @@ function renderEval(r) {
     const dTxt = x.isPct
       ? (delta >= 0 ? "+" : "") + (delta * 100).toFixed(1) + "pp"
       : (delta >= 0 ? "+" : "") + delta.toFixed(x.d);
+    // V4：Δ 不构成能力证据——样本期内与随机基线的差值属波动范围
     return '<div class="metric"><div class="k">' + x.k + "（系统）</div>" +
       '<div class="v">' + fmtV(x.sys) + "</div>" +
-      '<span class="sub">随机基线 ' + fmtV(x.rnd) + ' · Δ<span style="color:' +
-      (delta >= 0 ? "var(--green)" : "var(--red)") + '">' + dTxt + "</span></span></div>";
+      '<span class="sub">随机基线 ' + fmtV(x.rnd) + ' · Δ<span style="color:var(--muted)">' + dTxt + "</span></span></div>";
   }).join("");
   $("#evalArea").innerHTML =
     '<div class="note" style="margin-bottom:8px">离线 walk-forward 回测：' + (r.n_issues ?? "-") + " 期 × " +
@@ -2069,6 +2073,30 @@ async function saveMethodsConfig() {
 //     （6 个方法、1 期 → 错报 6 期），故用 rows 里的 issue 去重求并集。
 const TRACK_METHOD_MIN_ISSUES = 60;   // 与后端 LOTT_METHOD_RECOMMENDATION_MIN_ISSUES 对齐：低于此不做方法优劣结论
 
+// V4 诚实口径：任何「看起来像能力」的比率都必须带样本量。
+// 后端阈值 LOTT_METHOD_RECOMMENDATION_MIN_ISSUES（config.METHOD_RECOMMENDATION_MIN_ISSUES=60）
+// 通过 /api/info 的 method_min_issues 下发，前端不在第二处硬编码数字。
+let METHOD_MIN_ISSUES = TRACK_METHOD_MIN_ISSUES;
+
+/** 样本量是否足够下结论（统一入口，避免各处各写一个门槛）。 */
+function sampleEnough(n) { return Number(n || 0) >= METHOD_MIN_ISSUES; }
+
+/** 带样本量的指标：样本不足时**不**单独展示百分比，而是给出样本量与「不构成结论」。 */
+function metricWithSample(label, value, n, opts) {
+  const o = opts || {};
+  const enough = sampleEnough(n);
+  const shown = enough ? (o.text != null ? o.text : pct(value)) : "样本不足";
+  const sub = "样本 " + Number(n || 0) + " 期" + (enough ? "" : " · 不构成结论");
+  return '<div class="track-item"><div class="k">' + escHtml(label) + '</div><div class="v' +
+    (enough ? "" : " insufficient") + '">' + shown +
+    '<span class="sub">' + escHtml(sub) + '</span></div></div>';
+}
+
+/** 样本不足时的统一提示文案（前端唯一出处）。 */
+// 样本不足的统一定性文案（V4 诚实口径）。内联进各渲染器时保持逐字一致，
+// 便于结构守卫测试直接断言字面量、也避免同一句话出现两种措辞。
+const INSUFFICIENT_NOTE = "样本不足，不构成结论";
+
 function renderTrackRecord(cumulative) {
   const el = $("#trackRecord");
   const tag = $("#trackRecordTag");
@@ -2108,22 +2136,33 @@ function renderTrackRecord(cumulative) {
   if (tag) {
     tag.textContent = "已对照 " + nIssues + " 期 · " + tTickets + " 注 · 诚实口径（双色球独立随机，无超额保证）";
   }
-  const enoughSample = nIssues >= TRACK_METHOD_MIN_ISSUES;
+  const enoughSample = sampleEnough(nIssues);
+  // V4：期数是「样本量」本身，不能当作能力指标；比率类指标一律经 metricWithSample，
+  // 样本不足时显示「样本不足」而非一个看起来像能力的百分比（真实事故：1 期 10 注的
+  // 10.0% 蓝球命中率被当作能力展示，并对照理论值 6.25% 暗示系统有水平）。
   el.innerHTML =
     '<div class="track-metrics">' +
       '<div class="track-item"><div class="k">已对照期数</div><div class="v">' + nIssues +
         '<span class="sub">查询上限 ' + (cap || "-") + ' 期</span></div></div>' +
-      '<div class="track-item"><div class="k">红球命中均值</div><div class="v">' + fmt(redMean, 2) + '<span class="sub">/6 注 · ' + tTickets + ' 注样本</span></div></div>' +
-      '<div class="track-item"><div class="k">蓝球命中率</div><div class="v">' + pct(blueRate) + '<span class="sub">理论随机 6.25%</span></div></div>' +
-      '<div class="track-item"><div class="k">≥五等奖率</div><div class="v">' + pct(ge5Rate) + '</div></div>' +
-      '<div class="track-item"><div class="k">累计奖金</div><div class="v">¥' + Number(tReward || 0).toFixed(0) + '</div></div>' +
-      (bestLvl ? '<div class="track-item"><div class="k">最好奖级</div><div class="v pos">' + bestLvl + '</div></div>' : '') +
+      metricWithSample("红球命中均值", null, nIssues, { text: fmt(redMean, 2) + " /6" }) +
+      metricWithSample("蓝球命中率", blueRate, nIssues) +
+      metricWithSample("≥五等奖率", ge5Rate, nIssues) +
+      '<div class="track-item"><div class="k">累计奖金</div><div class="v">¥' + Number(tReward || 0).toFixed(0) +
+        '<span class="sub">' + tTickets + ' 注 · 期望为负</span></div></div>' +
+      (bestLvl ? '<div class="track-item"><div class="k">最好奖级</div><div class="v pos">' + bestLvl +
+        '<span class="sub">单期波动，非能力</span></div></div>' : '') +
     '</div>' +
+    // 样本不足时明确写出来，不让 5 个百分比并排站着暗示「系统有水平」
+    (enoughSample ? '' :
+      '<div class="track-note warn">⚠️ 样本不足，不构成结论：当前仅 ' + nIssues +
+      ' 期已对照样本，远低于方法比较门槛 ' + METHOD_MIN_ISSUES +
+      ' 期。上表比率是随机波动的读数，<b>不能</b>作为系统优劣或预测能力的证据。</div>') +
     '<div class="track-note">' +
       (bestMethod
         ? (enoughSample
             ? '最佳方法 <code>' + escHtml(bestMethod.method) + '</code>：红球 ' + fmt(bestMethod.red_hits_mean, 2) +
-              ' · 蓝球 ' + pct(bestMethod.blue_hit_rate) + ' · 奖金 ¥' + Number(bestMethod.reward_total || 0).toFixed(0) + '。'
+              ' · 蓝球 ' + pct(bestMethod.blue_hit_rate) + ' · 奖金 ¥' + Number(bestMethod.reward_total || 0).toFixed(0) +
+              '。（仍需随机性检验确认非波动，见「随机性检验」卡。）'
             : '样本仅 ' + nIssues + ' 期，<b>远不足以比较方法优劣</b>（后端筛查阈值 ' + TRACK_METHOD_MIN_ISSUES +
               ' 期），故此处不给出「最佳方法」结论。')
         : '') +
@@ -2141,6 +2180,127 @@ function renderTrackRecordError(e) {
   if (tag) tag.textContent = "样本数据加载失败 · 诚实口径（双色球独立随机，无超额保证）";
   if (el) el.innerHTML = '<div class="track-note">无法读取累计评估数据（' +
     escHtml((e && e.message) || "未知错误") + '）。此处不代表样本为 0，请刷新重试。</div>';
+}
+
+// ==================== V4：随机性检验卡 ====================
+//
+// 这张卡回答用户最根本的疑问：「为什么准确率上不去」。
+// 结论来自 /api/rigor/randomness（后端 lottery/rigor.py）：
+//   · verdict —— 这批开奖数据与「均匀随机」是否可区分
+//   · min_detectable_effect —— 在当前 N 期样本量下，能检出的最小提升幅度
+// 关键口径：若数据与随机不可区分，那么任何「命中率高于理论值」都只是波动。
+// 依赖缺失 / 检验失败时降级为明确提示，绝不伪装成「已通过检验」。
+
+const RIGOR_VERDICT_TEXT = {
+  consistent_with_random: { t: "与均匀随机一致", cls: "ok" },
+  deviation:              { t: "检出偏离",       cls: "warn" },
+  insufficient_data:      { t: "样本不足，未结论", cls: "warn" },
+};
+
+function renderRigorCard(report) {
+  const el = $("#rigorBody");
+  const tag = $("#rigorTag");
+  if (!el) return;
+  const r = report || {};
+  const v = RIGOR_VERDICT_TEXT[r.verdict] || { t: r.verdict || "未知", cls: "" };
+  const n = Number(r.n_draws || r.n_valid || 0);
+  const mde = r.min_detectable_effect || {};
+  if (tag) tag.textContent = "n=" + n + " 期 · " + v.t;
+
+  const lift = (mde.relative_lift != null)
+    ? (Number(mde.relative_lift) * 100).toFixed(1) + "%"
+    : "-";
+  const hitPp = (mde.hit_rate_pp != null) ? Number(mde.hit_rate_pp).toFixed(2) : "-";
+
+  // 唯一的「结论句」：数据与随机不可区分 ⇒ 准确率上不去是数学事实，不是调参问题
+  const concl = (r.verdict === "consistent_with_random")
+    ? '这批开奖数据与「均匀随机」在统计上<b>不可区分</b>。因此本系统的「命中率」只是随机波动的读数——' +
+      '<b>准确率上不去不是调参问题，而是双色球本身没有可利用规律</b>。'
+    : (r.verdict === "deviation")
+      ? '本批数据检出了统计偏离（见下方检验明细）。偏离可能来自样本量、口径或数据本身，' +
+        '需在更多期数据上复核，<b>不足以支撑「系统能预测」的结论</b>。'
+      : '当前样本量下检验无法给出结论，请勿据下方比率判断系统能力。';
+
+  el.innerHTML =
+    '<div class="rigor-verdict">' +
+      '<span class="rigor-badge ' + v.cls + '">' + escHtml(v.t) + '</span>' +
+      '<span class="rigor-n">样本量 ' + n + ' 期</span>' +
+    '</div>' +
+    '<div class="track-note rigor-concl">' + concl + '</div>' +
+    '<div class="rigor-mde">在当前 <b>' + n + ' 期样本量下，能检出的最小提升</b>为：相对随机基线 ≥ <b>' + lift +
+      '</b>（命中率提升 ≥ ' + hitPp + ' 个百分点）才可能被检出（α=' + (r.alpha != null ? r.alpha : "-") +
+      '，功效 ' + (mde.power != null ? mde.power : "-") + '）。<br>' +
+      escHtml(mde.note_zh || "低于该幅度的「优势」与随机波动无法区分。") + '</div>' +
+    renderRigorTests(r.tests) +
+    '<div class="track-note">双色球为独立随机事件，本系统不承诺中奖率。' +
+      '检验方法：' + escHtml(r.method || "-") + '</div>';
+}
+
+function renderRigorTests(tests) {
+  if (!tests || typeof tests !== "object") return "";
+  const rows = Object.keys(tests).map(k => {
+    const t = tests[k] || {};
+    const p = (t.p_value != null) ? Number(t.p_value).toFixed(4) : "-";
+    const sig = (t.p_value != null && Number(t.p_value) < 0.05);
+    return '<tr><td>' + escHtml(k) + '</td><td>' + (t.statistic != null ? fmt(t.statistic, 3) : "-") +
+      '</td><td class="' + (sig ? "warn" : "") + '">' + p + '</td><td>' +
+      (sig ? "偏离" : "与随机一致") + '</td></tr>';
+  }).join("");
+  if (!rows) return "";
+  return '<details class="rigor-tests"><summary>检验明细（' + Object.keys(tests).length + ' 项）</summary>' +
+    '<div class="scroll"><table><thead><tr><th>检验</th><th>统计量</th><th>p 值</th><th>判定</th></tr></thead>' +
+    '<tbody>' + rows + '</tbody></table></div>' +
+    '<div class="note">p 值经多重检验校正后判定；单项 p&lt;0.05 在多项检验下属预期波动。</div></details>';
+}
+
+function renderRigorUnavailable(reason) {
+  const el = $("#rigorBody");
+  const tag = $("#rigorTag");
+  if (tag) tag.textContent = "检验模块未就绪";
+  if (el) el.innerHTML = '<div class="track-note">随机性检验暂不可用（' +
+    escHtml(reason || "依赖未就绪") + '）。这不代表「检验通过」，也不代表系统有能力；' +
+    '在检验可用前，请勿把任何命中率当作预测能力。</div>';
+}
+
+// 策略显著性：把「某方法看起来准」交给多重检验校正来判断
+async function renderRigorSignal(strategy, window) {
+  const el = $("#rigorSignal");
+  if (!el) return;
+  el.innerHTML = '<div class="track-note">检验中…</div>';
+  try {
+    const s = await api("/api/rigor/signal?strategy=" + encodeURIComponent(strategy) +
+                        "&window=" + encodeURIComponent(window));
+    const survives = !!s.survives_correction;
+    el.innerHTML =
+      '<div class="track-note">策略 <code>' + escHtml(strategy) + '</code> · 窗口 ' + (s.window || window) +
+        ' 期 · 对照 ' + (s.n_trials || 0) + ' 期<br>' +
+        '观察均值 ' + fmt(s.observed_mean, 4) + ' vs 随机基线 ' + fmt(s.baseline_mean, 4) +
+        '（相对 ' + ((s.relative_lift || 0) * 100).toFixed(2) + '%）<br>' +
+        '校正后 p = ' + (s.adjusted_p != null ? Number(s.adjusted_p).toFixed(4) : "-") + ' → ' +
+        (survives
+          ? '<b class="warn">在校正后仍显著</b>（仍需样本外复核）'
+          : '<b>未通过多重检验校正</b>：该「优势」与随机波动无法区分') +
+        (s.sample_note ? '<br>' + escHtml(s.sample_note) : '') + '</div>';
+  } catch (e) {
+    el.innerHTML = '<div class="track-note">显著性检验不可用（' +
+      escHtml((e && e.message) || "未知错误") + '）。不构成「通过检验」。</div>';
+  }
+}
+
+async function loadRigor() {
+  const card = $("#rigorCard");
+  try {
+    const rep = await api("/api/rigor/randomness");
+    if (rep && rep.available === false) {
+      renderRigorUnavailable(rep.error || "依赖未就绪");
+      return;
+    }
+    renderRigorCard(rep);
+    renderRigorSignal("hot", 100);
+  } catch (e) {
+    // 503（模块未就绪）/ 网络错误：明确降级，绝不静默当成「检验通过」
+    renderRigorUnavailable((e && e.message) || "未知错误");
+  }
 }
 
 // 首页「上期开奖回执」：
@@ -2294,6 +2454,7 @@ async function loadAll() {
       // 取数失败时明确告知，别让标题停在「加载中…」、更不要假装样本为 0
       renderTrackRecordError(e);
     }
+    loadRigor();   // V4：随机性检验卡（依赖缺失时自行降级，不影响其它区块）
     initMlStatus();
     try {
       const llmRep = await api("/api/eval/llm/latest");
@@ -2302,6 +2463,15 @@ async function loadAll() {
     loadMethodsConfig();
     loadMiningReports();
     renderWinReceipt();
+    // V4：样本量门槛以 /api/info 的后端常量为准（前后端同一个数字）
+    try {
+      const info = await api("/api/info");
+      if (info && Number(info.method_min_issues) > 0) {
+        METHOD_MIN_ISSUES = Number(info.method_min_issues);
+      }
+      const cum = await api("/api/eval/cumulative?limit=120");
+      renderTrackRecord(cum);   // 门槛更新后重绘，确保展示与后端一致
+    } catch(e) {}
   } catch(e) {
     toast("加载失败: " + e.message);
   }

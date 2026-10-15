@@ -91,6 +91,9 @@ def app_info():
         "blue_mode": config.BLUE_MODE,
         "blue_cover": config.BLUE_COVER,
         "adaptive": METH.adaptive_status(),
+        # V4：前端样本量门槛的唯一出处（避免前后端各写一个数）
+        "method_min_issues": config.METHOD_RECOMMENDATION_MIN_ISSUES,
+        "honesty_boundary": "双色球为独立随机事件，本系统不承诺中奖率",
     }
 
 
@@ -751,6 +754,307 @@ def ml_eval(window: int = Query(30, ge=10, le=200),
         return JSONResponse({"ok": False, "error": "本地暂无开奖数据"}, status_code=400)
     return ml_model.evaluate_ml_walkforward(
         draws, window=window, refit_every=refit_every, train_window=train_window)
+
+
+# ---------- V4：诚实口径 —— 随机性检验 / 策略显著性 / 组合期望值 ----------
+#
+# 背景（用户实报「准确性过低」）：双色球是独立随机事件，系统**没有**预测能力。
+# 用户看到的「蓝球命中率 10.0% vs 理论随机 6.25%」只是 1 期 10 注的样本波动；
+# 「最佳方法」曾被封给一个已废弃的模型。这组端点把「能力是否存在」的判断
+# 从「看一个百分比」改成「看统计检验 + 最小可检出效应」。
+#
+# 依赖 lottery/rigor.py（由队友实现）。该模块可能尚未落地，故全部走
+# try/except ImportError 优雅降级：**绝不因为缺模块导致服务启动失败**。
+
+def _rigor_or_503():
+    """导入 rigor 模块；不可用时返回 (None, 503 响应)。
+
+    返回 503 而非 500：这是「依赖尚未就绪」的服务端状态，不是请求错误。
+    响应体里 available=false，前端据此展示「检验模块未就绪」而不是报错。
+    """
+    try:
+        from . import rigor
+    except ImportError as e:  # 模块尚未交付：降级，不影响服务启动与其它端点
+        return None, JSONResponse(
+            {
+                "ok": False,
+                "available": False,
+                "error": "随机性检验模块 lottery.rigor 尚未就绪",
+                "detail": str(e),
+                "hint": "该端点需 lottery/rigor.py；其余功能不受影响。",
+            },
+            status_code=503,
+        )
+    return rigor, None
+
+
+def _rigor_call_or_503(fn_name: str, *args, **kwargs):
+    """调用 rigor 的某个函数，统一处理「模块缺失」与「调用失败」两种降级。
+
+    · ImportError / AttributeError → 503（能力未就绪）
+    · 其它异常 → 503 且带 error 文本（检验失败不能伪装成「无结论」以外的含义）
+    """
+    rigor, resp = _rigor_or_503()
+    if resp is not None:
+        return None, resp
+    fn = getattr(rigor, fn_name, None)
+    if fn is None:
+        return None, JSONResponse(
+            {
+                "ok": False,
+                "available": False,
+                "error": f"lottery.rigor 未提供 {fn_name}()",
+                "hint": "模块接口与契约不一致，请检查版本。",
+            },
+            status_code=503,
+        )
+    try:
+        return fn(*args, **kwargs), None
+    except Exception as e:  # noqa: BLE001 —— 检验失败不得让 API 500
+        return None, JSONResponse(
+            {
+                "ok": False,
+                "available": False,
+                "error": f"{fn_name}() 执行失败",
+                "detail": str(e),
+            },
+            status_code=503,
+        )
+
+
+@app.get("/api/rigor/randomness")
+def rigor_randomness(limit: int = Query(0, ge=0, le=3490)):
+    """随机性检验：这批开奖数据与「均匀随机」是否不可区分。
+
+    limit=0 表示用全部历史（默认）。返回 randomness_report 的
+    verdict / min_detectable_effect / tests，前端「随机性检验」卡直接消费。
+
+    语义提醒：结论为「不可区分」时，任何「命中率高于理论值」的说法都只是波动，
+    不是能力——这正是本端点存在的意义。
+    """
+    draws = db.load_draws()
+    if not draws:
+        return JSONResponse({"ok": False, "available": True,
+                             "error": "本地暂无开奖数据"}, status_code=400)
+    if limit:
+        draws = draws[-int(limit):]
+    report, resp = _rigor_call_or_503("randomness_report", draws)
+    if resp is not None:
+        return resp
+    if not isinstance(report, dict):
+        return JSONResponse({"ok": False, "available": False,
+                             "error": "randomness_report() 返回结构异常",
+                             "detail": f"期望 dict，实际 {type(report).__name__}"},
+                            status_code=503)
+    out = dict(report)
+    out.setdefault("ok", True)
+    out["available"] = True
+    out["n_draws"] = len(draws)          # 样本量：所有结论必须带样本量
+    return out
+
+
+# 策略显著性检验支持的策略名（前端下拉与后端一致，未知策略显式报 400）
+RIGOR_STRATEGIES = ("hot", "cold", "blue_hot", "blue_cold", "random")
+
+
+def _strategy_hit_series(draws: List[Dict], strategy: str, window: int) -> Optional[List[float]]:
+    """按窗口滚动计算该策略每期的「命中数」，返回与 draws 对齐的序列（前 window 期为 None 去掉）。
+
+    · hot / cold：红球按窗口内出现频次排序，取前 6（hot）或后 6（cold）作为推荐组，
+      命中数 = 与当期 6 个红球的交集大小（0..6）。
+    · blue_hot / blue_cold：蓝球按窗口内频次取最高/最低的 1 个，命中为 1 否则 0。
+    · random：以「期望命中数」作为基线常数序列（不引入伪随机，保证可复现）。
+
+    这里只做**描述性**统计：返回的是命中数序列，显著性判断交给 rigor 模块。
+    """
+    if strategy == "random":
+        return None  # random 作为基线由端点内部构造，不作为策略
+    if window < 1 or len(draws) <= window:
+        return None
+    n = len(draws)
+    rows: List[float] = []
+    for i in range(window, n):
+        hist = draws[i - window:i]
+        cur = draws[i]
+        if strategy in ("hot", "cold"):
+            cnt: Dict[int, int] = {}
+            for d in hist:
+                for r in (d.get("reds") or []):
+                    cnt[r] = cnt.get(r, 0) + 1
+            if len(cnt) < 6:
+                return None
+            ordered = sorted(cnt.items(), key=lambda kv: (-kv[1], kv[0]))
+            pick = ordered[:6] if strategy == "hot" else ordered[-6:]
+            chosen = {int(k) for k, _ in pick}
+            hit = len(chosen & {int(r) for r in (cur.get("reds") or [])})
+        else:  # blue_hot / blue_cold
+            bcnt: Dict[int, int] = {}
+            for d in hist:
+                b = d.get("blue")
+                if b is not None:
+                    bcnt[int(b)] = bcnt.get(int(b), 0) + 1
+            if not bcnt:
+                return None
+            ordered_b = sorted(bcnt.items(), key=lambda kv: (-kv[1], kv[0]))
+            pick_b = ordered_b[0][0] if strategy == "blue_hot" else ordered_b[-1][0]
+            hit = 1.0 if cur.get("blue") is not None and int(cur["blue"]) == pick_b else 0.0
+        rows.append(float(hit))
+    return rows
+
+
+@app.get("/api/rigor/signal")
+def rigor_signal(strategy: str = Query("hot"), window: int = Query(100, ge=5, le=1000),
+                 alpha: float = Query(0.05, gt=0, lt=1)):
+    """策略显著性检验：该策略的历史表现能否与随机基线区分（含多重检验校正）。
+
+    返回 adjusted_p / survives_correction —— survives_correction=false 意味着
+    「看上去不错」的方法只是多重比较下的幸存者偏差，不构成能力证据。
+    """
+    strategy = (strategy or "").strip().lower()
+    if strategy not in RIGOR_STRATEGIES:
+        return JSONResponse(
+            {"ok": False, "error": f"未知策略 {strategy!r}",
+             "supported": list(RIGOR_STRATEGIES)}, status_code=400)
+    if strategy == "random":
+        return JSONResponse({"ok": False, "error": "random 是基线，不是可检验策略"},
+                            status_code=400)
+
+    draws = db.load_draws()
+    if not draws:
+        return JSONResponse({"ok": False, "available": True,
+                             "error": "本地暂无开奖数据"}, status_code=400)
+
+    series = _strategy_hit_series(draws, strategy, window)
+    if not series:
+        return JSONResponse(
+            {"ok": False, "available": True, "strategy": strategy, "window": window,
+             "n_trials": 0,
+             "error": "样本不足：可对照期数少于窗口长度，无法做显著性检验",
+             "hint": f"需要至少 window+1 = {window + 1} 期数据"}, status_code=400)
+
+    # 基线：红球策略期望命中 6*6/33；蓝球策略期望命中 1/16
+    baseline = (6 * 6 / 33) if strategy in ("hot", "cold") else (1 / 16)
+    n_trials = len(series)
+    result, resp = _rigor_call_or_503(
+        "strategy_significance",
+        series, [baseline] * n_trials, n_trials, alpha)
+    if resp is not None:
+        return resp
+    out = dict(result) if isinstance(result, dict) else {"raw": result}
+    out.setdefault("ok", True)
+    out.update({
+        "available": True,
+        "strategy": strategy,
+        "window": int(window),
+        "alpha": float(alpha),
+        "n_trials": n_trials,
+        "observed_mean": sum(series) / len(series),
+        "baseline_mean": baseline,
+        "sample_note": (f"基于 {n_trials} 期滚动对照；样本量不足时结论不成立，"
+                        f"请以 adjusted_p 为准而非观察均值。"),
+    })
+    return out
+
+
+# 单注 2 元（双色球官方单价，固定事实）
+TICKET_PRICE = 2.0
+
+
+def _hypergeom(k: int, K: int, n: int, N: int) -> float:
+    """超几何分布概率：N 个球中 K 个命中类，抽 n 个恰有 k 个命中类。"""
+    from math import comb
+    if k < 0 or k > K or (n - k) < 0 or (n - k) > (N - K):
+        return 0.0
+    return comb(K, k) * comb(N - K, n - k) / comb(N, n)
+
+
+def ticket_expected_prize() -> Dict:
+    """单注期望奖金（元）与各奖级贡献拆解。
+
+    按官方奖级规则与均匀随机假设精确计算：
+      · 红中 6 + 蓝中 1 → 一等；红 6 蓝 0 → 二等；红 5 蓝 1 → 三等；
+        红 5 蓝 0 或 红 4 蓝 1 → 四等；红 4 蓝 0 或 红 3 蓝 1 → 五等；蓝 1 → 六等。
+      · 一等奖为浮动奖金，这里取 evaluate.PRIZE_CASH 的近似值并明确标注为估算。
+    该值与「系统选什么号」**无关**——这正是要传达给用户的结论。
+    """
+    from . import evaluate
+    N, K_red, n_red = 33, 6, 6
+    p_red = {k: _hypergeom(k, K_red, n_red, N) for k in range(7)}
+    p_blue_hit, p_blue_miss = 1 / 16, 15 / 16
+
+    # 奖级概率（P(红=k) × P(蓝)）
+    levels = {
+        1: p_red[6] * p_blue_hit,
+        2: p_red[6] * p_blue_miss,
+        3: p_red[5] * p_blue_hit,
+        4: p_red[5] * p_blue_miss + p_red[4] * p_blue_hit,
+        5: p_red[4] * p_blue_miss + p_red[3] * p_blue_hit,
+        6: (p_red[2] * p_blue_hit + p_red[1] * p_blue_hit + p_red[0] * p_blue_hit),
+    }
+    ev = 0.0
+    breakdown = []
+    for lvl in sorted(levels):
+        p = levels[lvl]
+        cash = float(evaluate.PRIZE_CASH.get(lvl, 0.0))
+        contrib = p * cash
+        ev += contrib
+        breakdown.append({
+            "level": lvl,
+            "name": evaluate.PRIZE_NAME.get(lvl, f"{lvl} 等奖"),
+            "probability": p,
+            "prize_cash": cash,
+            "expected_contribution": contrib,
+            "prize_is_estimate": lvl in (1, 2),   # 一/二等奖浮动，取近似值
+        })
+    return {
+        "expected_prize_per_ticket": ev,
+        "hit_any_prize_probability": sum(levels.values()),
+        "breakdown": breakdown,
+    }
+
+
+@app.get("/api/portfolio/expected-value")
+def portfolio_expected_value(limit: int = Query(1, ge=1, le=20)):
+    """当前推荐注组合的期望奖金分析（期望值为负是彩票的数学事实）。
+
+    返回每注期望奖金、总投入、期望回报与 ROI；用于把一个「看起来能中奖」的
+    组合摆回数学现实：长期期望回报率显著小于 1，且与选号方法无关。
+    """
+    tickets: List[Dict] = db.load_last_predictions() or []
+    issue = None
+    if tickets:
+        issue = tickets[0].get("issue")
+    elif hasattr(db, "recent_prediction_issues"):
+        for iss in db.recent_prediction_issues(limit):
+            got = db.load_predictions(iss)
+            if got:
+                tickets, issue = got, iss
+                break
+
+    price = TICKET_PRICE
+    n_tickets = len(tickets)
+    cost = price * n_tickets
+
+    ev = ticket_expected_prize()
+    ev_per_ticket = float(ev["expected_prize_per_ticket"])
+
+    return {
+        "ok": True,
+        "available": True,
+        "issue": issue,
+        "n_tickets": n_tickets,
+        "has_tickets": bool(n_tickets),
+        "ticket_price": price,
+        "total_cost": round(cost, 2),
+        "expected_return_per_ticket": round(ev_per_ticket, 4),
+        "expected_return_total": round(ev_per_ticket * n_tickets, 4),
+        "expected_roi": round((ev_per_ticket - price) / price, 4),
+        "hit_any_prize_probability": ev["hit_any_prize_probability"],
+        "breakdown": ev["breakdown"],
+        "sample_note": ("期望值按固定奖级与官方概率精确计算，与本系统历史命中**无关**；"
+                        "彩票是负期望游戏，长期必亏是数学结论而非系统缺陷。"),
+        "honesty": "双色球为独立随机事件，本系统不承诺中奖率，也不改变期望值。",
+    }
 
 
 # ---------- 页面 ----------

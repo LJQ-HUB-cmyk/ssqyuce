@@ -23,8 +23,8 @@ BACKUP_DATA_URL = (os.environ.get("LOTT_BACKUP_DATA_URL") or "").strip() or None
 
 # ---------- 版本信息（前端主页 / API / GitHub 说明统一引用） ----------
 
-APP_VERSION = "1.0.2"          # v3 方案 U1–U9：U9 = 历史战绩样本口径修正（实际去重期数）+ 卡片下移至回执之后
-APP_BUILD = "2026-10-U9"       # 构建标识（U9 交付批次）
+APP_VERSION = "2.0.0"          # v4 方案：诚实口径交付批次（随机性检验 + 样本量门槛 + 期望值分析）
+APP_BUILD = "2026-10-V4"       # 构建标识（V4 交付批次）
 APP_MILESTONES = {
     "M1": {"status": "done",    "desc": "前端 Tab 工作台 + 规律库扩容 29 条 + 自动挖掘管道 + 任务系统"},
     "M2": {"status": "done",    "desc": "GBDT/RF 概率模型 + 滚动 Brier 加权融合 + 概率校准 + 蓝球独立投票 + ML walk-forward 评估"},
@@ -40,6 +40,7 @@ APP_MILESTONES = {
     "U7": {"status": "done", "desc": "LLM 实际生成注数模式：以大模型真实产出注数为准，不再用统计/ML 候选补齐"},
     "U8": {"status": "done", "desc": "推理型模型输出预算自适应（含预算记忆）+ 设置页模型唯一事实来源 + 观察轮报错聚合 + 上期开奖回执列出上期推荐逐注命中"},
     "U9": {"status": "done", "desc": "历史战绩口径修正：期数取接口实际去重样本（不再是用字面量 N / 各方法相加），样本不足不给最佳方法结论；卡片下移至「上期开奖回执」之后"},
+    "V4": {"status": "done", "desc": "诚实口径改造：/api/rigor/randomness + /api/rigor/signal + /api/portfolio/expected-value 三个端点（缺 rigor 模块时优雅降级 503）；前端不再把随机波动当能力展示——所有比率必须带样本量与「样本不足，不构成结论」提示，新增「随机性检验」卡展示最小可检出提升量"},
 }
 
 # ---------- LLM 通道（全部来自环境变量，无仓库内置密钥/地址） ----------
@@ -155,6 +156,11 @@ BLUE_COVER = os.environ.get("LOTT_BLUE_COVER", "1") == "1"
 # 蓝球模型运行命中率回退阈值：近 BLUE_FALLBACK_WINDOW 期命中率低于该值 → 该期回退 uniform
 BLUE_FALLBACK_WINDOW = int(os.environ.get("LOTT_BLUE_FALLBACK_WINDOW", "30"))
 BLUE_FALLBACK_MIN_RATE = float(os.environ.get("LOTT_BLUE_FALLBACK_MIN_RATE", "0.045"))
+# V4-C 修复：回退判定必须达到的最小样本量（期）。30 期样本的命中率标准误为
+# sqrt(0.0625*0.9375/30) ≈ 4.42%，远大于 6.25%-4.5%=1.75% 的差额——在这个样本量
+# 上做回退决策等于在噪声上决策。0（默认）= 由 engine._min_significant_blue_sample()
+# 用 1.96*sd/delta 反推（≈735 期）；显式设正值则用它，但仍不会低于 BLUE_FALLBACK_WINDOW。
+BLUE_FALLBACK_MIN_SAMPLE = int(os.environ.get("LOTT_BLUE_FALLBACK_MIN_SAMPLE", "0"))
 # 随机蓝球命中理论基线（1/16）
 BLUE_RANDOM_RATE = 1.0 / 16
 
@@ -185,6 +191,12 @@ ADAPTIVE_STATE_FILE = DATA_DIR / "adaptive_state.json"
 COVERAGE_R = int(os.environ.get("LOTT_COVERAGE_R", "3"))
 COVERAGE_TRIALS = int(os.environ.get("LOTT_COVERAGE_TRIALS", "3000"))
 COVERAGE_BLUE_K = int(os.environ.get("LOTT_COVERAGE_BLUE_K", "4"))
+# V4-C 覆盖优化目标函数：
+#   expected_value（默认）= 奖金期望 + 蓝球覆盖奖金（真实可优化的口径）
+#   coverage              = 旧口径（红球并集大小 + 蓝球覆盖数），向后兼容
+COVERAGE_OBJECTIVE = (os.environ.get("LOTT_COVERAGE_OBJECTIVE") or "expected_value").strip().lower()
+if COVERAGE_OBJECTIVE not in ("coverage", "expected_value"):
+    COVERAGE_OBJECTIVE = "expected_value"
 
 
 def methods_status() -> Dict:

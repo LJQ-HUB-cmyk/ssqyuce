@@ -3,6 +3,10 @@ services:
     build: .
     image: ssq-predictor:latest
     container_name: ssq-predictor
+    # 内存限额 (2026-10-12): 实测 peak 371MB(anon 333MB) → 768m, 系数 2.07
+    # LLM 推理+统计计算, LOTT_LLM_MAX_TOKENS=32000, 给足余量避免生成被截断。
+    mem_limit: 768m
+    memswap_limit: 1024m
     ports:
       - "18000:18000"
     volumes:
