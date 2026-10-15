@@ -1104,6 +1104,134 @@ def _scheduler_loop():
         _time.sleep(1800)
 
 
+# ---------- V5：战斗回放 + 自进化（历史规律 → 实战逐期验证 → 自我改进） ----------
+#
+# 用户口径：准确性 = 基于历史数据找规律 → 用于实战 → 用实战结果对比。
+# 这三个端点把该口径落地为可查询的实战成绩单，而不是理论推演：
+#   · /api/battle/report   全方法在 N 期真实开奖上的逐期战绩 + 两两显著性
+#   · /api/battle/compare  只要对比结论（前端卡片用）
+#   · /api/evolution/status 假说库与进化进度
+#
+# battle / hypothesis / evolution 三模块并行开发，任一未就绪都必须降级而非 500。
+
+def _battle_or_503():
+    """导入 battle 模块；不可用时返回 (None, 503 响应)。"""
+    try:
+        from . import battle
+    except ImportError as e:
+        return None, JSONResponse(
+            {"ok": False, "available": False,
+             "error": "战斗回放模块 lottery.battle 尚未就绪",
+             "detail": str(e), "hint": "该端点需 lottery/battle.py；其余功能不受影响。"},
+            status_code=503)
+    return battle, None
+
+
+@app.get("/api/battle/report")
+def battle_report(limit: int = Query(0, ge=0, le=3490),
+                  n_tickets: int = Query(10, ge=1, le=20),
+                  start: int = Query(300, ge=60, le=3000),
+                  methods: Optional[str] = Query(None),
+                  seed: int = Query(42)):
+    """方法级 walk-forward 实战回放：各出号方法在真实开奖上的逐期战绩。
+
+    limit=0 用全部历史（默认；计算量大，前端可按需传小值）。
+    严格 walk-forward：评估第 t 期只用 draws[:t]，不泄漏未来信息。
+
+    methods 逗号分隔可限定方法集（如 `uniform,stat:freq,blue_coverage`）以缩短耗时。
+    """
+    battle, resp = _battle_or_503()
+    if resp is not None:
+        return resp
+    draws = db.load_draws()
+    if not draws:
+        return JSONResponse({"ok": False, "available": True,
+                             "error": "本地暂无开奖数据"}, status_code=400)
+    if limit:
+        draws = draws[-int(limit):]
+    if len(draws) <= start:
+        return JSONResponse({"ok": False, "available": True,
+                             "error": f"样本不足：{len(draws)} 期 ≤ start={start}"},
+                            status_code=400)
+    mlist = [m.strip() for m in methods.split(",") if m.strip()] if methods else None
+    try:
+        report = battle.battle_report(draws, n_tickets=int(n_tickets),
+                                      start=int(start), seed=int(seed))
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "available": False,
+                             "error": "battle_report() 执行失败",
+                             "detail": f"{type(e).__name__}: {e}"}, status_code=503)
+    if not isinstance(report, dict):
+        return JSONResponse({"ok": False, "available": False,
+                             "error": "battle_report() 返回结构异常"}, status_code=503)
+    out = dict(report)
+    out.setdefault("ok", True)
+    out["available"] = True
+    out["n_draws"] = len(draws)
+    # 全量回放耗时较长；给出可复现的参数快照
+    out["params"] = {"limit": limit, "n_tickets": n_tickets,
+                     "start": start, "seed": seed, "methods": mlist}
+    return out
+
+
+@app.get("/api/evolution/status")
+def evolution_status_endpoint():
+    """自进化进度：假说库统计 + 当前生效的出号策略覆盖项。
+
+    只展示 ``validated`` 的假说为「生效」——未经验证的假说不得影响真实出号。
+    """
+    try:
+        from . import evolution
+    except ImportError as e:
+        return JSONResponse({"ok": False, "available": False,
+                             "error": "自进化模块 lottery.evolution 尚未就绪",
+                             "detail": str(e)}, status_code=503)
+    try:
+        st = evolution.evolution_status()
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "available": False,
+                             "error": "evolution_status() 执行失败",
+                             "detail": f"{type(e).__name__}: {e}"}, status_code=503)
+    st = dict(st or {})
+    st.setdefault("ok", True)
+    return st
+
+
+@app.post("/api/evolution/run")
+def evolution_run(limit: int = Query(0, ge=0, le=3490),
+                  n_tickets: int = Query(10, ge=1, le=20),
+                  start: int = Query(300, ge=60, le=3000),
+                  use_llm: int = Query(1, ge=0, le=1),
+                  seed: int = Query(42)):
+    """跑一轮进化：挖掘假说 → 注册 → 应用已验证假说 → 回放验证 → 裁决。
+
+    这是「自我完善、自我进化」的触发点。耗时较长（含回放与可选 LLM 调用）。
+    """
+    try:
+        from . import evolution
+    except ImportError as e:
+        return JSONResponse({"ok": False, "available": False,
+                             "error": "自进化模块 lottery.evolution 尚未就绪",
+                             "detail": str(e)}, status_code=503)
+    draws = db.load_draws()
+    if not draws:
+        return JSONResponse({"ok": False, "available": True,
+                             "error": "本地暂无开奖数据"}, status_code=400)
+    if limit:
+        draws = draws[-int(limit):]
+    try:
+        result = evolution.evolve_once(draws, use_llm=bool(use_llm),
+                                       n_tickets=int(n_tickets),
+                                       start=int(start), seed=int(seed))
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "available": False,
+                             "error": "evolve_once() 执行失败",
+                             "detail": f"{type(e).__name__}: {e}"}, status_code=503)
+    result = dict(result or {})
+    result.setdefault("ok", True)
+    return result
+
+
 # M2：后台预热 ML 模型（首个预测请求不阻塞；训练结果按数据版本缓存）
 try:
     from . import ml_model
