@@ -1,5 +1,10 @@
 # VPS 部署方案（Docker Compose · 长期运行 · 端口 18000）
 
+> **当前部署形态：单节点。** 只有本机（bero_de）在跑，公网入口 `https://ssq.ff88.de`。
+> 历史上曾用过 ivy-ray-EU、R71s.AI、BF.US、ZT.JP.Plus 四个节点，
+> **现均已退役或不再部署本应用**（见 `docs/PROJECT_CONTEXT.md` 第 2 节）。
+> 下文的 `<VPS>` 是**可选的异地重建**流程，当前没有第二个节点需要维护。
+
 本方案把一个"轻量 + 自动调度"的实例长期跑在 VPS 上：
 
 - **资源需求极低**：1 vCPU / 512MB–1GB 内存 / 1GB 磁盘即可（LLM 推理走远端 API，本地无 GPU 负担）；
@@ -26,7 +31,7 @@ docker --version && docker compose version
 cd /opt && git clone <你的仓库地址> ssq && cd ssq
 
 # 方式 B：从本机 rsync 同步
-rsync -av --exclude=.venv --exclude=.git /root/harness/CP/ root@<VPS>:/opt/ssq/
+rsync -av --exclude=.venv --exclude=.git --exclude=data /root/DSH/应用/ssqyuce/ root@<VPS>:/opt/ssqyuce/
 ```
 
 ## 三、迁移本地数据（推荐，可"热启动"）
@@ -34,7 +39,7 @@ rsync -av --exclude=.venv --exclude=.git /root/harness/CP/ root@<VPS>:/opt/ssq/
 把本机已积累的数据（3490 期开奖 + 预测记录）带过去，避免首启重新抓取：
 
 ```bash
-rsync -av /root/harness/CP/data/ root@<VPS>:/opt/ssq/data/
+rsync -av /root/DSH/应用/ssqyuce/data/ root@<VPS>:/opt/ssqyuce/data/
 ```
 
 > 跳过此步也可以：容器首次启动会自动抓取全量数据并生成首期预测（约 2–3 分钟）。
@@ -45,7 +50,7 @@ rsync -av /root/harness/CP/data/ root@<VPS>:/opt/ssq/data/
 先配置 LLM 凭据（**仓库不含任何 URL/Key**，全部走 `.env`，该文件已 gitignore）：
 
 ```bash
-cd /opt/ssq
+cd /opt/ssqyuce
 cp .env.example .env
 # 编辑 .env，填入你自己的 LLM 通道（DeepSeek/智谱/通义等任意 OpenAI 兼容服务均可）
 #   LOTT_LLM_BASE_URL=...  LOTT_LLM_API_KEY=...  LOTT_LLM_MODEL=...
@@ -128,11 +133,19 @@ sudo ufw allow 18000/tcp && sudo ufw enable
 
 阿里云/腾讯云/AWS 等需在**安全组**里放行 TCP 18000。
 
-## 六、本机挖掘并发布到远端节点
+## 六、本机挖掘与升级（当前为单节点部署）
 
-VPS 不执行自动挖掘。挖掘在本机完成后，只提交 `data/mining_artifact.json`；数据库、原始快照和密钥仍不会进入 Git。
+**当前部署形态：只有本机（bero_de）一个节点**，容器 `ssq-predictor`，公网入口 `https://ssq.ff88.de`。
+历史上还存在过 ivy-ray-EU、R71s.AI、BF.US、ZT.JP.Plus 四个节点，
+**现在它们都已退役或不再部署本应用**（详见 `docs/PROJECT_CONTEXT.md` 第 2 节）。
+因此本节不再有「发布到远端节点」的流程。
 
-### 本机（Linux，2026-10-15 实测可用）
+> ⚠️ **唯一数据副本就是本机 `data/`**。既然没有其他节点，本机数据丢失即全丢，
+> **备份是唯一安全网**（见第七节「备份」）。
+
+### 本机挖掘（可选）
+
+挖掘在本机完成后只提交 `data/mining_artifact.json`；数据库、原始快照和密钥不进 Git。
 
 ```bash
 cd /root/DSH/应用/ssqyuce
@@ -147,34 +160,18 @@ git commit -m "chore: publish local mining artifact"
 
 `mine` 会更新本机 SQLite，同时生成 `data/mining_artifact.json`。该文件仅包含挖掘规律、统计显著性和来源期号，不包含开奖数据库或凭据。
 
-### 部署到各节点（状态以实测为准）
-
-> ⚠️ **多节点现状（2026-10-15 实测）**：本机已是 v2.1.0；
-> R71s.AI 仍停在 v0.9.0；**ZT.JP.Plus 上查不到任何 ssq 部署**；BF.US 无 SSH 别名、未核实。
-> 详细状态表见 `docs/PROJECT_CONTEXT.md` 第 2 节。**不要照抄旧文档假设某台机器已部署。**
-
-**能直连 GitHub 的节点**（标准流程）：
+### 本机升级
 
 ```bash
-cd /opt/ssqyuce
-git pull --ff-only origin main
+cd /root/DSH/应用/ssqyuce
+# 务必先备份（跨批次升级会执行不可逆的 SQLite schema 迁移，见 lottery/migrations.py）
+cp data/ssq.db /tmp/ssq.db.bak.$(date +%Y%m%d_%H%M%S)
 docker compose up -d --build
 docker compose logs --tail 80 lottery
-curl -fsS http://127.0.0.1:18000/api/health
+# 预热约 2~2.5 分钟；轮询到 healthy 再验证
+until [ "$(docker inspect --format='{{.State.Health.Status}}' ssq-predictor)" = healthy ]; do sleep 10; done
+curl -fsS http://127.0.0.1:18000/api/info
 ```
-
-**不能直连 GitHub / Docker Hub 的节点**（如 R71s.AI，离线镜像路径）：
-
-```bash
-# 本机：导出镜像
-docker save ssq-predictor:latest | gzip > /tmp/ssq.tgz
-scp /tmp/ssq.tgz <node>:/tmp/
-# 目标机：载入并用现有镜像启动，不在本机构建
-ssh <node> 'gunzip -c /tmp/ssq.tgz | docker load && cd /opt/ssq && docker compose up -d --no-build'
-```
-
-**升级前务必备份目标机的 `data/`（尤其 `ssq.db`）与 `.env`**：
-跨多个批次升级会执行 SQLite schema 迁移（见 `lottery/migrations.py`），不可逆。
 
 ### 运行时状态不在 git 里
 
@@ -198,17 +195,22 @@ ssh <node> 'gunzip -c /tmp/ssq.tgz | docker load && cd /opt/ssq && docker compos
 | 手动刷数据 | `docker compose exec lottery python -m lottery.cli fetch` |
 | 手动生成预测 | `docker compose exec lottery python -m lottery.cli predict` |
 | 重启服务 | `docker compose restart` |
-| 升级版本 | `git pull && docker compose up -d --build`（数据库在 `./data`，不受影响） |
+| 升级版本 | 见第六节「本机升级」（**先备份 `data/ssq.db`**，再 `docker compose up -d --build`） |
 | 服务器重启 | 无需操作，`restart: unless-stopped` 自动拉起 |
 
-### 备份（建议 cron 每日）
+### 备份（**当前唯一安全网，务必配置**）
+
+本机是唯一节点，`data/` 是全项目唯一数据副本：
 
 ```bash
-# /etc/cron.d/ssq-backup
-0 3 * * * root tar -czf /backup/ssq_$(date +\%F).tar.gz -C /opt/ssq data && find /backup -name 'ssq_*.tar.gz' -mtime +14 -delete
+# /etc/cron.d/ssq-backup （注意路径按实际项目目录，这里是本机实际路径）
+0 3 * * * root tar -czf /backup/ssq_$(date +\%F).tar.gz -C /root/DSH/应用/ssqyuce data && find /backup -name 'ssq_*.tar.gz' -mtime +14 -delete
 ```
 
-恢复：`docker compose down && tar -xzf /backup/ssq_xxx.tar.gz -C /opt/ssq && docker compose up -d`。
+恢复：`docker compose down && tar -xzf /backup/ssq_xxx.tar.gz -C /root/DSH/应用/ssqyuce && docker compose up -d`。
+
+> ⚠️ 备份必须包含 `data/ssq.db`，以及 `data/hypotheses.json`、`data/adaptive_state.json`、
+> `data/llm_budget.json` 这些运行时状态；`.env`（含 LLM 凭据）另行单独备份。
 
 ## 八、公网访问：反代 + HTTPS（可选，推荐）
 
@@ -243,7 +245,7 @@ server {
 ## 九、常见问题
 
 - **端口占用/想换端口**：改 `docker-compose.yml` 中 `"18000:18000"`（左侧），或仅改左侧为 `"新端口:18000"` 保持容器内不变；
-- **LLM 未生效/调用失败**：仓库不含任何模型凭据，需先在 `/opt/ssq/` 创建 `.env`（`cp .env.example .env` 后填写你自己的 `LOTT_LLM_BASE_URL` / `LOTT_LLM_API_KEY` / `LOTT_LLM_MODEL`），然后 `docker compose up -d`。确认 VPS 能访问该 API 域名；可临时设 `LOTT_LLM_DISABLED=1` 降级为纯统计模型排查；
+- **LLM 未生效/调用失败**：仓库不含任何模型凭据，需先在项目目录创建 `.env`（`cp .env.example .env` 后填写你自己的 `LOTT_LLM_BASE_URL` / `LOTT_LLM_API_KEY` / `LOTT_LLM_MODEL`），然后 `docker compose up -d`。确认 VPS 能访问该 API 域名；可临时设 `LOTT_LLM_DISABLED=1` 降级为纯统计模型排查；
 - **多模型**：同一通道多模型用 `LOTT_LLM_MODEL_LIST=模型A,模型B`；完全独立的通道（不同 URL/Key）用 `LOTT_LLM_EXTRA_MODELS=[{...}]`。v0.8.3 起观察轮也会在模型间轮转容错（单模型挂掉不废整个 LLM 通道）；
 - **推理型模型输出为空/总是超时（v0.8.3）**：聚合网关的推理模型（glm/qwen 系 flash 等）会把 max_tokens 全部耗在 reasoning_content 上导致 content 为空。用 `LOTT_LLM_EXTRA_BODY`（全模型默认）与 `LOTT_LLM_EXTRA_BODY_MAP`（按模型覆盖）下发思考控制参数，例如 api.b.ai：
   `LOTT_LLM_EXTRA_BODY={"reasoning_effort":"low"}` + `LOTT_LLM_EXTRA_BODY_MAP={"qwen3.8-flash":{"enable_thinking":false,"reasoning_effort":"none"}}`；
@@ -294,5 +296,4 @@ grep -rIl "LOTT_LLM_API_KEY\|ghp_" $(git ls-files) 2>/dev/null   # 应为空
 > 且对账号下**所有**仓库有权限。建议换成仅限本仓库、权限为 Contents: Read and write
 > 的细粒度令牌，并吊销旧令牌。
 
-**其他节点**若也能直连 GitHub，按前述 `git pull --ff-only && docker compose up -d --build` 升级；
-不能直连的走离线镜像路径（见第六节）。
+升级本机即完成全量部署（当前为单节点，见第六节）。

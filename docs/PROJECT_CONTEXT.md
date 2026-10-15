@@ -12,28 +12,34 @@
 - 构建标识：`2026-10-V5`
 - 当前主分支提交：见 `git log -1`（V5 自进化系统提交）
 - GitHub：`https://github.com/jiam9069/ssqyuce`
-- 部署站点（均为 Docker Compose，容器 `ssq-predictor`，端口 `18000`）：
+- **部署形态：单节点**（Docker Compose，容器 `ssq-predictor`，端口 `18000`）
 
-  | 节点 | 路径 / 入口 | 实际状态（2026-10-15 实测） |
+  | 节点 | 路径 / 入口 | 状态（2026-10-15 实测） |
   |---|---|---|
-  | **本机**（bero_de） | `/root/DSH/应用/ssqyuce`，公网 `https://ssq.ff88.de` | ✅ **v2.1.0 / 2026-10-V5**，容器 healthy；公网 `/api/info` 同版本 |
-  | **R71s.AI**（192.168.5.5，ssh 别名 `r71s_debian`） | `/opt/ssq` | ⚠️ 仍停在 **v0.9.0 / 2026-09-M5.1**，git 停在 `ff3a7f6`（2026-09-17）——落后 6 个批次。该机 GitHub/Docker Hub 直连均不通，须走离线路径升级 |
-  | **BF.US** | `/opt/ssqyuce`（历史上也是本机推 GitHub 的中转） | ❓ **未核实**：本机无该机的 SSH 别名，无法登录验证；其存在性仅依据历史记录 |
-  | **ZT.JP.Plus** | 历史记录写 `/opt/ssqyuce` | ❌ **该机上查不到任何 ssq 部署**：无 `/opt/ssqyuce`、无 ssq 容器、无 18000 监听（2026-10-15 经 ssh `zt_jp_plus` 实测）。历史记录已失真 |
+  | **本机（bero_de）** | `/root/DSH/应用/ssqyuce` | ✅ **v2.1.0 / 2026-10-V5**，容器 healthy |
+  | 公网入口 | `https://ssq.ff88.de` | ✅ 同版本，`/api/info` 已核验 |
 
-- **ivy-ray-EU 已于 2026-09-17 下线删除**（容器/目录/镜像清除，18000 释放）。
-  历史记录称「数据已迁往 ZT.JP.Plus」，但 2026-10-15 在 ZT.JP.Plus 上查不到 ssq 部署，
-  故「数据现在在谁那里」**需要重新确认**，不要沿用这条旧结论。
+  除本机外**没有其他部署节点**。
+
+- **历史节点（均已退役，不要再按它们部署或排查）**：
+
+  | 节点 | 退役情况 |
+  |---|---|
+  | **ivy-ray-EU** | 2026-09-17 下线删除（容器/目录/镜像清除，18000 释放） |
+  | **R71s.AI** | **已不存在**（用户 2026-10-15 确认） |
+  | **BF.US** | **已不存在**（用户 2026-10-15 确认）；历史上曾是本机推 GitHub 的中转 |
+  | **ZT.JP.Plus** | 机器仍在（`ssh zt_jp_plus` 可登录），但**已不再部署本应用**：无 `/opt/ssqyuce`、无 ssq 容器、无 18000 监听 |
+
+  > 历史记录里「ivy-ray-EU 的数据已迁往 ZT.JP.Plus」这类结论**已失效**——
+  > ZT.JP.Plus 上没有 ssq，R71s.AI 与 BF.US 也已不存在。
+  > **当前唯一的数据副本就是本机 `/root/DSH/应用/ssqyuce/data/`，因此它的备份是唯一的安全网。**
+
 - 最近验证（2026-10-15，本机）：容器 `healthy`，`/api/info` 返回 v2.1.0 / 2026-10-V5；
   V4 三个端点 + V5 三个端点（`/api/battle/report`、`/api/evolution/status`、`/api/evolution/run`）均 200；
   公网 `https://ssq.ff88.de` 同样返回 v2.1.0，`/static/app.js?v=20261015.2` 返回 `x-cache-status: MISS`（缓存已换新键）。
   工作树干净，本地 HEAD = `origin/main` = GitHub 远端（三方 SHA 一致）。
 - 启动预热期 healthcheck 可能短暂 `unhealthy`（回测占满 CPU 使 8s 探活超时），非故障；本机实测预热约 2~2.5 分钟。
 - **api.b.ai 网关账户余额已耗尽**（`insufficient_user_quota`，balance=0）：LLM 通道自检返回“模型无返回”，纯统计模式不受影响；需充值或换通道后 LLM 才恢复。
-
-> ⚠️ **多节点状态请以实测为准**：上表 2026-10-15 由 coding-agent 逐台 ssh 核验（`zt_jp_plus`、`r71s_debian`）。
-> 未核实项已标 ❓，不要当成已知事实。若要把本机版本推到其他节点，
-> 注意 **`data/hypotheses.json` 等运行时状态不在 git 里**，需手动同步。
 
 ## 3. 已完成能力
 
@@ -267,4 +273,4 @@ P2：
 - 不能把随机波动表述为稳定命中率提升。
 - 不能宣称 M4.1 真实数据验收完成，除非有开奖后的真实 `online_check` 和累计报告证据。
 - 每次代码改动都要同时更新 README/规划文档/版本字段（如影响发布状态）。
-- 完成后必须记录本地测试、GitHub 提交、BF.US 部署提交和远程健康验证结果。
+- 完成后必须记录本地测试、GitHub 提交，以及本机重建部署后的健康验证结果（当前为单节点）。
