@@ -1,0 +1,300 @@
+{
+  "version": "v5-2",
+  "updated_at": "2026-10-15T15:11:59+00:00",
+  "hypotheses": [
+    {
+      "id": "omission_ratio_red-9896e42235",
+      "family": "omission_ratio_red",
+      "statement": "红球 [8, 25, 9] 的遗漏回补比（当前遗漏/平均遗漏）达 3.02，属回补压力最大档，下注时优先纳入。",
+      "action": {
+        "type": "prefer_numbers",
+        "numbers": [
+          8,
+          9,
+          25
+        ]
+      },
+      "params": {
+        "top_k": 3,
+        "numbers": [
+          8,
+          25,
+          9
+        ],
+        "boost_method": {
+          "type": "boost_method",
+          "method": "stat:omission",
+          "weight": 1.2
+        }
+      },
+      "evidence": {
+        "n": 900,
+        "lift": 2.0222,
+        "ratios": {
+          "8": 3.0222,
+          "25": 2.8978,
+          "9": 1.83
+        },
+        "metric": "遗漏回补比",
+        "baseline": 1.0,
+        "p_value": null,
+        "note_zh": "漏补比是确定性统计量，不做假设检验；其可证伪性由后续实战回放给出。"
+      },
+      "source": "stat",
+      "n_samples": 900,
+      "created_at": "2026-10-15T15:11:13+00:00",
+      "status": "proposed",
+      "attempts": 2,
+      "supports": 0,
+      "refutes": 0,
+      "last_seen_at": "2026-10-15T15:11:59+00:00"
+    },
+    {
+      "id": "omission_ratio_blue-8e65d819ee",
+      "family": "omission_ratio_blue",
+      "statement": "蓝球 [13, 1, 15] 的遗漏回补比最高（2.78），蓝球覆盖优先纳入。",
+      "action": {
+        "type": "blue_prefer",
+        "blues": [
+          1,
+          13,
+          15
+        ]
+      },
+      "params": {
+        "top_k": 3,
+        "blues": [
+          13,
+          1,
+          15
+        ]
+      },
+      "evidence": {
+        "n": 900,
+        "lift": 1.7767,
+        "ratios": {
+          "13": 2.7767,
+          "1": 1.8133,
+          "15": 1.25
+        },
+        "metric": "蓝球遗漏回补比",
+        "baseline": 1.0,
+        "p_value": null
+      },
+      "source": "stat",
+      "n_samples": 900,
+      "created_at": "2026-10-15T15:11:13+00:00",
+      "status": "proposed",
+      "attempts": 2,
+      "supports": 0,
+      "refutes": 0,
+      "last_seen_at": "2026-10-15T15:11:59+00:00"
+    },
+    {
+      "id": "repeat_confirmed-7c64d3c0ca",
+      "family": "repeat_confirmed",
+      "statement": "最近 200 期实测每期平均重号 1.180 个，理论期望 1.091 个（高 8.2%）；候选生成时保留 1 个上期号码。",
+      "action": {
+        "type": "prefer_structure",
+        "rule": "keep_last"
+      },
+      "params": {
+        "mode": "keep_last",
+        "expected_repeat": 1.18
+      },
+      "evidence": {
+        "n": 200,
+        "lift": 0.0817,
+        "observed": 1.18,
+        "baseline": 1.0909,
+        "metric": "每期平均重号数",
+        "p_value": null
+      },
+      "source": "stat",
+      "n_samples": 200,
+      "created_at": "2026-10-15T15:11:13+00:00",
+      "status": "proposed",
+      "attempts": 2,
+      "supports": 0,
+      "refutes": 0,
+      "last_seen_at": "2026-10-15T15:11:59+00:00"
+    },
+    {
+      "id": "neighbor_number-eaa7c64242",
+      "family": "neighbor_number",
+      "statement": "最近 200 期实测每期平均命中邻号 1.725 个，理论期望 1.651 个（偏离 +4.5%）；候选生成时纳入上期号码的邻号。",
+      "action": {
+        "type": "prefer_structure",
+        "rule": "neighbors_of_last"
+      },
+      "params": {
+        "mode": "neighbors_of_last"
+      },
+      "evidence": {
+        "n": 200,
+        "lift": 0.0449,
+        "observed": 1.725,
+        "baseline": 1.6509,
+        "metric": "每期平均邻号数",
+        "p_value": null
+      },
+      "source": "stat",
+      "n_samples": 200,
+      "created_at": "2026-10-15T15:11:13+00:00",
+      "status": "proposed",
+      "attempts": 2,
+      "supports": 0,
+      "refutes": 0,
+      "last_seen_at": "2026-10-15T15:11:59+00:00"
+    },
+    {
+      "id": "gap2_reappear-b97311bf39",
+      "family": "gap2_reappear",
+      "statement": "隔期复出（上上期号码在本期再现）实测每期 1.141 个，理论期望 1.091 个；候选生成时按该幅度纳入隔期号。",
+      "action": {
+        "type": "prefer_structure",
+        "rule": "gap2"
+      },
+      "params": {
+        "mode": "gap2"
+      },
+      "evidence": {
+        "n": 200,
+        "lift": 0.0498,
+        "observed": 1.1407,
+        "baseline": 1.0909,
+        "metric": "隔期复出数",
+        "p_value": null
+      },
+      "source": "stat",
+      "n_samples": 200,
+      "created_at": "2026-10-15T15:11:13+00:00",
+      "status": "proposed",
+      "attempts": 2,
+      "supports": 0,
+      "refutes": 0,
+      "last_seen_at": "2026-10-15T15:11:59+00:00"
+    },
+    {
+      "id": "odd_even_shift-1212119d8d",
+      "family": "odd_even_shift",
+      "statement": "近 50 期每期平均奇数 2.8 个，全历史 3.052 个（差 -0.252）；候选组合的奇偶配比按该偏离微调。",
+      "action": {
+        "type": "prefer_structure",
+        "rule": "odd_target",
+        "target_odd": 2.8
+      },
+      "params": {
+        "target_odd": 2.8
+      },
+      "evidence": {
+        "n": 50,
+        "lift": -0.084,
+        "observed": 2.8,
+        "baseline": 3.052,
+        "metric": "每期奇数个数",
+        "p_value": null
+      },
+      "source": "stat",
+      "n_samples": 50,
+      "created_at": "2026-10-15T15:11:13+00:00",
+      "status": "proposed",
+      "attempts": 2,
+      "supports": 0,
+      "refutes": 0,
+      "last_seen_at": "2026-10-15T15:11:59+00:00"
+    },
+    {
+      "id": "zone_concentration-5909597ede",
+      "family": "zone_concentration",
+      "statement": "近 50 期三区比 (2, 2, 2) 占 18.0%（全历史 16.9%）；候选组合的三区分布向该主导形态靠拢。",
+      "action": {
+        "type": "prefer_structure",
+        "rule": "zone_target",
+        "zone": [
+          2,
+          2,
+          2
+        ]
+      },
+      "params": {
+        "zone": "(2, 2, 2)",
+        "target_rate": 0.18
+      },
+      "evidence": {
+        "n": 50,
+        "lift": 0.011,
+        "observed": 0.18,
+        "baseline": 0.169,
+        "metric": "主导三区比出现率",
+        "p_value": null
+      },
+      "source": "stat",
+      "n_samples": 50,
+      "created_at": "2026-10-15T15:11:13+00:00",
+      "status": "proposed",
+      "attempts": 2,
+      "supports": 0,
+      "refutes": 0,
+      "last_seen_at": "2026-10-15T15:11:59+00:00"
+    },
+    {
+      "id": "blue_dedupe_coverage-0b660f367f",
+      "family": "blue_dedupe_coverage",
+      "statement": "逐期实战回放 600 期中，蓝球去重覆盖（blue_coverage）每期至少中 1 个蓝球的期数占比 0.000，独立重复（uniform）为 0.000（提升 +0.0 个百分点）；多注时启用蓝球去重覆盖。",
+      "action": {
+        "type": "blue_dedupe",
+        "enabled": true
+      },
+      "params": {
+        "mode": "dedupe",
+        "n_tickets_per_issue": 0
+      },
+      "evidence": {
+        "n": 600,
+        "lift": 0.0,
+        "observed": 0.0,
+        "baseline": 0.0,
+        "metric": "每期至少中 1 蓝球的期数占比",
+        "structural": true,
+        "note_zh": "去重覆盖的「至少中 1 蓝」概率 = min(k,16)/16 是数学恒等式的结构性收益；其可证伪性体现在实测期数占比与恒等式预期是否一致。"
+      },
+      "source": "stat",
+      "n_samples": 600,
+      "created_at": "2026-10-15T15:11:13+00:00",
+      "status": "proposed",
+      "attempts": 2,
+      "supports": 0,
+      "refutes": 0,
+      "last_seen_at": "2026-10-15T15:11:59+00:00"
+    },
+    {
+      "id": "blue_uniform_fallback-ec23e48d60",
+      "family": "blue_uniform_fallback",
+      "statement": "回放中蓝球覆盖方案逐注命中率 0.0605 低于均匀方案 0.0680；下一期起蓝球回退均匀分布。",
+      "action": {
+        "type": "blue_uniform",
+        "enabled": true
+      },
+      "params": {
+        "mode": "uniform"
+      },
+      "evidence": {
+        "n": 600,
+        "lift": -0.0075,
+        "observed": 0.0605,
+        "baseline": 0.068,
+        "metric": "逐注蓝球命中率",
+        "p_value": null
+      },
+      "source": "stat",
+      "n_samples": 600,
+      "created_at": "2026-10-15T15:11:13+00:00",
+      "status": "proposed",
+      "attempts": 2,
+      "supports": 0,
+      "refutes": 0,
+      "last_seen_at": "2026-10-15T15:11:59+00:00"
+    }
+  ]
+}

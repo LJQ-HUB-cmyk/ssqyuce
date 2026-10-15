@@ -47,7 +47,11 @@ import numpy as np
 from . import config
 
 # 允许的动作白名单。任何想影响出号的假说都必须落在这几类里，
-# 否则视为「不可执行」而拒绝应用（防止假说库堆满空话。
+# 否则视为「不可执行」而拒绝应用（防止假说库堆满空话）。
+#
+# 注意：``hypothesis.mine_hypotheses`` 的确定性挖掘会产出 ``prefer_structure``
+# （重号/邻号/隔期复出/奇偶配比/三区形态），若不纳入白名单，
+# 实测 7 条挖掘结果里会有 5 条被静默丢弃 —— 即大部分「找出来的规律」根本影响不到出号。
 _ACTION_KINDS = (
     "boost_method",
     "downgrade_method",
@@ -55,6 +59,17 @@ _ACTION_KINDS = (
     "blue_prefer",
     "blue_dedupe",
     "blue_uniform",
+    "prefer_structure",
+)
+
+# ``prefer_structure`` 支持的规则名（与 hypothesis 挖掘端约定一致）。
+# 每条规则映射到「如何调整候选生成」，实现见 apply_structure_rules()。
+_STRUCTURE_RULES = (
+    "keep_last",          # 保留 1 个上期号码（重号）
+    "neighbors_of_last",  # 纳入上期号码的邻号
+    "gap2",               # 纳入隔期（上上期）复出号
+    "odd_target",         # 奇偶配比向实测目标靠拢
+    "zone_target",        # 三区形态向主导形态靠拢
 )
 
 # 单次叠加给某方法的权重上下限：防止一条假说把整个集成掀翻
@@ -65,11 +80,25 @@ _NUMBER_GAIN_MIN, _NUMBER_GAIN_MAX = 0.5, 3.0
 
 # ---------- 假说 → 出号策略 ----------
 
+def _as_hyp_list(registry) -> List[Dict]:
+    """把假说库的任意返回形态归一成 ``list[dict]``。
+
+    ``hypothesis.load_registry`` 可能返回 ``list`` 或 ``{"hypotheses": [...]}``，
+    且条目理论上都应是 dict；这里统一过滤掉非法条目，避免上层
+    在 ``h.get(...)`` 处抛 AttributeError（真实踩过：dict 的键被当成假说）。
+    """
+    if isinstance(registry, dict):
+        registry = registry.get("hypotheses") or []
+    if not isinstance(registry, list):
+        return []
+    return [h for h in registry if isinstance(h, dict)]
+
+
 def EVO_EMPTY_OVERRIDES() -> Dict:
     """空的出号策略覆盖项（降级路径与无假说时共用）。"""
     return {"method_weights": {}, "red_boost": [], "blue_boost": [],
             "blue_dedupe": False, "blue_uniform": False,
-            "applied": [], "skipped": []}
+            "structure_rules": [], "applied": [], "skipped": []}
 
 
 def apply_hypotheses(hypotheses: List[Dict],
@@ -132,12 +161,88 @@ def apply_hypotheses(hypotheses: List[Dict],
         elif kind == "blue_uniform":
             out["blue_uniform"] = bool(act.get("enabled", True))
 
+        elif kind == "prefer_structure":
+            rule = act.get("rule")
+            if rule not in _STRUCTURE_RULES:
+                out["skipped"].append(
+                    {"id": hid, "reason": f"unknown structure rule {rule!r}"})
+                continue
+            out["structure_rules"].append({
+                "rule": rule,
+                "target_odd": act.get("target_odd"),
+                "zone": act.get("zone"),
+                "evidence": (h or {}).get("evidence"),
+            })
+
         out["applied"].append(hid)
     # 互斥：blue_uniform 优先于 blue_prefer / blue_dedupe
     if out["blue_uniform"]:
         out["blue_dedupe"] = False
         out["blue_boost"] = []
     return out
+
+
+def apply_structure_rules(red_pool: List[List[int]], rules: List[Dict],
+                          hist: List[Dict]) -> tuple:
+    """把 ``prefer_structure`` 规则真正作用到红球候选上。
+
+    与号码级乘法偏置不同，这些规则改的是**候选组合的结构**：重号、邻号、
+    隔期复出、奇偶配比、三区形态。实现方式是对每个候选取「结构调整得分」，
+    得分高的候选优先入选；**不直接增删号码**，因此不会破坏既有的硬约束与去重。
+
+    参数
+    ----
+    red_pool: 候选红球组合列表（每个是 6 个升序号码）
+    rules: ``apply_hypotheses()`` 产出的 ``structure_rules``
+    hist: **用于判定结构的历史**（调用方必须传 ``draws[:t]``，不得传未来数据）
+
+    返回 ``(ranked_pool, detail)``：按得分降序的候选与逐规则命中统计。
+    """
+    if not red_pool:
+        return [], {}
+    rules = [r for r in (rules or []) if r.get("rule") in _STRUCTURE_RULES]
+    if not rules or not hist:
+        return list(red_pool), {}
+
+    last = set(hist[-1].get("reds") or [])
+    prev = set(hist[-2].get("reds") or []) if len(hist) >= 2 else set()
+    neighbors = {n for x in last for n in (x - 1, x + 1) if 1 <= n <= 33} - last
+    detail: Dict = {}
+
+    def _score(ticket: List[int]) -> float:
+        s = set(ticket)
+        sc = 0.0
+        for r in rules:
+            rule = r["rule"]
+            if rule == "keep_last":
+                hit = 1 if (s & last) else 0
+                sc += 1.0 if hit else -0.5      # 命中重号加分，完全没有则轻罚
+                detail[rule] = detail.get(rule, 0) + hit
+            elif rule == "neighbors_of_last":
+                hit = 1 if (s & neighbors) else 0
+                sc += 1.0 if hit else -0.5
+                detail[rule] = detail.get(rule, 0) + hit
+            elif rule == "gap2":
+                hit = 1 if (s & prev) else 0
+                sc += 0.8 if hit else -0.4
+                detail[rule] = detail.get(rule, 0) + hit
+            elif rule == "odd_target":
+                tgt = r.get("target_odd")
+                if tgt is not None:
+                    odd = sum(1 for x in ticket if x % 2 == 1)
+                    sc -= abs(odd - float(tgt)) * 0.5   # 越接近实测目标越好
+            elif rule == "zone_target":
+                zone = r.get("zone")
+                if zone:
+                    z1 = sum(1 for x in ticket if 1 <= x <= 11)
+                    z2 = sum(1 for x in ticket if 12 <= x <= 22)
+                    z3 = 6 - z1 - z2
+                    tgt = [int(z) for z in zone]
+                    sc -= (abs(z1 - tgt[0]) + abs(z2 - tgt[1]) + abs(z3 - tgt[2])) * 0.4
+        return sc
+
+    ranked = sorted(red_pool, key=_score, reverse=True)
+    return ranked, detail
 
 
 def _renorm(v: np.ndarray, target: float) -> np.ndarray:
@@ -237,7 +342,10 @@ def evolve_once(draws: List[Dict], use_llm: Optional[bool] = None,
     result["registered"] = reg
 
     # 4) 折叠成出号策略覆盖项（只消费 validated）
-    hyps = hypothesis.load_registry(registry_path)
+    #    注意：load_registry 的返回形态可能是 list 或 {"hypotheses": [...]}，
+    #    必须归一化后再用——否则 "str"/dict 会被当成假说而 AttributeError。
+    hyps = _as_hyp_list(hypothesis.load_registry(registry_path))
+    result["registry_size"] = len(hyps)
     result["overrides"] = apply_hypotheses(hyps)
 
     # 5) 回放验证：首轮没有任何 validated 假说时，退化为「基线 vs 基线」
@@ -271,15 +379,7 @@ def evolution_status(registry_path=None) -> Dict:
                 "min_issues": getattr(config, "METHOD_RECOMMENDATION_MIN_ISSUES", 60),
                 "reason": "lottery/hypothesis.py 尚未就绪"}
 
-    hyps = hypothesis.load_registry(registry_path)
-    # 兼容假说库的「裸列表」形态（h[Hypothesis, ...]）：统一收敛成 list of dict
-    if isinstance(hyps, dict):
-        hyps = list(hyps.get("hypotheses") or [])
-    elif isinstance(hyps, list):
-        hyps = list(hyps)
-    else:
-        hyps = []
-    hyps = [h for h in hyps if isinstance(h, dict)]
+    hyps = _as_hyp_list(hypothesis.load_registry(registry_path))
 
     by_status: Dict[str, int] = {}
     for h in hyps:

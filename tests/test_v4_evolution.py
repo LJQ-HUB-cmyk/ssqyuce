@@ -182,11 +182,74 @@ def test_evolution_status_shape():
 
 
 def test_action_kinds_whitelist_is_closed():
-    """白名单必须包含当前所有动作类型，且不含占位假类型。"""
+    """白名单必须覆盖挖掘端真实产出的动作类型，且不含占位假类型。
+
+    ``prefer_structure`` 必须在内：``hypothesis.mine_hypotheses`` 的确定性挖掘会产出
+    重号/邻号/隔期复出/奇偶/三区这五类结构假说，实测占 7 条挖掘结果的 5 条。
+    若白名单漏掉它，71% 的「找出来的规律」会被静默丢弃、根本影响不到出号。
+    """
     for kind in ("boost_method", "downgrade_method", "prefer_numbers",
-                 "blue_prefer", "blue_dedupe", "blue_uniform"):
-        assert kind in EVO._ACTION_KINDS
+                 "blue_prefer", "blue_dedupe", "blue_uniform",
+                 "prefer_structure"):
+        assert kind in EVO._ACTION_KINDS, f"{kind} 必须支持，否则挖掘端产出会被丢弃"
     assert "summon_dragon" not in EVO._ACTION_KINDS
+
+
+def test_prefer_structure_is_accepted_and_validated():
+    """结构类假说必须被接受，且规则名要在白名单内。"""
+    ok = EVO.apply_hypotheses([_hyp("s1", {"type": "prefer_structure",
+                                          "rule": "keep_last"})])
+    assert ok["applied"] == ["s1"]
+    assert ok["structure_rules"] and ok["structure_rules"][0]["rule"] == "keep_last"
+
+    bad = EVO.apply_hypotheses([_hyp("s2", {"type": "prefer_structure",
+                                           "rule": "summon_dragon"})])
+    assert bad["applied"] == []
+    assert any("unknown structure rule" in s["reason"] for s in bad["skipped"])
+
+
+def test_all_mined_structure_rules_are_whitelisted():
+    """挖掘端产出的每个结构规则名都必须被 evolution 接受（接口对齐守卫）。"""
+    for rule in ("keep_last", "neighbors_of_last", "gap2",
+                 "odd_target", "zone_target"):
+        ov = EVO.apply_hypotheses([_hyp("r", {"type": "prefer_structure", "rule": rule})])
+        assert ov["applied"] == ["r"], f"{rule} 必须被接受"
+    assert set(EVO._STRUCTURE_RULES) >= {"keep_last", "neighbors_of_last",
+                                        "gap2", "odd_target", "zone_target"}
+
+
+def test_apply_structure_rules_penalizes_missing_repeat():
+    """keep_last：有重号的候选必须排在完全没有重号的候选之前。"""
+    hist = [{"reds": [1, 2, 3, 8, 9, 10], "blue": 5},
+            {"reds": [5, 21, 22, 23, 28, 31], "blue": 3}]
+    last = set(hist[-1]["reds"])                    # {5,21,22,23,28,31}
+    pool = [[1, 2, 3, 4, 6, 8],                     # 与 last 交集 0 -> 无重号
+            [5, 1, 2, 3, 4, 6],                     # 含 5     -> 1 个重号
+            sorted(last)]                           # 全部      -> 6 个重号
+    reps_in = [len(set(t) & last) for t in pool]
+    assert reps_in == [0, 1, 6], f"夹具本身要满足 0/1/6 三档，实际 {reps_in}"
+
+    ranked, detail = EVO.apply_structure_rules(pool, [{"rule": "keep_last"}], hist)
+    reps = [len(set(t) & last) for t in ranked]
+    assert reps[-1] == 0, f"无重号候选必须沉底，实际排序 {reps}"
+    assert all(r > 0 for r in reps[:-1]), f"有重号的必须靠前，实际 {reps}"
+    assert detail.get("keep_last", 0) >= 1
+
+
+def test_apply_structure_rules_never_adds_or_drops_candidates():
+    """结构规则只重排序，不得增删候选（否则会破坏既有硬约束与去重）。"""
+    hist = [{"reds": [5, 21, 22, 23, 28, 31], "blue": 5}]
+    pool = [[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]]
+    ranked, _ = EVO.apply_structure_rules(
+        pool, [{"rule": "keep_last"}, {"rule": "odd_target", "target_odd": 3}], hist)
+    assert sorted(map(tuple, ranked)) == sorted(map(tuple, pool))
+
+
+def test_apply_structure_rules_degrades_without_rules_or_history():
+    pool = [[1, 2, 3, 4, 5, 6]]
+    assert EVO.apply_structure_rules(pool, [], [{"reds": [1]}])[0] == pool
+    assert EVO.apply_structure_rules(pool, [{"rule": "keep_last"}], [])[0] == pool
+    assert EVO.apply_structure_rules([], [{"rule": "keep_last"}], [{"reds": [1]}])[0] == []
 
 
 def test_apply_hypotheses_explicit_status_override():
