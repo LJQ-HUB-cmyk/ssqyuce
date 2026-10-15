@@ -1,6 +1,6 @@
 {
   "version": "v5-2",
-  "updated_at": "2026-10-15T15:11:59+00:00",
+  "updated_at": "2026-10-15T15:17:18+00:00",
   "hypotheses": [
     {
       "id": "omission_ratio_red-9896e42235",
@@ -47,7 +47,22 @@
       "attempts": 2,
       "supports": 0,
       "refutes": 0,
-      "last_seen_at": "2026-10-15T15:11:59+00:00"
+      "last_seen_at": "2026-10-15T15:11:59+00:00",
+      "last_score": {
+        "hyp_id": "omission_ratio_red-9896e42235",
+        "family": "omission_ratio_red",
+        "metric": "红球命中差",
+        "delta": -0.0043,
+        "lift": -0.0043,
+        "n_issues": 515,
+        "min_issues": 60,
+        "verdict": "无显著差异",
+        "basis": "回放给出的红球命中差（相对基线）；515 期样本（≥ 门槛 60），最小可检出幅度 0.05",
+        "direction": "none",
+        "p_value": null,
+        "p_adjusted": null
+      },
+      "last_scored_at": "2026-10-15T15:17:18+00:00"
     },
     {
       "id": "omission_ratio_blue-8e65d819ee",
@@ -88,7 +103,22 @@
       "attempts": 2,
       "supports": 0,
       "refutes": 0,
-      "last_seen_at": "2026-10-15T15:11:59+00:00"
+      "last_seen_at": "2026-10-15T15:11:59+00:00",
+      "last_score": {
+        "hyp_id": "omission_ratio_blue-8e65d819ee",
+        "family": "omission_ratio_blue",
+        "metric": "红球命中差",
+        "delta": 0.0,
+        "lift": 0.0,
+        "n_issues": 515,
+        "min_issues": 60,
+        "verdict": "无显著差异",
+        "basis": "回放给出的红球命中差（相对基线）；515 期样本（≥ 门槛 60），最小可检出幅度 0.05",
+        "direction": "none",
+        "p_value": null,
+        "p_adjusted": null
+      },
+      "last_scored_at": "2026-10-15T15:17:18+00:00"
     },
     {
       "id": "repeat_confirmed-7c64d3c0ca",
@@ -117,7 +147,22 @@
       "attempts": 2,
       "supports": 0,
       "refutes": 0,
-      "last_seen_at": "2026-10-15T15:11:59+00:00"
+      "last_seen_at": "2026-10-15T15:11:59+00:00",
+      "last_score": {
+        "hyp_id": "repeat_confirmed-7c64d3c0ca",
+        "family": "repeat_confirmed",
+        "metric": "红球命中差",
+        "delta": 0.012,
+        "lift": 0.011,
+        "n_issues": 515,
+        "min_issues": 60,
+        "verdict": "无显著差异",
+        "basis": "回放给出的红球命中差（相对基线）；515 期样本（≥ 门槛 60），最小可检出幅度 0.05",
+        "direction": "none",
+        "p_value": null,
+        "p_adjusted": null
+      },
+      "last_scored_at": "2026-10-15T15:17:18+00:00"
     },
     {
       "id": "neighbor_number-eaa7c64242",
@@ -145,7 +190,22 @@
       "attempts": 2,
       "supports": 0,
       "refutes": 0,
-      "last_seen_at": "2026-10-15T15:11:59+00:00"
+      "last_seen_at": "2026-10-15T15:11:59+00:00",
+      "last_score": {
+        "hyp_id": "neighbor_number-eaa7c64242",
+        "family": "neighbor_number",
+        "metric": "红球命中差",
+        "delta": -0.0008,
+        "lift": -0.0005,
+        "n_issues": 515,
+        "min_issues": 60,
+        "verdict": "无显著差异",
+        "basis": "回放给出的红球命中差（相对基线）；515 期样本（≥ 门槛 60），最小可检出幅度 0.05",
+        "direction": "none",
+        "p_value": null,
+        "p_adjusted": null
+      },
+      "last_scored_at": "2026-10-15T15:17:18+00:00"
     },
     {
       "id": "gap2_reappear-b97311bf39",
@@ -173,7 +233,22 @@
       "attempts": 2,
       "supports": 0,
       "refutes": 0,
-      "last_seen_at": "2026-10-15T15:11:59+00:00"
+      "last_seen_at": "2026-10-15T15:11:59+00:00",
+      "last_score": {
+        "hyp_id": "gap2_reappear-b97311bf39",
+        "family": "gap2_reappear",
+        "metric": "红球命中差",
+        "delta": 0.0023,
+        "lift": 0.0021,
+        "n_issues": 515,
+        "min_issues": 60,
+        "verdict": "无显著差异",
+        "basis": "回放给出的红球命中差（相对基线）；515 期样本（≥ 门槛 60），最小可检出幅度 0.05",
+        "direction": "none",
+        "p_value": null,
+        "p_adjusted": null
+      },
+      "last_scored_at": "2026-10-15T15:17:18+00:00"
     },
     {
       "id": "odd_even_shift-1212119d8d",
@@ -202,7 +277,22 @@
       "attempts": 2,
       "supports": 0,
       "refutes": 0,
-      "last_seen_at": "2026-10-15T15:11:59+00:00"
+      "last_seen_at": "2026-10-15T15:11:59+00:00",
+      "last_score": {
+        "hyp_id": "odd_even_shift-1212119d8d",
+        "family": "odd_even_shift",
+        "metric": "红球命中差",
+        "delta": -0.0148,
+        "lift": -0.0048,
+        "n_issues": 515,
+        "min_issues": 60,
+        "verdict": "无显著差异",
+        "basis": "回放给出的红球命中差（相对基线）；515 期样本（≥ 门槛 60），最小可检出幅度 0.05",
+        "direction": "none",
+        "p_value": null,
+        "p_adjusted": null
+      },
+      "last_scored_at": "2026-10-15T15:17:18+00:00"
     },
     {
       "id": "zone_concentration-5909597ede",
@@ -236,7 +326,22 @@
       "attempts": 2,
       "supports": 0,
       "refutes": 0,
-      "last_seen_at": "2026-10-15T15:11:59+00:00"
+      "last_seen_at": "2026-10-15T15:11:59+00:00",
+      "last_score": {
+        "hyp_id": "zone_concentration-5909597ede",
+        "family": "zone_concentration",
+        "metric": "红球命中差",
+        "delta": -0.0132,
+        "lift": -0.0781,
+        "n_issues": 515,
+        "min_issues": 60,
+        "verdict": "无显著差异",
+        "basis": "回放给出的红球命中差（相对基线）；515 期样本（≥ 门槛 60），最小可检出幅度 0.05",
+        "direction": "none",
+        "p_value": null,
+        "p_adjusted": null
+      },
+      "last_scored_at": "2026-10-15T15:17:18+00:00"
     },
     {
       "id": "blue_dedupe_coverage-0b660f367f",
@@ -266,7 +371,22 @@
       "attempts": 2,
       "supports": 0,
       "refutes": 0,
-      "last_seen_at": "2026-10-15T15:11:59+00:00"
+      "last_seen_at": "2026-10-15T15:11:59+00:00",
+      "last_score": {
+        "hyp_id": "blue_dedupe_coverage-0b660f367f",
+        "family": "blue_dedupe_coverage",
+        "metric": "红球命中差",
+        "delta": 0.0,
+        "lift": 0.0,
+        "n_issues": 515,
+        "min_issues": 60,
+        "verdict": "无显著差异",
+        "basis": "回放给出的红球命中差（相对基线）；515 期样本（≥ 门槛 60），最小可检出幅度 0.05",
+        "direction": "none",
+        "p_value": null,
+        "p_adjusted": null
+      },
+      "last_scored_at": "2026-10-15T15:17:18+00:00"
     },
     {
       "id": "blue_uniform_fallback-ec23e48d60",
@@ -294,7 +414,22 @@
       "attempts": 2,
       "supports": 0,
       "refutes": 0,
-      "last_seen_at": "2026-10-15T15:11:59+00:00"
+      "last_seen_at": "2026-10-15T15:11:59+00:00",
+      "last_score": {
+        "hyp_id": "blue_uniform_fallback-ec23e48d60",
+        "family": "blue_uniform_fallback",
+        "metric": "红球命中差",
+        "delta": 0.0,
+        "lift": 0.0,
+        "n_issues": 515,
+        "min_issues": 60,
+        "verdict": "无显著差异",
+        "basis": "回放给出的红球命中差（相对基线）；515 期样本（≥ 门槛 60），最小可检出幅度 0.05",
+        "direction": "none",
+        "p_value": null,
+        "p_adjusted": null
+      },
+      "last_scored_at": "2026-10-15T15:17:18+00:00"
     }
   ]
 }

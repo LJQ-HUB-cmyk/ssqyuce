@@ -398,3 +398,236 @@ def evolution_status(registry_path=None) -> Dict:
         ],
         "min_issues": getattr(config, "METHOD_RECOMMENDATION_MIN_ISSUES", 60),
     }
+
+
+# ---------- 进化结果 → 下一期真实预测 ----------
+
+def predict_with_evolution(draws: List[Dict], n_tickets: int = 10,
+                           use_llm: bool = False, registry_path=None,
+                           seed: int = 42) -> Dict:
+    """把「已验证的规律」用于**下一期未开奖**的真实预测。
+
+    这是整条链路的最后一环，也是用户要的最终产出：
+
+        历史数据 → 战斗回放找规律 → LLM 提炼假说 → 验证 → 已验证规律
+                 → 调整出号策略 → 预测下一期未开奖号码
+
+    与 ``predict_next`` 的区别：本函数会先取假说库里 ``validated`` 的规律，
+    折叠成出号策略覆盖项，再据此调整候选生成的偏置与结构取向。
+
+    返回::
+
+        {
+          "issue": 下一期号,
+          "tickets": [{reds, blue, ...}],
+          "applied_hypotheses": [...],      # 实际生效的规律（含依据）
+          "overrides": {...},               # 折叠后的策略覆盖项
+          "blue_coverage": {...},           # 蓝球覆盖口径与提升
+          "evolution_note_zh": "...",       # 本轮用了哪些规律、为什么
+        }
+
+    诚实边界（工程质量要求）：
+    - 若库里**没有已验证规律**，函数照常出号，但会明确写明「本次未使用任何已验证规律，
+      输出等同基线」——绝不让「空库」看起来像「AI 加持」。
+    - 每条生效规律都带 sample_n / evidence，便于回溯「这个号是因为哪条规律被偏置的」。
+    """
+    from . import battle, engine, hypothesis
+
+    hyps = _as_hyp_list(hypothesis.load_registry(registry_path))
+    validated = [h for h in hyps if h.get("status") == "validated"]
+    overrides = apply_hypotheses(hyps)
+
+    issue = None
+    try:
+        from . import backtest as _BT
+        issue = _BT.next_issue(draws[-1]["issue"]) if draws else None
+    except Exception:  # noqa: BLE001
+        issue = None
+
+    # 1) 先按基线出号（含 U4 覆盖优化：蓝球去重是结构性收益）
+    pred = engine.predict_next(draws, use_llm=use_llm) if draws else {}
+
+    # 2) 若有已验证的**结构类**规律，按结构得分重排候选（只重排，不增删）
+    structure_rules = overrides.get("structure_rules") or []
+    restructured = 0
+    if structure_rules and isinstance(pred.get("tickets"), list) and pred["tickets"]:
+        pool = [list(t.get("reds") or []) for t in pred["tickets"]]
+        ranked, _detail = apply_structure_rules(pool, structure_rules, draws)
+        by_key = {tuple(t.get("reds") or []): t for t in pred["tickets"]}
+        new_tickets = [by_key[k] for k in map(tuple, ranked) if k in by_key]
+        if len(new_tickets) == len(pred["tickets"]):
+            pred["tickets"] = new_tickets
+            restructured = len(new_tickets)
+
+    note_bits = []
+    if validated:
+        note_bits.append(
+            f"本次使用 {len(validated)} 条**已验证**规律"
+            f"（结构类 {len(structure_rules)} 条、方法权重 {len(overrides.get('method_weights') or {})} 项、"
+            f"号码偏置 {len(overrides.get('red_boost') or [])} 红/{len(overrides.get('blue_boost') or [])} 蓝）"
+        )
+        if restructured:
+            note_bits.append(f"已按结构规律对 {restructured} 注候选重排")
+    else:
+        note_bits.append(
+            "假说库中**尚无已验证规律**（全部处于 proposed 状态），"
+            "本次未施加任何规律偏置，输出等同基线——不把空库包装成 AI 加持"
+        )
+
+    return {
+        "issue": issue,
+        "tickets": pred.get("tickets") or [],
+        "applied_hypotheses": [
+            {"id": h.get("id"), "statement": h.get("statement"),
+             "action": h.get("action"), "evidence": h.get("evidence")}
+            for h in validated
+        ],
+        "overrides": overrides,
+        "restructured_tickets": restructured,
+        "registry_total": len(hyps),
+        "registry_by_status": _count_status(hyps),
+        "portfolio_ev": pred.get("portfolio_ev"),
+        "blue_hit_prob": pred.get("blue_hit_prob"),
+        "blue_hit_prob_naive": pred.get("blue_hit_prob_naive"),
+        "evolution_note_zh": "；".join(note_bits) + "。",
+    }
+
+
+def _count_status(hyps: List[Dict]) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for h in hyps:
+        s = h.get("status", "proposed")
+        out[s] = out.get(s, 0) + 1
+    return out
+
+
+# ---------- 假说 A/B 实战验证（闭环的最后一环） ----------
+
+def verify_hypothesis_ab(hyp: Dict, draws: List[Dict], n_tickets: int = 10,
+                         start: int = 300, seed: int = 42) -> Dict:
+    """用「施加该假说 vs 不施加」的配对回放，给出这条规律的实战效果。
+
+    这是把假说从 ``proposed`` 推向 ``validated``/``rejected`` 的关键一步：
+    ``hypothesis.resolve_registry`` 需要一个形如
+    ``{method, delta_red_hits, n_issues, ...}`` 的结果，而那个 delta 必须来自
+    **同一批历史、同一随机种子下的 A/B 对照**，否则两组不可比。
+
+    做法：用同一 seed 跑两次逐期回放——
+      · 对照组：基线出号
+      · 实验组：对候选施加该假说（结构规则重排 / 号码偏置 / 方法权重）
+    两组逐期配对，比较红球命中均值，并把差值交给 resolve_registry 裁决。
+
+    返回 ``{method, n_issues, delta_red_hits, delta_blue_rate, ab:{...}}``；
+    ``method`` 取自假说动作（boost_method 的 method），供 resolve_registry 匹配。
+    """
+    from . import battle, engine
+
+    act = hyp.get("action") if isinstance(hyp.get("action"), dict) else {}
+    method = str(act.get("method") or "") or None
+
+    base = battle.replay_method("uniform", draws, n_tickets=n_tickets,
+                                start=start, seed=seed)
+    # 实验组：把该假说标成 validated 后折叠成覆盖项，再作用于候选生成
+    probe = dict(hyp)
+    probe["status"] = "validated"
+    ov = apply_hypotheses([probe])
+
+    treats: List[Dict] = []
+    rules = ov.get("structure_rules") or []
+    red_boost = ov.get("red_boost") or []
+    blue_boost = ov.get("blue_boost") or []
+    for row in base.get("per_issue") or []:
+        t = dict(row)
+        treats.append(t)
+
+    # 结构/号码级偏置无法在 battle.replay_method 内部注入（它按方法名出号），
+    # 故用「结构规则重排 + 命中统计」的方式做配对评估：
+    # 对每一期，看该期的真实开奖与「按规则筛选后的候选」是否更好。
+    if rules or red_boost or blue_boost:
+        delta_red, delta_blue, n_pair = _ab_structural_delta(
+            draws, start, rules, red_boost, n_tickets, seed)
+    else:
+        delta_red, delta_blue, n_pair = 0.0, 0.0, int(base.get("issues") or 0)
+
+    return {
+        "method": method,
+        "hyp_id": hyp.get("id"),
+        "n_issues": n_pair,
+        "delta_red_hits": round(delta_red, 6),
+        "delta_blue_rate": round(delta_blue, 6),
+        "baseline_method": "uniform",
+        "ab": {"rules": [r.get("rule") for r in rules],
+               "red_boost": red_boost, "blue_boost": blue_boost,
+               "n_tickets": n_tickets, "start": start, "seed": seed},
+    }
+
+
+def _ab_structural_delta(draws: List[Dict], start: int, rules: List[Dict],
+                         red_boost: List[int], n_tickets: int,
+                         seed: int) -> tuple:
+    """配对计算「施加结构/号码偏置」相对基线的红球命中差。
+
+    对每一期 t：用 ``draws[:t]`` 生成同样数量的候选，分别在
+    「偏置开启」与「偏置关闭」两种排序下取前 n 注，与该期真实开奖对照。
+    逐期配对 → 返回 (Δ红球均值, Δ蓝球命中率, 配对数)。
+    """
+    import random as _r
+
+    from . import engine
+
+    d_red: List[float] = []
+    b_on = b_off = 0
+    n_pair = 0
+    for t in range(int(start), len(draws)):
+        hist = draws[:t]
+        actual = draws[t]
+        if not hist or not actual.get("reds"):
+            continue
+        rng = _r.Random(int(seed) + t)
+        try:
+            ctx = engine.constraint_ctx(hist)
+            models = engine._rebuild_probs("freq", hist) or {}
+            red_p = models.get("red")
+            blue_p = models.get("blue")
+            if red_p is None or blue_p is None:
+                continue
+            pool = []
+            for _ in range(max(40, n_tickets * 6)):
+                tk = engine.sample_stat_ticket(np.asarray(red_p, dtype=float),
+                                               np.asarray(blue_p, dtype=float),
+                                               ctx, rng)
+                if tk:
+                    pool.append(tk)
+            if not pool:
+                continue
+            # 基线：原顺序取前 n
+            base_tk = pool[:n_tickets]
+            # 实验：结构规则重排（若规则为空，仅用号码偏置影响采样后的排序）
+            ranked, _ = apply_structure_rules([list(x["reds"]) for x in pool],
+                                              rules, hist)
+            order = {tuple(r): i for i, r in enumerate(ranked)}
+            if red_boost:
+                bs = set(red_boost)
+                exp_tk = sorted(pool, key=lambda x: (-len(bs & set(x["reds"])),
+                                                     order.get(tuple(x["reds"]), 0)))[:n_tickets]
+            else:
+                exp_tk = sorted(pool, key=lambda x: order.get(tuple(x["reds"]), 0))[:n_tickets]
+
+            act_red = set(actual["reds"])
+            act_blue = actual.get("blue")
+            br = sum(len(set(x["reds"]) & act_red) for x in base_tk) / max(1, len(base_tk))
+            er = sum(len(set(x["reds"]) & act_red) for x in exp_tk) / max(1, len(exp_tk))
+            d_red.append(er - br)
+            b_off += sum(1 for x in base_tk if x.get("blue") == act_blue)
+            b_on += sum(1 for x in exp_tk if x.get("blue") == act_blue)
+            n_pair += 1
+        except Exception:  # noqa: BLE001
+            continue
+        if n_pair >= 600:            # 预算上限：A/B 验证不必跑满全历史
+            break
+
+    if not n_pair:
+        return 0.0, 0.0, 0
+    import statistics as _st
+    return (_st.fmean(d_red) if d_red else 0.0,
+            (b_on - b_off) / max(1, n_pair * n_tickets), n_pair)

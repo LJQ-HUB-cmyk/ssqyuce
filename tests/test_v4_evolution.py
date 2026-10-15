@@ -257,3 +257,68 @@ def test_apply_hypotheses_explicit_status_override():
     hyps = [_hyp("h", {"type": "prefer_numbers", "numbers": [7]}, status="proposed")]
     ov = EVO.apply_hypotheses(hyps, only_status={"proposed"})
     assert ov["applied"] == ["h"] and ov["red_boost"] == [7]
+
+
+# ---------- 4. A/B 实战验证（闭环最后一环） ----------
+
+def test_verify_hypothesis_ab_returns_resolvable_shape():
+    """A/B 结果必须能直接被 resolve_registry 消费（含 method 与 delta 字段）。"""
+    from lottery import evolution as _E
+    draws = [{"issue": str(2026000 + i), "reds": [((i * 3 + j) % 33) + 1 for j in range(6)],
+              "blue": (i % 16) + 1} for i in range(120)]
+    hyp = _hyp("ab1", {"type": "boost_method", "method": "stat:omission", "weight": 1.3})
+    r = _E.verify_hypothesis_ab(hyp, draws, n_tickets=1, start=100)
+    for k in ("method", "n_issues", "delta_red_hits", "delta_blue_rate"):
+        assert k in r, f"A/B 结果缺少 {k}（resolve_registry 需要它）"
+    assert r["method"] == "stat:omission"      # 供 resolve_registry 匹配动作
+
+
+def test_verify_hypothesis_ab_is_deterministic():
+    """同 seed 必须可复现——否则裁决会随机漂移。"""
+    from lottery import evolution as _E
+    draws = [{"issue": str(2026000 + i), "reds": [((i * 5 + j) % 33) + 1 for j in range(6)],
+              "blue": (i % 16) + 1} for i in range(120)]
+    hyp = _hyp("ab2", {"type": "prefer_structure", "rule": "keep_last"})
+    a = _E.verify_hypothesis_ab(hyp, draws, n_tickets=1, start=100)
+    b = _E.verify_hypothesis_ab(hyp, draws, n_tickets=1, start=100)
+    assert a["delta_red_hits"] == b["delta_red_hits"]
+    assert a["n_issues"] == b["n_issues"]
+
+
+def test_ab_structural_delta_is_bounded_and_finite():
+    """Δ 必须在合理范围内且有限——防止排序 bug 造成荒谬数值。"""
+    import math
+
+    from lottery import evolution as _E
+    draws = [{"issue": str(2026000 + i), "reds": [((i * 7 + j) % 33) + 1 for j in range(6)],
+              "blue": (i % 16) + 1} for i in range(140)]
+    d_red, d_blue, n = _E._ab_structural_delta(
+        draws, 100, [{"rule": "keep_last"}], [4, 9], 1, 42)
+    assert math.isfinite(d_red) and math.isfinite(d_blue)
+    assert -6.0 <= d_red <= 6.0 and -1.0 <= d_blue <= 1.0
+    assert n >= 0
+
+
+def test_predict_with_evolution_reports_empty_registry_honestly(monkeypatch, tmp_path):
+    """空假说库时必须如实说明「未使用任何已验证规律」，不得包装成 AI 加持。"""
+    from lottery import evolution as _E, hypothesis
+    monkeypatch.setattr(hypothesis, "load_registry", lambda *a, **k: {"hypotheses": []})
+    monkeypatch.setattr(_E, "apply_hypotheses", lambda h, **k: _E.EVO_EMPTY_OVERRIDES())
+    # features.compute_features 需要 date 字段，故夹具要带全
+    draws = [{"issue": "2026001", "reds": [1, 2, 3, 4, 5, 6], "blue": 7,
+              "date": "2026-01-01"}]
+    out = _E.predict_with_evolution(draws, n_tickets=1)
+    assert out["applied_hypotheses"] == []
+    assert "尚无已验证规律" in out["evolution_note_zh"]
+    assert "不把空库包装成 AI 加持" in out["evolution_note_zh"]
+
+
+def test_as_hyp_list_normalizes_shapes():
+    """load_registry 的各种返回形态都要能归一（真实踩过 dict 被当成假说的坑）。"""
+    from lottery import evolution as _E
+    assert _E._as_hyp_list({"hypotheses": [{"id": "a"}]}) == [{"id": "a"}]
+    assert _E._as_hyp_list([{"id": "a"}]) == [{"id": "a"}]
+    assert _E._as_hyp_list({"nope": 1}) == []
+    assert _E._as_hyp_list("oops") == []
+    assert _E._as_hyp_list(None) == []
+    assert _E._as_hyp_list([{"id": "a"}, "junk", None]) == [{"id": "a"}]
