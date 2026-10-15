@@ -128,26 +128,32 @@ sudo ufw allow 18000/tcp && sudo ufw enable
 
 阿里云/腾讯云/AWS 等需在**安全组**里放行 TCP 18000。
 
-## 六、本机挖掘并发布到 BF.US
+## 六、本机挖掘并发布到远端节点
 
 VPS 不执行自动挖掘。挖掘在本机完成后，只提交 `data/mining_artifact.json`；数据库、原始快照和密钥仍不会进入 Git。
 
-### Windows 本机（PowerShell）
+### 本机（Linux，2026-10-15 实测可用）
 
-```powershell
-# 在工作区 D:\AI\Deepseek-harness\CP 执行
-.venv\Scripts\python.exe -m lottery.cli fetch
-.venv\Scripts\python.exe -m lottery.cli mine --engine rf --min-start 300 --top-k 8
-.venv\Scripts\python.exe -m lottery.cli import_mining data\mining_artifact.json  # 可选：验证可导入
+```bash
+cd /root/DSH/应用/ssqyuce
+.venv/bin/python -m lottery.cli fetch
+.venv/bin/python -m lottery.cli mine --engine rf --min-start 300 --top-k 8
+.venv/bin/python -m lottery.cli import_mining data/mining_artifact.json  # 可选：验证可导入
 
 git add lottery data/mining_artifact.json entrypoint.sh DEPLOY.md
 git commit -m "chore: publish local mining artifact"
-git push origin main
+# 推送见「十一、推送到 GitHub」
 ```
 
 `mine` 会更新本机 SQLite，同时生成 `data/mining_artifact.json`。该文件仅包含挖掘规律、统计显著性和来源期号，不包含开奖数据库或凭据。
 
-### BF.US 远程重建
+### 部署到各节点（状态以实测为准）
+
+> ⚠️ **多节点现状（2026-10-15 实测）**：本机已是 v2.1.0；
+> R71s.AI 仍停在 v0.9.0；**ZT.JP.Plus 上查不到任何 ssq 部署**；BF.US 无 SSH 别名、未核实。
+> 详细状态表见 `docs/PROJECT_CONTEXT.md` 第 2 节。**不要照抄旧文档假设某台机器已部署。**
+
+**能直连 GitHub 的节点**（标准流程）：
 
 ```bash
 cd /opt/ssqyuce
@@ -156,6 +162,31 @@ docker compose up -d --build
 docker compose logs --tail 80 lottery
 curl -fsS http://127.0.0.1:18000/api/health
 ```
+
+**不能直连 GitHub / Docker Hub 的节点**（如 R71s.AI，离线镜像路径）：
+
+```bash
+# 本机：导出镜像
+docker save ssq-predictor:latest | gzip > /tmp/ssq.tgz
+scp /tmp/ssq.tgz <node>:/tmp/
+# 目标机：载入并用现有镜像启动，不在本机构建
+ssh <node> 'gunzip -c /tmp/ssq.tgz | docker load && cd /opt/ssq && docker compose up -d --no-build'
+```
+
+**升级前务必备份目标机的 `data/`（尤其 `ssq.db`）与 `.env`**：
+跨多个批次升级会执行 SQLite schema 迁移（见 `lottery/migrations.py`），不可逆。
+
+### 运行时状态不在 git 里
+
+以下文件是**运行时状态**、已 gitignore，换节点或重建容器时不会自动跟随，需要时手动 `scp`：
+
+| 文件 | 内容 |
+|---|---|
+| `data/ssq.db` | 开奖库、预测、评估明细 |
+| `data/hypotheses.json` | V5 假说库（每轮进化改写） |
+| `data/adaptive_state.json` | 方法自适应降权状态 |
+| `data/llm_budget.json` | 推理型模型学到的输出预算 |
+| `data/llm_config.json`、`.env` | 密钥与运行时配置 |
 
 容器启动时会自动导入 `/app/data/mining_artifact.json`；重复重建是幂等的。若本次不发布产物，启动会明确跳过挖掘，不会在 VPS 上自动运行 `mine`。
 
@@ -231,5 +262,37 @@ entrypoint.sh（启动：同步数据→回测→按需生成预测）
       ├─ 单页前端（web/，ECharts CDN，零构建）
       ├─ REST API（lottery/api_app.py）
       └─ 调度线程（LOTT_SCHEDULER=1：开奖日 21:35 后自动闭环）
-数据卷：/app/data（ssq.db + raw 快照）
+数据卷：/app/data（ssq.db + raw 快照 + hypotheses.json 等运行时状态）
 ```
+
+## 十一、推送到 GitHub
+
+本机（bero_de）HTTPS 可直连 GitHub，PAT 存于 `/root/DSH/githubtoken.txt`：
+
+```bash
+cd /root/DSH/应用/ssqyuce
+git add -A && git commit -m "..."           # 先提交
+PAT=$(tr -d '\r\n' < /root/DSH/githubtoken.txt)
+git -c credential.helper= push "https://jiam9069:${PAT}@github.com/jiam9069/ssqyuce.git" main
+
+# 走显式 URL 推送**不会**更新本地 origin/main 跟踪引用，需手动同步后再看 git status：
+git update-ref refs/remotes/origin/main "$(git rev-parse HEAD)"
+
+# 核验确实落地（不要只信 push 的输出）
+curl -s https://api.github.com/repos/jiam9069/ssqyuce/commits/main | grep -m1 '"sha"'
+```
+
+**推送前检查**（本仓库历史踩过密钥泄露风险）：
+
+```bash
+git status --short                      # 确认没把 .env / data/*.json / ssq.db 加进来
+git diff --cached --stat                # 过一眼改动面
+grep -rIl "LOTT_LLM_API_KEY\|ghp_" $(git ls-files) 2>/dev/null   # 应为空
+```
+
+> ⚠️ **凭据现状（待改进）**：`/root/DSH/githubtoken.txt` 里的 PAT 以**明文**存放，
+> 且对账号下**所有**仓库有权限。建议换成仅限本仓库、权限为 Contents: Read and write
+> 的细粒度令牌，并吊销旧令牌。
+
+**其他节点**若也能直连 GitHub，按前述 `git pull --ff-only && docker compose up -d --build` 升级；
+不能直连的走离线镜像路径（见第六节）。

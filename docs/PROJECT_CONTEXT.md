@@ -13,16 +13,27 @@
 - 当前主分支提交：见 `git log -1`（V5 自进化系统提交）
 - GitHub：`https://github.com/jiam9069/ssqyuce`
 - 部署站点（均为 Docker Compose，容器 `ssq-predictor`，端口 `18000`）：
-  - **本机**：`/root/DSH/应用/ssqyuce`，公网入口 `https://ssq.ff88.de`
-  - **BF.US**：`/opt/ssqyuce`，GitHub 可直连，构建正常；也是本机推 GitHub 的中转
-  - **R71s.AI**（192.168.5.5）：`/opt/ssq`，GitHub/Docker Hub 直连均不通；升级用「BF.US `docker save|gzip` → 本机中转 → `docker load` + `compose up -d --no-build`」（135MB 镜像传输验证可行）；docker-compose.yml 有本地代理注入改动（SSQ_PROXY），属预期保留
-  - **ZT.JP.Plus**（jp6.ff88.xx.kg）：`/opt/ssqyuce`，GitHub/Docker Hub 均可直连，标准 git clone + 构建；数据与 .env 由 ivy-ray-EU 迁移接替
-- **ivy-ray-EU 已于 2026-09-17 下线删除**（容器/目录/镜像清除，18000 释放，数据已迁往 ZT.JP.Plus）
-- 最近验证（2026-10-15，本机）：容器 `healthy`，`/api/info` 返回 v2.1.0 / 2026-10-V5，
-  3514 期（max 2026117）；三个 V4 新端点均 200；公网 `https://ssq.ff88.de` 同样返回 v2.1.0，
-  `/static/app.js?v=20261015.2` 返回 `x-cache-status: MISS`（缓存已换新键）。
-  R71s / ZT.JP.Plus 启动预热期 healthcheck 可能短暂 `unhealthy`（回测占满 CPU 使 8s 探活超时），非故障。
+
+  | 节点 | 路径 / 入口 | 实际状态（2026-10-15 实测） |
+  |---|---|---|
+  | **本机**（bero_de） | `/root/DSH/应用/ssqyuce`，公网 `https://ssq.ff88.de` | ✅ **v2.1.0 / 2026-10-V5**，容器 healthy；公网 `/api/info` 同版本 |
+  | **R71s.AI**（192.168.5.5，ssh 别名 `r71s_debian`） | `/opt/ssq` | ⚠️ 仍停在 **v0.9.0 / 2026-09-M5.1**，git 停在 `ff3a7f6`（2026-09-17）——落后 6 个批次。该机 GitHub/Docker Hub 直连均不通，须走离线路径升级 |
+  | **BF.US** | `/opt/ssqyuce`（历史上也是本机推 GitHub 的中转） | ❓ **未核实**：本机无该机的 SSH 别名，无法登录验证；其存在性仅依据历史记录 |
+  | **ZT.JP.Plus** | 历史记录写 `/opt/ssqyuce` | ❌ **该机上查不到任何 ssq 部署**：无 `/opt/ssqyuce`、无 ssq 容器、无 18000 监听（2026-10-15 经 ssh `zt_jp_plus` 实测）。历史记录已失真 |
+
+- **ivy-ray-EU 已于 2026-09-17 下线删除**（容器/目录/镜像清除，18000 释放）。
+  历史记录称「数据已迁往 ZT.JP.Plus」，但 2026-10-15 在 ZT.JP.Plus 上查不到 ssq 部署，
+  故「数据现在在谁那里」**需要重新确认**，不要沿用这条旧结论。
+- 最近验证（2026-10-15，本机）：容器 `healthy`，`/api/info` 返回 v2.1.0 / 2026-10-V5；
+  V4 三个端点 + V5 三个端点（`/api/battle/report`、`/api/evolution/status`、`/api/evolution/run`）均 200；
+  公网 `https://ssq.ff88.de` 同样返回 v2.1.0，`/static/app.js?v=20261015.2` 返回 `x-cache-status: MISS`（缓存已换新键）。
+  工作树干净，本地 HEAD = `origin/main` = GitHub 远端（三方 SHA 一致）。
+- 启动预热期 healthcheck 可能短暂 `unhealthy`（回测占满 CPU 使 8s 探活超时），非故障；本机实测预热约 2~2.5 分钟。
 - **api.b.ai 网关账户余额已耗尽**（`insufficient_user_quota`，balance=0）：LLM 通道自检返回“模型无返回”，纯统计模式不受影响；需充值或换通道后 LLM 才恢复。
+
+> ⚠️ **多节点状态请以实测为准**：上表 2026-10-15 由 coding-agent 逐台 ssh 核验（`zt_jp_plus`、`r71s_debian`）。
+> 未核实项已标 ❓，不要当成已知事实。若要把本机版本推到其他节点，
+> 注意 **`data/hypotheses.json` 等运行时状态不在 git 里**，需手动同步。
 
 ## 3. 已完成能力
 
@@ -209,16 +220,29 @@
 - `lottery/data_check.py`：多源对账。
 - `README.md`：用户文档、配置、API、版本记录。
 - `docs/M3_M4_PLAN.md`：M3/M4 规划、实施状态、验收与风险。
-- `tests/`：回归测试，当前本地全套 `30 passed, 1 warning`。
+- `tests/`：回归测试，当前本地全套 **381 passed**（2026-10-15 实测）。
 
 ## 5. 运行与交付约定
 
-1. 工作目录固定为 `D:\AI\Deepseek-harness\CP`；不要把 DSH checkout 当作项目目录。
-2. 使用 `read`/`edit`/`write`/`glob`/`grep` 检查和修改项目文件；不要提交运行态密钥和数据：`.env`、`data/llm_config.json`、`data/methods_config.json`、SQLite/raw 数据。
+1. 工作目录：本机为 `/root/DSH/应用/ssqyuce`（**不要**把 DSH checkout 当作项目目录）。
+   （历史记录里的 `D:\AI\Deepseek-harness\CP` 是早期 Windows 环境，已不适用。）
+2. 使用 `read`/`edit`/`write`/`glob`/`grep` 检查和修改项目文件；不要提交运行态密钥和数据：
+   `.env`、`data/llm_config.json`、`data/methods_config.json`、`data/hypotheses.json`、
+   `data/adaptive_state.json`、`data/llm_budget.json`、SQLite/raw 数据。这些已在 `.gitignore` 中。
 3. 每次较大修改必须本地运行 `python -m pytest -q`、compileall、前端 `node --check`、`git diff --check`。
-4. 提交后同步 GitHub；若本机 HTTPS 不通，可通过 BF.US SSH Git remote 推送。之后在 BF.US `/opt/ssqyuce` 拉取/重建/验证。
-5. BF.US 首次重启后可能因 fetch/backtest/ML 预热需要数分钟；不要把启动阶段的 curl reset 直接当成失败，应查看 `docker compose logs`，等待容器 `healthy` 后再验证 `/api/health`、`/api/info`。
+4. **提交后直接推 GitHub**（2026-10-15 实测本机 HTTPS 可直连、PAT 存于 `/root/DSH/githubtoken.txt`）：
+   ```
+   git -c credential.helper= push "https://jiam9069:${PAT}@github.com/jiam9069/ssqyuce.git" main
+   ```
+   推送后用 `git update-ref refs/remotes/origin/main <sha>` 同步本地跟踪引用
+   （走显式 URL 推送不会更新它），并以 GitHub API 核验落地。
+5. **本机部署**：`docker compose up -d --build`，然后轮询 `docker inspect --format='{{.State.Health.Status}}' ssq-predictor`。
+   首次启动预热（fetch/backtest/ML）约 **2~2.5 分钟**，期间 `/api/health` 不可用、healthcheck 显示 `starting`——
+   这不是故障，不要据此判失败。容器 `mem_limit=768m`，预热期实测约 630MB（82%），偏紧。
 6. Token/SMTP/Webhook 只写服务器 `.env`，最终回复不得展示秘密。
+7. **前端改动必须同步升 `?v=`**（见 `DEPLOY.md`）：入口节点对 `/static/` 有 7 天代理缓存、
+   浏览器 24h 缓存，不升版本号用户刷新也拿不到新前端。
+8. 多节点部署状态**以实测为准**，不要沿用旧记录（详见第 2 节的状态表）。
 
 ## 6. 下一步优先级
 
