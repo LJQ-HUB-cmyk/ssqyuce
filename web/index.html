@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>双色球智能预测分析系统</title>
-<link rel="stylesheet" href="/static/style.css?v=20261015.1">
+<link rel="stylesheet" href="/static/style.css?v=20261015.2">
 <!-- ECharts CDN + 本地 fallback -->
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"
   onerror="this.src='/static/vendor/echarts.min.js?v=20260817.7'"></script>
@@ -265,6 +265,7 @@
             <div class="subtab" data-sub="methods" onclick="setEvalSub('methods')">🧭 方法对比</div>
             <div class="subtab" data-sub="ml" onclick="setEvalSub('ml')">🤖 ML 模型</div>
             <div class="subtab" data-sub="llm" onclick="setEvalSub('llm')">🧠 LLM 通道</div>
+            <div class="subtab" data-sub="evolution" onclick="setEvalSub('evolution')">🧬 实战战绩</div>
           </div>
 
           <!-- 综合概览 -->
@@ -316,6 +317,48 @@
               <span class="hint-inline">三通道对比（stat / stat+LLM / random），后台运行约 5~30 分钟</span>
             </div>
             <div id="llmEvalArea"><div class="note">🧠 LLM 三通道评估：完成后展示对比、paired p 值与成本估算。</div></div>
+          </div>
+
+          <!-- 实战战绩 + 进化过程（V5）：按方法在真实开奖上的逐期对照 -->
+          <div id="evalSub-evolution" class="sub-panel hidden">
+
+            <!-- 进化总览（唯一首屏自动加载项：/api/evolution/status 很快） -->
+            <div class="card" id="evoStatusCard">
+              <h2>🧬 进化总览 <span class="tag" id="evoStatusTag">加载中…</span></h2>
+              <div id="evoStatusBody"></div>
+              <div id="evoValidatedBody"></div>
+            </div>
+
+            <!-- 1. 实战战绩榜 -->
+            <div class="card" id="evoBattleCard">
+              <h2>⚔️ 实战战绩榜 <span class="tag" id="evoBattleTag">未加载</span></h2>
+              <div class="eval-actions">
+                <button id="btnEvoBattle" onclick="runBattleReport(900)">▶ 加载战绩榜（近 900 期，约 20~60 秒）</button>
+                <button id="btnEvoBattleFull" onclick="runBattleReport(0)">🐢 全量回放（约 5 分钟）</button>
+                <span class="hint-inline">回放 = 各方法在**相同历史条件**下逐期出号，再与真实开奖核对互相比高低</span>
+              </div>
+              <div id="evoBattleProgress"></div>
+              <div id="evoBattleBody"><div class="note">点击上方按钮开始回放。默认只跑近 900 期小窗口；全量回放耗时约 5 分钟，需显式选择。</div></div>
+            </div>
+
+            <!-- 2. 两两对比结论 -->
+            <div class="card" id="evoCompareCard">
+              <h2>⚖️ 两两对比结论 <span class="tag" id="evoCompareTag">未加载</span></h2>
+              <div id="evoCompareBody"><div class="note">随战绩榜一起加载：每对给出 Δ红球、校正后 p 值与判定。</div></div>
+            </div>
+
+            <!-- 3. 进化操作 -->
+            <div class="card" id="evoRunCard">
+              <h2>🔁 进化操作 <span class="tag">挖掘 → 注册 → A/B 实战验证 → 裁决</span></h2>
+              <div class="eval-actions">
+                <button id="btnEvoRun" onclick="runEvolutionOnce()">🧬 跑一轮进化（可能超过 10 分钟）</button>
+                <button id="btnEvoStatusRefresh" onclick="loadEvolutionStatus(true)">⟳ 刷新进化状态</button>
+                <span class="hint-inline">含 LLM 调用，会写入 <code>data/hypotheses.json</code>，需二次确认</span>
+              </div>
+              <div id="evoRunProgress"></div>
+              <div id="evoRunBody"></div>
+            </div>
+
           </div>
         </div>
       </section>
@@ -476,6 +519,6 @@
 </div>
 
 <div id="toast"></div>
-<script src="/static/app.js?v=20261015.1"></script>
+<script src="/static/app.js?v=20261015.2"></script>
 </body>
 </html>

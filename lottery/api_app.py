@@ -1071,7 +1071,11 @@ def index():
 # ---------- 开奖日自动调度（可选，LOTT_SCHEDULER=1） ----------
 
 def _scheduler_step():
-    """开奖日（二/四/日）21:35 后：抓取 → 在线对照 → 生成下期预测。"""
+    """开奖日（二/四/日）21:35 后：抓取 → 在线对照 → **跑一轮进化** → 生成下期预测。
+
+    V5 起在生成预测之前先跑进化（``_evolution_step``），这样「找规律 → 实战验证 →
+    用已验证规律预测」是同一个调度周期内完成的，而不是靠人工手动触发。
+    """
     from . import backtest as BT, engine, evaluate
     now = __import__("datetime").datetime.now()
     if now.weekday() not in config.DRAW_WEEKDAYS:
@@ -1087,11 +1091,80 @@ def _scheduler_step():
     check_result = evaluate.online_check()
     from . import notify
     print("[scheduler] 通知结果:", notify.notify_after_check(check_result))
+
+    # V5：每期开奖后自动跑一轮进化（失败不影响预测生成）
+    try:
+        _evolution_step()
+    except Exception as e:  # noqa: BLE001
+        print("[scheduler] 进化失败（不影响预测）:", e)
+
     draws = db.load_draws()
     issue = BT.next_issue(draws[-1]["issue"])
     if not db.load_predictions(issue):
         engine.predict_next(draws, use_llm=True)
         print("[scheduler] 已生成", issue, "预测")
+
+
+def _evolution_step(limit: int = 0, use_llm: bool = True) -> dict:
+    """每期开奖后自动跑的一轮自进化：挖掘 → 注册 → A/B 实战验证 → 裁决。
+
+    为什么需要它：``evolve_once`` 只做「挖掘+注册+应用」，假说会永远停在
+    ``proposed``（实测 9 条全是 proposed），因为**没有任何环节把它们送去做 A/B 验证**。
+    本函数补上这一步——对每条 proposed 假说跑配对回放，把结果交给
+    ``hypothesis.resolve_registry`` 裁决，假说才可能晋升 ``validated``（进而影响出号）
+    或被 ``rejected``（退场）。
+
+    成本控制：
+    - ``limit`` 限制参与验证的历史期数（0=全部）；A/B 内部另有 600 期上限
+    - ``use_llm`` 控制是否调用 LLM 提炼新假说（单次 1~2 分钟）
+    - 整体失败只记录不抛出，绝不影响当期预测生成
+
+    返回本轮摘要，便于调度日志与 ``/api/evolution/status`` 观测。
+    """
+    from . import battle, evolution, hypothesis
+
+    draws = db.load_draws()
+    if not draws:
+        return {"ok": False, "reason": "本地暂无开奖数据"}
+    if limit:
+        draws = draws[-int(limit):]
+
+    summary: dict = {"ok": True}
+
+    # 1) 挖掘 + 注册新假说（LLM 或纯统计）
+    mined = hypothesis.mine_hypotheses({}, draws, use_llm=use_llm)
+    reg = hypothesis.register_hypotheses(mined.get("hypotheses") or [])
+    summary["mined"] = {"stat": mined.get("stat_count"), "llm": mined.get("llm_count"),
+                        "llm_used": mined.get("llm_used"), "llm_error": mined.get("llm_error")}
+    summary["registered"] = reg
+
+    # 2) 对**全部** proposed 假说做 A/B 实战验证 —— 这是它们唯一的晋升通道
+    hyps = evolution._as_hyp_list(hypothesis.load_registry())
+    proposed = [h for h in hyps if h.get("status") == "proposed"]
+    results = []
+    for h in proposed:
+        try:
+            results.append(evolution.verify_hypothesis_ab(
+                h, draws, n_tickets=5, start=max(300, len(draws) - 600)))
+        except Exception as e:  # noqa: BLE001
+            print(f"[evolution] 假说 {h.get('id')} 验证失败: {e}")
+    summary["verified"] = len(results)
+
+    # 3) 裁决：validated / rejected / 样本不足
+    resolution = hypothesis.resolve_registry(results) if results else {}
+    summary["resolution"] = {
+        "validated": resolution.get("validated"),
+        "rejected": resolution.get("rejected"),
+        "insufficient": len(resolution.get("insufficient") or []),
+        "unchanged": resolution.get("unchanged"),
+    }
+
+    # 4) 报告当前生效的出号策略覆盖项
+    st = evolution.evolution_status()
+    summary["by_status"] = st.get("by_status")
+    summary["active_overrides"] = st.get("active_overrides")
+    print("[evolution] 本轮完成:", summary["resolution"], "| 库:", summary["by_status"])
+    return summary
 
 
 def _scheduler_loop():
@@ -1203,32 +1276,40 @@ def evolution_run(limit: int = Query(0, ge=0, le=3490),
                   start: int = Query(300, ge=60, le=3000),
                   use_llm: int = Query(1, ge=0, le=1),
                   seed: int = Query(42)):
-    """跑一轮进化：挖掘假说 → 注册 → 应用已验证假说 → 回放验证 → 裁决。
+    """跑一轮**完整**进化：挖掘 → 注册 → A/B 实战验证 → 裁决 → 应用已验证规律。
 
-    这是「自我完善、自我进化」的触发点。耗时较长（含回放与可选 LLM 调用）。
+    这是「自我完善、自我进化」的手动触发点，与调度器每期自动跑的
+    ``_evolution_step`` 走同一条路径（避免两处逻辑漂移）。
+
+    耗时较长：默认含 LLM 提炼（1~2 分钟）+ 对每条 proposed 假说做 600 期配对 A/B 验证。
+    返回本轮摘要：挖到几条、注册几条、验证几条、裁决结果（validated/rejected/unchanged）、
+    以及当前生效的出号策略覆盖项。
     """
-    try:
-        from . import evolution
-    except ImportError as e:
-        return JSONResponse({"ok": False, "available": False,
-                             "error": "自进化模块 lottery.evolution 尚未就绪",
-                             "detail": str(e)}, status_code=503)
+    for mod in ("evolution", "hypothesis", "battle"):
+        try:
+            __import__(f"lottery.{mod}")
+        except ImportError as e:
+            return JSONResponse({"ok": False, "available": False,
+                                 "error": f"自进化模块 lottery.{mod} 尚未就绪",
+                                 "detail": str(e)}, status_code=503)
     draws = db.load_draws()
     if not draws:
         return JSONResponse({"ok": False, "available": True,
                              "error": "本地暂无开奖数据"}, status_code=400)
-    if limit:
-        draws = draws[-int(limit):]
     try:
-        result = evolution.evolve_once(draws, use_llm=bool(use_llm),
-                                       n_tickets=int(n_tickets),
-                                       start=int(start), seed=int(seed))
+        result = _evolution_step(limit=int(limit), use_llm=bool(use_llm))
     except Exception as e:  # noqa: BLE001
         return JSONResponse({"ok": False, "available": False,
-                             "error": "evolve_once() 执行失败",
+                             "error": "_evolution_step() 执行失败",
                              "detail": f"{type(e).__name__}: {e}"}, status_code=503)
     result = dict(result or {})
     result.setdefault("ok", True)
+    # 附上当前进化状态，便于前端一次拿到完整画面
+    try:
+        from . import evolution as _evo
+        result["status"] = _evo.evolution_status()
+    except Exception:  # noqa: BLE001
+        pass
     return result
 
 

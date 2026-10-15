@@ -17,3 +17,5 @@ data/llm_budget.json
 data/ml_models/
 data/methods_config.json
 
+# V5 自进化：假说库是**运行时状态**（每轮进化都会改写），不得入库
+data/hypotheses.json

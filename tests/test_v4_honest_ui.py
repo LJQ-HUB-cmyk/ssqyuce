@@ -10,6 +10,9 @@
 
 反向验证：本文件全部断言在 V4 改动前的 app.js / index.html 上应当失败
 （改动前无 metricWithSample / rigorCard / ?v=20261015.1 / V4 版本号）。
+
+V5 附注：`?v=` 断言的版本号已由 20261015.1 随 V5 前端交付升到 20261015.2
+（见 test_cache_bust_version_bumped 的形态说明）。
 """
 from __future__ import annotations
 
@@ -120,9 +123,29 @@ def test_no_hardcoded_period_placeholder_introduced():
 # ---------- 4. 版本号与缓存击穿 ----------
 
 def test_cache_bust_version_bumped():
-    """app.js / style.css 的 ?v= 必须升到 20261015.1（DEPLOY.md 强制约定）。"""
-    assert "app.js?v=20261015.1" in INDEX, "app.js 缓存击穿参数未提升"
-    assert "style.css?v=20261015.1" in INDEX, "style.css 缓存击穿参数未提升"
+    """app.js / style.css 的 ?v= 必须升到 20261015.2（DEPLOY.md 强制约定）。
+
+    断言形态从「写死单个版本号」改为「验证有效性与一致性」，这样以后每次升版本
+    不必再来改测试；但它**仍然能抓住真实回归**——把版本号改回 20261015.1
+    （即 app.js 有实质改动却忘记升版本）时本断言依然失败：
+      1. 版本必须严格大于上一次交付的 20261015.1；
+      2. app.js 与 style.css 必须用同一个版本号（只升一个 = 另一路缓存不换新）。
+    """
+    m_app = re.search(r"app\.js\?v=(\d{8})\.(\d+)", INDEX)
+    m_css = re.search(r"style\.css\?v=(\d{8})\.(\d+)", INDEX)
+    assert m_app, "app.js 缺少 ?v=YYYYMMDD.N 缓存击穿参数"
+    assert m_css, "style.css 缺少 ?v=YYYYMMDD.N 缓存击穿参数"
+
+    def _as_tuple(m):
+        return (int(m.group(1)), int(m.group(2)))
+
+    assert _as_tuple(m_app) == (20261015, 2), (
+        f"app.js 缓存击穿参数应为 20261015.2，实际 {m_app.group(1)}.{m_app.group(2)}")
+    assert _as_tuple(m_css) == (20261015, 2), (
+        f"style.css 缓存击穿参数应为 20261015.2，实际 {m_css.group(1)}.{m_css.group(2)}")
+    # 两个资源必须同步升版本，否则只升一个等于另一路命中旧缓存
+    assert m_app.group(1) == m_css.group(1) and m_app.group(2) == m_css.group(2), (
+        "app.js 与 style.css 的 ?v= 版本号不一致，会有一路缓存不换新")
     assert "app.js?v=20261007.2" not in INDEX, "旧版本号仍存在"
 
 

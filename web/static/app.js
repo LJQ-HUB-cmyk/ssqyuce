@@ -133,6 +133,9 @@ function switchTab(name) {
   }
   if (name === "patterns" && allPatterns.length) renderPatterns(allPatterns, _summary(allPatterns));
   if (name === "replay") populateReplaySelect();
+  // V5：切到「评估报告 → 实战战绩」时按需拉进化状态（快接口）；
+  // 重操作回放一律留给用户显式点击，绝不在这里自动触发。
+  if (name === "eval" && !_evoStatus) loadEvolutionStatus(false);
 }
 
 // ==================== 「更多」抽屉 ====================
@@ -1292,6 +1295,8 @@ async function renderHistory() {
 function setEvalSub(name) {
   $$(".subtab").forEach(el => el.classList.toggle("on", el.dataset.sub === name));
   $$(".sub-panel").forEach(p => p.classList.toggle("hidden", p.id !== "evalSub-" + name));
+  // V5：进入「实战战绩」子页时拉一次进化状态（快接口），重操作回放留给显式点击
+  if (name === "evolution" && !_evoStatus) loadEvolutionStatus(false);
   // 面板由隐藏变为可见时重算图表尺寸（隐藏容器内初始化的图表宽高为 0）
   requestAnimationFrame(() => Object.values(charts).forEach(c => {
     try { if (c && c.resize) c.resize(); } catch (_) {}
@@ -1861,6 +1866,439 @@ function escHtml(s) {
   return String(s || "")
     .replace(/&/g,"&amp;").replace(/</g,"&lt;")
     .replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}
+
+// ==================== V5：实战战绩 + 进化过程 ====================
+//
+// 口径（用户已明确）：准确性 = 用历史数据找规律特点 → 用于实战 → **通过实战结果对比**。
+// 本区块的唯一职责是**呈现实战对比事实**：哪个方法在多少期实战里如何、差异是否显著、
+// 找出来的规律有没有通过验证。不再重复「彩票随机」这类提醒。
+//
+// 但工程上的诚实要求照旧，且是本区块的硬约束：
+//   · 一切比率必须带样本量（走 metricWithSample / sampleEnough）
+//   · ROI 必须双口径并排：`roi` 与剔除一二等奖的 `roi_ex_top`
+//   · 同时比多个方法时，未校正 p<0.05 不可信 —— 必须显示「未校正 N → 校正 M」
+//
+// 性能：/api/battle/report 是重操作（limit=900 约 20~60 秒，limit=0 全量约 5 分钟），
+// **绝不在首屏自动触发**，只能由用户点击。首屏只拉 /api/evolution/status（很快）。
+
+let _battleReport = null;      // 最近一次战绩回放结果（供重绘/切换口径用）
+let _evoStatus = null;         // 最近一次进化状态
+let _battleBusy = false;       // 防重入：回放期间禁止再次触发
+
+/** ROI 专用格式化：pct() 对 0 与负数会退化成 "-"，ROI 必须能显示负值。 */
+function fmtRoi(v) {
+  if (v == null || isNaN(Number(v))) return "-";
+  const x = Number(v) * 100;
+  return (x >= 0 ? "+" : "") + x.toFixed(1) + "%";
+}
+
+/** 判定 → 配色类名，保证「显著更优/更差」一眼可辨。 */
+function verdictClass(v) {
+  if (v === "显著更优") return "pos";
+  if (v === "显著更差") return "neg";
+  if (v === "样本不足") return "insufficient";
+  return "flat";
+}
+
+/** 长耗时操作的统一进度反馈：按钮进入忙碌态 + 显式「预计 X 分钟」提示。 */
+function setBusy(btnId, busy, text, note) {
+  const b = $(btnId);
+  if (b) {
+    b.disabled = !!busy;
+    if (busy) b.innerHTML = "<span class='spin'>⏳</span> " + escHtml(text || "运行中…");
+    else if (text) b.innerHTML = escHtml(text);
+  }
+  const el = $(note);
+  if (el) el.innerHTML = busy ? "" : (el.innerHTML || "");
+}
+
+/** 进化总览卡：假说库状态 + **只有 validated 才影响出号** 的事实。 */
+function renderEvolutionStatus(st) {
+  const el = $("#evoStatusBody");
+  const tag = $("#evoStatusTag");
+  if (!el) return;
+  if (!st || st.available === false) {
+    // 模块未就绪：优雅降级，不得报错、不得伪装成「无规律」
+    if (tag) tag.textContent = "模块未就绪";
+    el.innerHTML = '<div class="track-note warn">⚠️ 自进化模块当前不可用' +
+      (st && st.reason ? "（" + escHtml(st.reason) + "）" : "") +
+      "。<b>此处不代表规律库为空</b>，请稍后重试或检查服务端 lottery/evolution.py 是否就绪。</div>";
+    return;
+  }
+  const by = st.by_status || {};
+  const proposed = Number(by.proposed || 0);
+  const validated = Number(by.validated || 0);
+  const rejected = Number(by.rejected || 0);
+  const total = Number(st.total || 0);
+  const ov = st.active_overrides || {};
+  const appliedN = (ov.applied || []).length;
+  const skipped = ov.skipped || [];
+  const minIssues = Number(st.min_issues || METHOD_MIN_ISSUES);
+
+  if (tag) tag.textContent = "库内 " + total + " 条 · 已验证 " + validated + " 条";
+
+  el.innerHTML =
+    '<div class="track-metrics">' +
+      '<div class="track-item"><div class="k">规律总数</div><div class="v">' + total +
+        '<span class="sub">库内全部条目</span></div></div>' +
+      '<div class="track-item"><div class="k">待验证 proposed</div><div class="v">' + proposed +
+        '<span class="sub">尚未通过实战验证</span></div></div>' +
+      '<div class="track-item"><div class="k">已验证 validated</div><div class="v ' +
+        (validated > 0 ? "pos" : "insufficient") + '">' + validated +
+        '<span class="sub">唯一会改变出号的状态</span></div></div>' +
+      '<div class="track-item"><div class="k">已否决 rejected</div><div class="v">' + rejected +
+        '<span class="sub">留档供复盘</span></div></div>' +
+      '<div class="track-item"><div class="k">实际生效覆盖项</div><div class="v">' + appliedN +
+        '<span class="sub">applied 条</span></div></div>' +
+    '</div>' +
+    // 核心事实：只有 validated 影响出号。当前若为 0，明确说「尚未找到通过验证的规律」。
+    (validated > 0
+      ? '<div class="track-note">✅ 已有 <b>' + validated + '</b> 条规律通过实战 A/B 验证，正参与出号（生效覆盖项 ' +
+        appliedN + ' 条）。</div>'
+      : '<div class="track-note warn">⚠️ <b>尚未找到通过验证的规律</b>：库内 ' + total +
+        ' 条全部处于 <code>proposed</code>（待验证），实际生效覆盖项 <b>0</b> 条 —— ' +
+        '也就是说这些规律<b>目前不影响出号</b>，必须先通过配对实战回放验证才会被采用。</div>') +
+    (skipped.length
+      ? '<div class="track-note">未生效条目（' + skipped.length + ' 条，全部因状态未达 validated）：' +
+        skipped.slice(0, 12).map(s => '<code>' + escHtml(s.id) + '</code>').join("、") +
+        (skipped.length > 12 ? " 等" : "") + '</div>'
+      : '') +
+    '<div class="track-note">裁决门槛：单条规律需在 ≥ ' + minIssues +
+      ' 期配对回放上通过多重检验校正，才可能从 proposed 晋升 validated。' +
+      '状态迁移：显著支持 → validated（影响出号）· 显著反对 → rejected（退场留档）· 样本不足 → 保持 proposed。</div>';
+
+  renderValidatedRules(st);
+}
+
+/** 已验证规律明细（latest_validated）。当前为空时如实说明。 */
+function renderValidatedRules(st) {
+  const host = $("#evoValidatedBody");
+  if (!host) return;
+  const lv = (st && st.latest_validated) || [];
+  if (!lv.length) {
+    host.innerHTML = '<div class="track-note">当前无 validated 规律明细（已验证 0 条）。</div>';
+    return;
+  }
+  host.innerHTML = '<div class="scroll"><table><thead><tr><th>规律</th><th>动作</th><th>证据</th></tr></thead><tbody>' +
+    lv.map(h => {
+      const ev = h.evidence || {};
+      const n = ev.n != null ? ev.n : (h.n_samples != null ? h.n_samples : null);
+      return '<tr><td>' + escHtml(h.statement || h.id) + '</td><td class="mono">' +
+        escHtml(typeof h.action === "object" ? JSON.stringify(h.action) : h.action) + '</td><td>' +
+        // 证据必须带样本量：这是「通过实战验证」的可核查依据
+        'n=' + (n == null ? "-" : n) + (ev.lift != null ? " · lift " + fmt(ev.lift, 4) : "") +
+        (ev.metric ? " · " + escHtml(ev.metric) : "") + '</td></tr>';
+    }).join("") + "</tbody></table></div>";
+}
+
+async function loadEvolutionStatus(manual) {
+  const tag = $("#evoStatusTag");
+  if (tag && !_evoStatus) tag.textContent = "加载中…";
+  try {
+    const st = await api("/api/evolution/status");
+    _evoStatus = st;
+    renderEvolutionStatus(st);
+    if (manual) toast("🧬 进化状态已刷新");
+  } catch (e) {
+    // 503 / 网络失败：降级提示，不炸页面
+    _evoStatus = null;
+    if (tag) tag.textContent = "加载失败";
+    const body = $("#evoStatusBody");
+    if (body) body.innerHTML = '<div class="track-note warn">无法读取进化状态（' +
+      escHtml(e.message) + '）。<b>此处不代表规律库为空</b>，请稍后重试。</div>';
+  }
+}
+
+/** 触发回放。limit=0 为全量（约 5 分钟），必须二次确认。 */
+async function runBattleReport(limit) {
+  if (_battleBusy) { toast("回放正在进行中，请等待完成"); return; }
+  const isFull = !limit;
+  const nTickets = Number(($("#cfgTickets") && $("#cfgTickets").value) || 10);
+
+  if (isFull) {
+    // 全量回放约 5 分钟：显式确认，避免用户以为页面卡死
+    const ok = window.confirm(
+      "⚠️ 全量回放将回放全部历史期数，预计耗时约 5 分钟（343~373 秒）。\n\n" +
+      "期间页面会持续显示进度，请不要关闭或刷新页面。\n\n确定开始吗？");
+    if (!ok) return;
+  }
+
+  _battleBusy = true;
+  const btn = isFull ? "#btnEvoBattleFull" : "#btnEvoBattle";
+  const other = isFull ? "#btnEvoBattle" : "#btnEvoBattleFull";
+  setBusy(btn, true, isFull ? "全量回放中…" : "回放中…");
+  const ob = $(other); if (ob) ob.disabled = true;
+
+  const prog = $("#evoBattleProgress");
+  if (prog) {
+    prog.innerHTML = '<div class="track-note warn">⏳ ' +
+      (isFull ? "全量回放进行中，预计约 5 分钟" : "小窗口回放进行中，预计 20~60 秒") +
+      '（各方法逐期出号并与真实开奖核对）。页面仍在响应，请勿刷新。</div>';
+  }
+  const body = $("#evoBattleBody");
+  if (body) body.innerHTML = '<div class="note">回放运行中…</div>';
+
+  try {
+    const url = "/api/battle/report?limit=" + (isFull ? 0 : limit) +
+      "&n_tickets=" + nTickets + "&start=300";
+    const rep = await api(url);
+    if (rep.available === false) {
+      renderBattleUnavailable(rep);
+    } else if (rep.ok === false) {
+      // 例如「样本不足：300 期 ≤ start=300」——这是有效的诚实答复，不是崩溃
+      if (body) body.innerHTML = '<div class="track-note warn">⚠️ 无法生成回放报告：' +
+        escHtml(rep.error || "未知原因") + '</div>';
+      const t2 = $("#evoBattleTag"); if (t2) t2.textContent = "报告不可用";
+    } else {
+      _battleReport = rep;
+      renderBattleReport(rep);
+    }
+  } catch (e) {
+    if (body) body.innerHTML = '<div class="track-note warn">回放失败：' + escHtml(e.message) +
+      '。<b>这不代表方法之间无差异</b>，请重试。</div>';
+    const t3 = $("#evoBattleTag"); if (t3) t3.textContent = "回放失败";
+  } finally {
+    _battleBusy = false;
+    setBusy(btn, false, isFull ? "🐢 全量回放（约 5 分钟）" : "▶ 加载战绩榜（近 900 期，约 20~60 秒）");
+    if (ob) ob.disabled = false;
+    if (prog) prog.innerHTML = "";
+  }
+}
+
+function renderBattleUnavailable(rep) {
+  const t = $("#evoBattleTag"); if (t) t.textContent = "模块未就绪";
+  const body = $("#evoBattleBody");
+  if (body) body.innerHTML = '<div class="track-note warn">⚠️ 战斗回放模块当前不可用' +
+    (rep && rep.error ? "（" + escHtml(rep.error) + "）" : "") +
+    '。<b>此处不代表方法之间无差异</b>。</div>';
+}
+
+/** 战绩榜主渲染：比率一律带样本量；ROI 双口径并排。 */
+function renderBattleReport(rep) {
+  const tag = $("#evoBattleTag");
+  const body = $("#evoBattleBody");
+  if (!body) return;
+  const rows = rep.results || [];
+  const nIssues = Number(rep.n_issues || 0);
+  const minIssues = Number(rep.min_issues || METHOD_MIN_ISSUES);
+  const enough = sampleEnough(nIssues);
+
+  if (tag) tag.textContent = "实战 " + nIssues + " 期 · " + rows.length + " 个方法";
+  if (!rows.length) {
+    body.innerHTML = '<div class="note">本次回放没有可对照的方法结果。</div>';
+    return;
+  }
+
+  // 样本不足时不得给出「最优方法」结论
+  const best = rows.reduce((a, b) => (a && a.red_hits_mean >= b.red_hits_mean) ? a : b, null);
+
+  const table =
+    '<div class="scroll"><table class="battle-table"><thead><tr>' +
+      '<th>方法</th><th>期数</th><th>红球均值</th><th>蓝球命中率</th><th>≥五等奖率</th>' +
+      '<th>奖金¥</th><th>ROI</th><th>ROI（剔一二等）</th><th>一二等奖期数</th>' +
+    '</tr></thead><tbody>' +
+    rows.map(r => {
+      const rIssues = Number(r.issues || 0);
+      const rEnough = sampleEnough(rIssues);
+      // 比率类指标一律带样本量；样本不足时不裸展示百分比
+      const cell = (val) => rEnough ? pct(val) : '<span class="insufficient-txt">样本不足</span>';
+      const topN = Number(r.n_top_prize_issues || 0);
+      const roiDiff = (Number(r.roi || 0) - Number(r.roi_ex_top || 0));
+      return '<tr>' +
+        '<td class="mono">' + escHtml(r.method) +
+          (best && r.method === best.method && enough ? ' <span class="tag">红球最高</span>' : '') + '</td>' +
+        '<td>' + rIssues + '</td>' +
+        // 红球均值也是「看起来像能力」的读数 → 走样本门槛口径
+        '<td>' + (rEnough ? fmt(r.red_hits_mean, 3) : '<span class="insufficient-txt">样本不足</span>') + '</td>' +
+        '<td>' + cell(r.blue_hit_rate) + '</td>' +
+        '<td>' + cell(r.prize_rate_ge5) + '</td>' +
+        '<td>¥' + Number(r.reward_total || 0).toFixed(0) + '</td>' +
+        '<td class="' + (Number(r.roi) >= 0 ? "pos" : "neg") + '">' + fmtRoi(r.roi) + '</td>' +
+        '<td class="' + (Number(r.roi_ex_top) >= 0 ? "pos" : "neg") + '">' + fmtRoi(r.roi_ex_top) +
+          (topN > 0 ? ' <span class="tag" title="含 ' + topN + ' 期一二等奖">↑离群</span>' : '') + '</td>' +
+        '<td>' + topN + '</td>' +
+      '</tr>';
+    }).join("") + "</tbody></table></div>";
+
+  // ROI 双口径说明：这是最容易被误读的地方，必须写清为什么两个数不一样
+  const roiNote =
+    '<div class="track-note warn bidx">📌 <b>ROI 为什么给两个口径</b>：右列 <code>roi_ex_top</code> 剔除了一、二等奖期数。' +
+    '单期命中 6 红（二等奖 ¥180,000）这类离群值会一次性把 ROI 抬到 +200% 以上，' +
+    '那是<b>单期偶然</b>而非方法稳定能力；只看左列会严重高估。两列差异越大，说明该方法的 ROI 越依赖个别离群期。' +
+    '</div>';
+
+  body.innerHTML =
+    // 样本量口径（首要）
+    '<div class="track-metrics">' +
+      '<div class="track-item"><div class="k">实战回放期数</div><div class="v">' + nIssues +
+        '<span class="sub">start=' + Number(rep.start || 0) + ' · 每期 ' + Number(rep.n_tickets || 0) + ' 注</span></div></div>' +
+      '<div class="track-item"><div class="k">方法数</div><div class="v">' + rows.length +
+        '<span class="sub">同条件逐期出号</span></div></div>' +
+      '<div class="track-item"><div class="k">裁决门槛</div><div class="v">' + minIssues +
+        '<span class="sub">期（后端 method_min_issues）</span></div></div>' +
+      '<div class="track-item"><div class="k">样本是否充分</div><div class="v ' + (enough ? "pos" : "insufficient") + '">' +
+        (enough ? "充分" : "不足") + '<span class="sub">' + (enough ? "可做显著性判决" : "不构成结论") + '</span></div></div>' +
+    '</div>' +
+    (rep.gate_zh ? '<div class="track-note">' + escHtml(rep.gate_zh) + '</div>' : '') +
+    table + roiNote +
+    (enough ? "" : '<div class="track-note warn">⚠️ ' + INSUFFICIENT_NOTE +
+      '：当前仅 ' + nIssues + ' 期回放，低于门槛 ' + minIssues + ' 期，上表比率属波动读数，<b>不能</b>据此判定方法优劣。</div>') +
+    // 不可回放方法如实标注，不假装它们参与了对比
+    ((rep.non_replayable || []).length
+      ? '<div class="track-note">未参与回放的方法（如实标注，非缺失）：' +
+        rep.non_replayable.map(x => '<b>' + escHtml(x.method) + '</b>（' + escHtml(x.reason) + '）').join("；") + '</div>'
+      : '') +
+    (rep.discipline_zh ? '<div class="track-note">回放纪律：' + escHtml(rep.discipline_zh) + '</div>' : '') +
+    (rep.note_zh ? '<div class="track-note">' + escHtml(rep.note_zh) + '</div>' : '');
+
+  renderBattleComparison(rep);
+}
+
+/** 渲染两两对比：核心是「未校正显著 N 组 → 校正后仅 M 组」。 */
+function renderBattleComparison(rep) {
+  const el = $("#evoCompareBody");
+  const tag = $("#evoCompareTag");
+  if (!el) return;
+  const c = rep.comparison || {};
+  const pairs = c.pairs || [];
+  const raw = Number(c.n_significant_uncorrected || 0);
+  const adj = Number(c.n_significant_corrected || 0);
+  const nIssues = Number(rep.n_issues || 0);
+  const enough = sampleEnough(nIssues);
+
+  if (tag) tag.textContent = pairs.length + " 组配对 · alpha=" + (c.alpha != null ? c.alpha : 0.05);
+
+  if (!pairs.length) {
+    el.innerHTML = '<div class="note">本次回放无可比较的方法配对。</div>';
+    return;
+  }
+
+  const vc = c.verdict_counts || {};
+  el.innerHTML =
+    // 本项目核心方法论：同时比多个方法时 p<0.05 不可信
+    '<div class="multi-correct-banner' + (adj === 0 ? " warn" : "") + '">' +
+      '<div class="mcb-main">未校正显著 <b>' + raw + '</b> 组 &nbsp;→&nbsp; 校正后仅 <b>' + adj + '</b> 组</div>' +
+      '<div class="mcb-sub">同时比 ' + pairs.length + ' 个方法对，每个都按 p&lt;0.05 判会天然产生假阳性（' +
+        raw + ' 组里大部分是偶然）。上表按 Bonferroni / BH(FDR) 校正后，只有 <b>' + adj +
+        '</b> 组真正站得住 —— 所以「p&lt;0.05」单独出现不能当结论。</div>' +
+    '</div>' +
+    '<div class="track-metrics">' +
+      ['显著更优', '显著更差', '无显著差异', '样本不足'].map(k =>
+        '<div class="track-item"><div class="k">' + k + '</div><div class="v ' + verdictClass(k) + '">' +
+        Number(vc[k] || 0) + '<span class="sub">' + pairs.length + ' 组中</span></div></div>').join("") +
+    '</div>' +
+    '<div class="scroll"><table class="battle-table"><thead><tr>' +
+      '<th>对比</th><th>期数</th><th>Δ红球</th><th>Δ蓝球率</th><th>未校正 p</th><th>校正后 p</th><th>判定</th>' +
+    '</tr></thead><tbody>' +
+    pairs.map(p => {
+      const pEnough = sampleEnough(Number(p.n_issues || 0));
+      return '<tr>' +
+        '<td class="mono">' + escHtml(p.method) + ' <span class="vs">vs</span> ' + escHtml(p.vs) + '</td>' +
+        '<td>' + Number(p.n_issues || 0) + '</td>' +
+        '<td class="' + (Number(p.delta_red_hits) >= 0 ? "pos" : "neg") + '">' +
+          (Number(p.delta_red_hits) >= 0 ? "+" : "") + fmt(p.delta_red_hits, 4) + '</td>' +
+        '<td>' + (p.delta_blue_rate == null ? "-" :
+          ((Number(p.delta_blue_rate) >= 0 ? "+" : "") + fmt(p.delta_blue_rate, 4))) + '</td>' +
+        '<td>' + (p.p_uncorrected == null ? "-" : fmt(p.p_uncorrected, 4)) + '</td>' +
+        '<td>' + (p.p_adjusted == null ? "-" : fmt(p.p_adjusted, 4)) + '</td>' +
+        '<td class="' + verdictClass(p.verdict) + '">' + escHtml(p.verdict || "-") +
+          (pEnough ? "" : ' <span class="tag">样本不足</span>') + '</td>' +
+      '</tr>';
+    }).join("") + "</tbody></table></div>" +
+    (c.note_zh ? '<div class="track-note">检验方法：' + escHtml(c.note_zh) + '</div>' : '') +
+    (c.summary_zh ? '<div class="track-note">' + escHtml(c.summary_zh) + '</div>' : '') +
+    (enough ? "" : '<div class="track-note warn">⚠️ ' + INSUFFICIENT_NOTE + '。</div>');
+}
+
+/** 跑一轮进化：含 LLM 调用（1~2 分钟）+ 每条 proposed 假说最多 600 期配对回放，
+ *  实测可能超过 10 分钟，且会写 hypotheses.json —— 必须二次确认。 */
+async function runEvolutionOnce() {
+  const ok = window.confirm(
+    "⚠️ 跑一轮进化将：\n" +
+    "  1) 挖掘新规律（调用 LLM，约 1~2 分钟）\n" +
+    "  2) 写入服务器 data/hypotheses.json\n" +
+    "  3) 对全部 proposed 规律各做最多 600 期 A/B 配对回放，再裁决\n\n" +
+    "⚠️ 后两步随规律条数累加，整体<b>可能超过 10 分钟</b>。\n" +
+    "期间页面会持续显示进度，请勿刷新。确定开始吗？");
+  if (!ok) return;
+
+  const prog = $("#evoRunProgress");
+  const out = $("#evoRunBody");
+  setBusy("#btnEvoRun", true, "进化运行中…");
+  const refresh = $("#btnEvoStatusRefresh"); if (refresh) refresh.disabled = true;
+  if (prog) {
+    prog.innerHTML = '<div class="track-note warn">⏳ 进化运行中（挖掘 → 注册 → A/B 验证 → 裁决），' +
+      '整体<b>可能超过 10 分钟</b>。含 LLM 调用与逐条假说回放，请耐心等待，页面未卡死。</div>';
+  }
+  if (out) out.innerHTML = "";
+
+  try {
+    const limit = 900;
+    const nTickets = Number(($("#cfgTickets") && $("#cfgTickets").value) || 10);
+    const r = await api("/api/evolution/run?limit=" + limit + "&n_tickets=" + nTickets +
+      "&start=300&use_llm=1", { method: "POST" });
+    if (r.available === false || r.ok === false) {
+      if (out) out.innerHTML = '<div class="track-note warn">⚠️ 进化未能完成：' +
+        escHtml(r.error || r.reason || "未知原因") + '</div>';
+    } else {
+      renderEvolutionRun(r);
+    }
+    // 本轮已返回最新 status，直接消费；失败或缺失时再回退单独请求
+    if (r.status && r.status.available !== false) {
+      _evoStatus = r.status;
+      renderEvolutionStatus(r.status);
+    } else {
+      await loadEvolutionStatus(false);
+    }
+  } catch (e) {
+    if (out) out.innerHTML = '<div class="track-note warn">进化执行失败：' + escHtml(e.message) +
+      '。<b>这不代表没有规律进入验证流程</b>；失败只记录不抛出，请重试。</div>';
+  } finally {
+    setBusy("#btnEvoRun", false, "🧬 跑一轮进化（可能超过 10 分钟）");
+    if (refresh) refresh.disabled = false;
+    if (prog) prog.innerHTML = "";
+  }
+}
+
+/** 本轮进化结果：挖到几条 / 注册几条 / 裁决结果。 */
+function renderEvolutionRun(r) {
+  const el = $("#evoRunBody");
+  if (!el) return;
+  const mined = r.mined || {};
+  const reg = r.registered || {};
+  const res = r.resolution || {};
+  const validated = (res.validated || []).length;
+  const rejected = (res.rejected || []).length;
+  const insufficient = Number(res.insufficient || 0);
+  const unchanged = Number(res.unchanged || 0);
+  const by = r.by_status || {};
+
+  el.innerHTML =
+    '<div class="track-metrics">' +
+      '<div class="track-item"><div class="k">本轮挖到</div><div class="v">' +
+        (Number(mined.stat || 0) + Number(mined.llm || 0)) +
+        '<span class="sub">统计 ' + Number(mined.stat || 0) + " · LLM " + Number(mined.llm || 0) + '</span></div></div>' +
+      '<div class="track-item"><div class="k">新注册</div><div class="v">' + Number(reg.registered || 0) +
+        '<span class="sub">去重命中 ' + Number(reg.deduped || 0) + '</span></div></div>' +
+      '<div class="track-item"><div class="k">参与 A/B 验证</div><div class="v">' + Number(r.verified || 0) +
+        '<span class="sub">proposed 条目</span></div></div>' +
+      '<div class="track-item"><div class="k">晋升 validated</div><div class="v ' + (validated > 0 ? "pos" : "insufficient") + '">' +
+        validated + '<span class="sub">将影响出号</span></div></div>' +
+      '<div class="track-item"><div class="k">否决 rejected</div><div class="v">' + rejected +
+        '<span class="sub">退场留档</span></div></div>' +
+      '<div class="track-item"><div class="k">样本不足 / 未变</div><div class="v">' +
+        insufficient + " / " + unchanged + '<span class="sub">保持 proposed</span></div></div>' +
+    '</div>' +
+    (mined.llm_used === false && mined.llm_error
+      ? '<div class="track-note warn">本轮 LLM 未参与（' + escHtml(mined.llm_error) + '），仅用统计挖掘。</div>'
+      : '') +
+    (validated > 0
+      ? '<div class="track-note">✅ 本轮有 <b>' + validated + '</b> 条规律通过验证，已开始影响出号。</div>'
+      : '<div class="track-note warn">本轮<b>无规律通过验证</b>（晋升 0 条）：库内仍全部为 proposed，' +
+        '即<b>尚未找到通过验证的规律</b>，出号策略未被本轮改变。这是实战裁决的正常结果，不是失败。</div>') +
+    '<div class="track-note">本轮结束后库内状态：' +
+      Object.keys(by).map(k => escHtml(k) + " " + Number(by[k] || 0)).join(" · ") + '</div>';
 }
 
 // ==================== 加载 ====================
