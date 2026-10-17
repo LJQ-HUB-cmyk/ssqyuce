@@ -1,5 +1,9 @@
 .venv/
 data/*.db
+
+# V10-00d 迁移前自动备份（含生产数据，绝不入库）
+data/*.pre-migrate-*
+data/*.db.tmp
 data/raw/
 __pycache__/
 *.pyc

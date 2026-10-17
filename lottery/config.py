@@ -385,6 +385,21 @@ ML_N_ESTIMATORS = int(os.environ.get("LOTT_ML_N_ESTIMATORS", "60")) # 树数量�
 ML_MAX_DEPTH = int(os.environ.get("LOTT_ML_MAX_DEPTH", "5"))        # 树深度
 ML_CAL_CV = int(os.environ.get("LOTT_ML_CAL_CV", "2"))              # 概率校准折叠数（小=快）
 
+# ML 模型「特征/结构」版本号（V10-08 / R1 P2-5）。
+#
+# 为什么需要它：`ml_model._cache_key` 过去只是 `"{期数}:{末期号}"`，不含任何
+# 特征定义版本。于是**改特征工程后 key 不变** → `data/ml_models/<key>.joblib`
+# （单个 55MB）被静默复用，跑出来的模型与代码不一致，表现为「改了没生效」。
+#
+# 约定（硬规则）：任何会改变模型输入/输出语义的改动，**必须递增这个常量**：
+#   * 改 `_FEATURE_NAMES` / `_BLUE_FEATURE_NAMES` 的维数或含义；
+#   * 改 `_compute_features` / `_compute_blue_features` 的计算口径；
+#   * 改集成结构、校准方式、标签定义（y 的构造）。
+# 递增后旧 joblib 自动失效（key 变了），旧文件可安全删除（见
+# `ml_model.prune_model_cache`）。仅调整超参（树数/深度/CV 折数）无需递增，
+# 但若要让改动立刻生效也应递增，否则会继续命中旧缓存。
+MODEL_SCHEMA_VERSION = "2"        # v2：V10-08 首版带版本号的缓存键（此前无版本，v1 仅指历史）
+
 # 调度（开奖日：周二/四/日 21:35 后自动 抓取+评估+预测）
 SCHEDULER_ENABLED = os.environ.get("LOTT_SCHEDULER", "0") == "1"
 DRAW_WEEKDAYS = (1, 3, 6)  # 周一=0 … 周日=6 -> 周二/四/日
