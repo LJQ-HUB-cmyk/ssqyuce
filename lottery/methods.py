@@ -334,3 +334,169 @@ def _blue_running_rate(limit: int = 30) -> Optional[float]:
     if not blues:
         return None
     return sum(blues) / len(blues)
+
+
+# ==========================================================================
+# V10-00a 契约冻结：resolve_channels() —— 本期出号通道的**唯一**判据
+#
+# 为什么需要它（docs/reviews/R1_ARCHITECTURE_REVIEW.md P0-1）：
+#   项目已有 6 层开关（LOTT_METHODS / LOTT_METHOD_MODE / LOTT_LLM_ONLY_OUTPUT /
+#   LOTT_LLM_DISABLED / methods_config.json / .env），v1.0 方案还想加第 7 套
+#   LOTT_PREDICT_CHANNELS —— 必然造成设置漂移。本函数把它们收敛为一个返回体。
+#
+# 优先级链（硬性）：
+#   1) data/methods_config.json （设置页写入，import 期由 config 加载）
+#   2) .env: LOTT_METHODS / LOTT_METHOD_MODE / LOTT_LLM_ONLY_OUTPUT
+#   3) 代码默认: "stat,ml,uniform"，llm_output_mode="off"
+#
+# 【关键实现纪律 —— S2 二次评审 B3】
+#   config.py 会把 methods_config.json 的生效值**写回 os.environ**
+#   （见 config._apply_runtime_methods / _load_runtime_methods_config），
+#   因此 `os.environ.get("LOTT_METHODS")` 永久**无法区分**"来自 json"和"来自 .env"。
+#   判定来源必须用"查文件是否存在" + "`in os.environ`"（键是否被设置过），
+#   **不得**用 .get(...) is not None。
+# ==========================================================================
+
+DEFAULT_SPEC_RAW = "stat,ml,uniform"     # 代码默认：不带 llm / blend
+DEFAULT_MODE = "production"
+DEFAULT_LLM_OUTPUT_MODE = "off"
+
+# LLM 出号模式合法取值
+LLM_OUTPUT_MODES = ("off", "only", "mix")
+
+
+def _methods_config_file():
+    """延迟导入，避免 methods <-> config 的循环 import。"""
+    from . import config
+    return config.METHODS_CONFIG_FILE
+
+
+def _read_methods_config() -> Dict:
+    """读取 methods_config.json；不存在/损坏返回 {}。"""
+    import json
+    path = _methods_config_file()
+    try:
+        if not path.exists():
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (ValueError, OSError):
+        return {}
+
+
+def resolve_layer() -> str:
+    """判定生效开关来自哪一层：``methods_config.json`` / ``.env`` / ``default``。
+
+    顺序（不得调换）：
+      1. 文件存在且含 raw/mode → 文件层（它覆盖一切）
+      2. 否则 ``"LOTT_METHODS" in os.environ`` 或 ``"LOTT_METHOD_MODE" in os.environ``
+         → .env 层（用 ``in`` 而不是 ``.get``，见上方纪律说明）
+      3. 否则 default
+    """
+    conf = _read_methods_config()
+    if conf.get("raw") or conf.get("mode") or conf.get("llm_output_mode"):
+        return "methods_config.json"
+    if ENV_NAME in os.environ or MODE_ENV_NAME in os.environ or "LOTT_LLM_ONLY_OUTPUT" in os.environ:
+        return ".env"
+    return "default"
+
+
+def _resolve_llm_output_mode(conf: Dict, fam_llm: bool) -> str:
+    """解析 LLM 出号模式，并处理与族开关的冲突。
+
+    冲突规则：拒绝列表优先 —— 若 LLM 族被关闭，则出号模式强制 off（幂等、只 warning）。
+    """
+    raw_mode = conf.get("llm_output_mode")
+    if not raw_mode:
+        # 兼容旧开关 LOTT_LLM_ONLY_OUTPUT（1→only / 0→off）；代码默认已改为 0
+        legacy = os.environ.get("LOTT_LLM_ONLY_OUTPUT")
+        if legacy is None:
+            raw_mode = DEFAULT_LLM_OUTPUT_MODE
+        else:
+            raw_mode = "only" if str(legacy).strip() == "1" else "off"
+    mode = str(raw_mode).strip().lower()
+    if mode not in LLM_OUTPUT_MODES:
+        mode = DEFAULT_LLM_OUTPUT_MODE
+    if not fam_llm and mode != "off":
+        _warn_once("llm_output_mode 被族开关覆盖为 off（拒绝列表优先）")
+        return "off"
+    return mode
+
+
+_WARNED: Set[str] = set()
+
+
+def _warn_once(msg: str) -> None:
+    """幂等告警（同一消息只打一次，避免热路径刷屏）。"""
+    if msg in _WARNED:
+        return
+    _WARNED.add(msg)
+    print(f"[methods] {msg}")
+
+
+def resolve_channels(*, force_production: bool = False) -> Dict:
+    """本期出号通道的**唯一**判据（V10-00a 契约冻结，返回 schema 只增不改）。
+
+    返回字段：
+      spec_raw        生效的原始开关串
+      source          命中哪一层：methods_config.json / .env / default
+      mode            production / research
+      families        各族是否启用 {stat, blend, llm, ml, uniform}
+      llm_output_mode off / only / mix
+      llm_can_pick    families["llm"] 且 llm_output_mode != "off" 且 mode == production
+      research_arm    研究对照臂 {stat: bool, llm_probe: bool}
+      fingerprint     sha1(canonical_json(上面除 fingerprint 外全部字段))[:16]
+
+    force_production=True 供回放/测试绕过 research 模式。
+    """
+    import hashlib
+    import json
+
+    conf = _read_methods_config()
+    source = resolve_layer()
+
+    # 生效 raw / mode：文件层优先，其次 env，最后代码默认
+    if conf.get("raw") is not None:
+        spec_raw = str(conf.get("raw") or "").strip()
+    else:
+        spec_raw = (os.environ.get(ENV_NAME) or "").strip()
+        # V10：代码默认从"全部启用(空=all)"改为 allow-list ``stat,ml,uniform``
+        # —— "把最没用的通道(llm)设成主力"的根因修复。空串在旧语义里=全部启用，
+        #    这里必须显式落到 DEFAULT_SPEC_RAW，否则 llm/blend 仍会被启用。
+        if not spec_raw:
+            spec_raw = DEFAULT_SPEC_RAW
+
+    if conf.get("mode") is not None:
+        mode = normalize_mode(conf.get("mode"))
+    else:
+        mode = normalize_mode(os.environ.get(MODE_ENV_NAME))
+    if force_production:
+        mode = "production"
+
+    spec = implement_spec(spec_raw)
+
+    # research 模式：全部方法启用（保持现状语义）
+    effective = effective_spec(mode, spec)
+    families = {fam: bool(is_enabled(fam, effective)) for fam in FAMILIES}
+
+    llm_output_mode = _resolve_llm_output_mode(conf, families["llm"])
+    llm_can_pick = bool(
+        families["llm"] and llm_output_mode != "off" and mode == "production"
+    )
+    research_arm = {
+        "stat": bool(families["stat"]),
+        "llm_probe": bool(families["llm"] and mode == "research"),
+    }
+
+    body = {
+        "spec_raw": spec_raw,
+        "source": source,
+        "mode": mode,
+        "families": families,
+        "llm_output_mode": llm_output_mode,
+        "llm_can_pick": llm_can_pick,
+        "research_arm": research_arm,
+    }
+    canon = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    body["fingerprint"] = hashlib.sha1(canon.encode("utf-8")).hexdigest()[:16]
+    return body

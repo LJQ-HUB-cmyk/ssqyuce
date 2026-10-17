@@ -440,13 +440,18 @@ def test_predict_next_reports_honest_coverage_metadata():
 
 
 def test_predict_next_coverage_mode_uses_ev_objective():
-    """coverage 模式：默认走 expected_value 目标，并把目标写进结果元数据。"""
+    """coverage 模式：默认走"EV 守恒"目标，并把目标写进结果元数据。
+
+    V10-00a：目标值由 ``expected_value`` 更名为 ``ev_conserving``（语义更准确：
+    该目标下 EV 是恒等的，真正被优化的是冗余度/覆盖结构）。
+    旧值 ``expected_value`` 仍通过 ``config.COVERAGE_OBJECTIVE_ALIASES`` 别名可用。
+    """
     from lottery import engine as E
     draws = _mk_draws(500)
     res = E.predict_next(draws, use_llm=False, use_ml=False, n_tickets=8,
                          persist=False, rng=random.Random(9), coverage=True)
     assert res["coverage_mode"] is True
-    assert res["coverage_objective"] == "expected_value"
+    assert res["coverage_objective"] == "ev_conserving"
     assert res["actual_tickets"] == 8
     assert res["blue_covered"] >= 4
 

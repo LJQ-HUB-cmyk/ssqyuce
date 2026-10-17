@@ -75,10 +75,13 @@ except (json.JSONDecodeError, TypeError):
 LLM_SAMPLES = int(os.environ.get("LOTT_LLM_SAMPLES", "3"))          # LLM 多轮采样次数（并发）
 TICKETS_PER_LLM_CALL = int(os.environ.get("LOTT_TICKETS_PER_CALL", "5"))
 N_TICKETS = int(os.environ.get("LOTT_N_TICKETS", "10"))             # 最终输出注数
-# LLM_ONLY_OUTPUT（默认 1）：LLM 通道产出候选时，最终注数以 LLM **实际返回**的注数
-# 为准，不再用统计/ML 候选补齐到 N_TICKETS。避免“宣称 10 注、实际仅 4 注来自
-# LLM”的口径不一致。设 0 恢复旧的“候选池混选 + 补齐到 N_TICKETS”行为。
-LLM_ONLY_OUTPUT = os.environ.get("LOTT_LLM_ONLY_OUTPUT", "1") == "1"
+# LLM_ONLY_OUTPUT（V10 起默认 **0**；历史上默认 1）
+#   =1（only）：LLM 通道产出候选时，最终注数以 LLM 实际返回的注数为准，不用统计/ML 补齐。
+#   =0（off，**当前默认**）：LLM 只提供候选，最终出号仍由确定性排序 + 蓝球覆盖计划决定。
+# V10 改默认值的理由（docs/reviews/V10_REVIEW_SUMMARY.md G1 + R3）：双色球为独立随机
+# 事件，LLM 无可利用信息；把它设为默认出号主力会让"最没用的通道"决定结果
+# （最近 4 期真实开奖 20 注、蓝球 0/20）。保留本开关作为紧急回退。
+LLM_ONLY_OUTPUT = os.environ.get("LOTT_LLM_ONLY_OUTPUT", "0") == "1"
 LLM_TIMEOUT = float(os.environ.get("LOTT_LLM_TIMEOUT", "60"))
 # 大输出预算（推理型模型）单次调用的宽松超时：预算抬到上限后单次要跑 40~120s，
 # 仍用 60s 会先被判读取超时而白白重试一次。
@@ -159,6 +162,26 @@ METHODS_SPEC = _methods.implement_spec(METHODS_RAW)                   # 解析�
 # 运行时方法配置持久化（Web 设置页写入，优先于 .env，重启不丢失）
 METHODS_CONFIG_FILE = DATA_DIR / "methods_config.json"
 
+# ---------- V10-00a：开关来源标记 + 通道冻结快照 ----------
+# METHODS_SOURCE：生效的方法开关来自哪一层（"methods_config.json" / ".env" / "default"）。
+# **必须在 import 期一次性定值**，不得在 resolve_channels() 里现算后回写
+# —— config 自己会把 json 的生效值写回 os.environ，任何"现算+回写"都会重演来源污染。
+# 判定逻辑见 methods.resolve_layer()（查文件优先 + `in os.environ`，不用 .get）。
+METHODS_SOURCE = _methods.resolve_layer()
+
+# CHANNELS：本期通道的冻结快照（resolve_channels 的只读缓存）。
+# 用途：让 engine/battle/evaluate/api 只读一处，而不是各自去读环境变量（第 7 套开关的根源）。
+# 注意：这是 import 期快照；设置页改开关后必须调 refresh_channels() 刷新。
+CHANNELS = _methods.resolve_channels()
+
+
+def refresh_channels() -> Dict:
+    """重新解析并刷新 CHANNELS 快照（设置页保存开关后调用）。"""
+    global CHANNELS, METHODS_SOURCE
+    METHODS_SOURCE = _methods.resolve_layer()
+    CHANNELS = _methods.resolve_channels()
+    return CHANNELS
+
 # ---------- U2 蓝球专项 ----------
 # LOTT_BLUE_MODE：model（默认，用 blue_specialist 等模型）/ uniform（整期回退 16 个均匀随机）
 BLUE_MODE = (os.environ.get("LOTT_BLUE_MODE") or "model").strip().lower()
@@ -207,9 +230,23 @@ COVERAGE_BLUE_K = int(os.environ.get("LOTT_COVERAGE_BLUE_K", "4"))
 # V4-C 覆盖优化目标函数：
 #   expected_value（默认）= 奖金期望 + 蓝球覆盖奖金（真实可优化的口径）
 #   coverage              = 旧口径（红球并集大小 + 蓝球覆盖数），向后兼容
-COVERAGE_OBJECTIVE = (os.environ.get("LOTT_COVERAGE_OBJECTIVE") or "expected_value").strip().lower()
-if COVERAGE_OBJECTIVE not in ("coverage", "expected_value"):
-    COVERAGE_OBJECTIVE = "expected_value"
+#
+# V10-00a 别名表：值域变更时旧值必须**继续可用**（不得报错）。
+#   expected_value → ev_conserving   （V10 新名：诚实口径——EV 守恒，只比冗余度，
+#                                     对应 docs V10 §3.4 的可插拔目标）
+#   ev_conserving  → ev_conserving
+#   coverage       → coverage
+#   pmax_high / custom_weight 直通（V10 新增目标，见 docs/V10 §3.4）
+COVERAGE_OBJECTIVE_ALIASES = {
+    "expected_value": "ev_conserving",
+    "ev": "ev_conserving",
+    "ev_conserving": "ev_conserving",
+    "coverage": "coverage",
+    "pmax_high": "pmax_high",
+    "custom_weight": "custom_weight",
+}
+_raw_objective = (os.environ.get("LOTT_COVERAGE_OBJECTIVE") or "expected_value").strip().lower()
+COVERAGE_OBJECTIVE = COVERAGE_OBJECTIVE_ALIASES.get(_raw_objective, "ev_conserving")
 
 
 def methods_status() -> Dict:
