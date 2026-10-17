@@ -76,7 +76,7 @@ def _fmt_list(values: Sequence[Any], limit: int = 12) -> List[Any]:
 
 def _era_series(draws: Sequence[Dict]) -> Dict[str, Any]:
     """号码/结构特征的分年序列——这是 LLM 判断「阶段」最直接的原料。"""
-    eras = regime.build_eras(draws)
+    eras = regime.eras_for(draws, mode="calendar")  # LLM 上下文用自然年，便于人读
     years: Dict[str, Dict[str, Any]] = {}
     for e in eras:
         chunk = draws[e["start"]:e["end"]]
@@ -216,7 +216,7 @@ def build_user_prompt(ctx: Dict[str, Any], round_no: int = 1,
 # --------------------------------------------------------------------------
 
 def ask_llm(ctx: Dict[str, Any], rounds: int = 3,
-            max_tokens: int = 2400) -> Dict[str, Any]:
+            max_tokens: int = 2400, progress=None) -> Dict[str, Any]:
     """三轮 LLM 规律探讨。返回 ``{claims, reviews, overall, next_dimensions,
     llm_used, error, per_round}``；通道不可用时整体降级为 ``llm_used=False``。"""
     out: Dict[str, Any] = {"claims": [], "reviews": [], "overall": None,
@@ -244,6 +244,8 @@ def ask_llm(ctx: Dict[str, Any], rounds: int = 3,
     out["overall"] = res1.get("overall")
     reviews: List[Dict] = []
     if rounds >= 2 and claims:
+        if progress:
+            progress(0.4, f"第 2 轮：自我质疑（对 {len(claims)} 条候选逐条审查）…")
         try:
             res2 = llm_client.chat_json(
                 SYSTEM_PROMPT, build_user_prompt(ctx, 2, claims), max_tokens=max_tokens,
@@ -260,6 +262,8 @@ def ask_llm(ctx: Dict[str, Any], rounds: int = 3,
                        if str(r.get("verdict", "")).lower().startswith("drop")}
             kept_claims = [c for c in claims if str(c.get("title")) not in dropped]
             if rounds >= 3:
+                if progress:
+                    progress(0.65, "第 3 轮：据审查结论修订…")
                 try:
                     res3 = llm_client.chat_json(
                         SYSTEM_PROMPT, build_user_prompt(ctx, 3, reviews),
@@ -476,7 +480,7 @@ def persist_run(result: Dict, path=None) -> Dict:
 
 
 def run_closed_loop(draws: Sequence[Dict], rounds: int = 3, use_llm: bool = True,
-                    persist: bool = True) -> Dict:
+                    persist: bool = True, progress=None) -> Dict:
     """**AI 规律闭环**：挖掘 → 验证 → 注册 → 更新规律快照 → 可用于出号。
 
     这是用户第 4 条诉求（"要用 AI 来挖掘规律、验证规律、使用规律"）的单一入口，
@@ -498,13 +502,29 @@ def run_closed_loop(draws: Sequence[Dict], rounds: int = 3, use_llm: bool = True
     steps: List[Dict] = []
     errors: List[str] = []
 
-    lab = run_lab(draws, rounds=rounds, use_llm=use_llm, persist=persist)
+    def _p(frac: float, msg: str) -> None:
+        """进度回调（Web 端转成后台任务的 progress/message，前端可见）。
+
+        这一步是用户反馈「点击后 15 分钟没有任何反应」的直接修复：整个闭环
+        1~8 分钟、其中 LLM 三轮占绝大部分时间，没有进度就只能靠猜。
+        """
+        if progress is None:
+            return
+        try:
+            progress(min(max(float(frac), 0.0), 0.99), msg)
+        except Exception:  # noqa: BLE001
+            pass
+
+    _p(0.05, "① 维度扫描（91 组 as-of 回放，约 5~10 秒）…")
+    lab = run_lab(draws, rounds=rounds, use_llm=use_llm, persist=persist,
+                  progress=lambda f, m: _p(0.05 + 0.55 * f, m))
     steps.append({"step": "mine_and_verify", "llm_used": lab.get("llm_used"),
                   "n_claims": len(lab.get("claims") or []),
                   "summary": lab.get("summary"), "error": lab.get("error")})
     if lab.get("error") and not lab.get("llm_used"):
         errors.append(f"LLM 环节降级：{lab.get('error')}（维度扫描结果仍然有效）")
 
+    _p(0.62, "③ 注册可验证规律进假说库…")
     reg = {}
     try:
         reg = evolution.register_llm_lab_claims(draws)
@@ -514,6 +534,7 @@ def run_closed_loop(draws: Sequence[Dict], rounds: int = 3, use_llm: bool = True
     except Exception as e:  # noqa: BLE001
         errors.append(f"注册失败：{type(e).__name__}: {e}")
 
+    _p(0.70, "④ 重算每条规律的阶段时效…")
     ann = {}
     try:
         ann = evolution.annotate_hypotheses(draws)
@@ -522,6 +543,7 @@ def run_closed_loop(draws: Sequence[Dict], rounds: int = 3, use_llm: bool = True
     except Exception as e:  # noqa: BLE001
         errors.append(f"阶段标注失败：{type(e).__name__}: {e}")
 
+    _p(0.85, "⑤ 重建规律快照（供本期出号使用）…")
     snap = {}
     try:
         snap = patterns_runtime.refresh(draws)
@@ -529,6 +551,7 @@ def run_closed_loop(draws: Sequence[Dict], rounds: int = 3, use_llm: bool = True
     except Exception as e:  # noqa: BLE001
         errors.append(f"规律快照刷新失败：{type(e).__name__}: {e}")
 
+    _p(1.0, "闭环完成")
     return {
         "ok": True,
         "closed_loop": True,
@@ -560,13 +583,16 @@ def summarize_verdicts(claims: Sequence[Dict]) -> Dict:
 
 
 def run_lab(draws: Sequence[Dict], rounds: int = 3, use_llm: bool = True,
-            persist: bool = True, scan: Optional[Dict] = None) -> Dict:
+            persist: bool = True, scan: Optional[Dict] = None,
+            progress=None) -> Dict:
     """完整跑一次规律工坊：上下文 →（多轮）LLM → 逐条落地验证 → 落盘。
 
     ``use_llm=False`` 时只做「维度扫描 + 阶段画像」，用于无 LLM 环境下的自检。
     """
     draws = list(draws or [])
     t0 = time.time()
+    if progress:
+        progress(0.0, "维度扫描中…")
     if scan is None:
         scan = discovery.discover(draws, top=12)
     result: Dict[str, Any] = {
@@ -582,11 +608,15 @@ def run_lab(draws: Sequence[Dict], rounds: int = 3, use_llm: bool = True,
     }
     if use_llm:
         ctx = build_lab_context(draws, scan)
-        llm = ask_llm(ctx, rounds=rounds)
+        if progress:
+            progress(0.1, "第 1 轮：让大模型提规律…")
+        llm = ask_llm(ctx, rounds=rounds, progress=progress)
         result.update({"error": llm.get("error"), "reviews": llm.get("reviews") or [],
                        "overall": llm.get("overall"),
                        "next_dimensions": llm.get("next_dimensions") or [],
                        "per_round": llm.get("per_round") or []})
+        if progress:
+            progress(0.9, "逐条落地验证（as-of 回放 + 阶段画像）…")
         evaluated = evaluate_claims(llm.get("claims") or [], draws)
         result["claims"] = _merge_claims(llm.get("claims") or [], evaluated)
         result["llm_used"] = bool(llm.get("llm_used"))

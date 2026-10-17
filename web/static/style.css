@@ -579,3 +579,14 @@ footer { color: var(--muted); font-size: 12px; text-align: center; margin-top: 2
 .rule-tier.rejected { color: var(--red); border-color: var(--red); }
 .rule-shadow { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px;
   background: var(--bg2); font-size: 12px; line-height: 1.75; margin-top: 6px; }
+
+/* V8：诊断号码统一格式回显 */
+.diag-ticket { display: inline-flex; align-items: center; gap: 10px; font-family: var(--mono, ui-monospace, monospace);
+  font-size: 15px; font-weight: 700; letter-spacing: .5px; background: var(--bg2);
+  border: 1px solid var(--border); border-radius: 10px; padding: 8px 12px; margin-bottom: 8px; }
+.diag-copy { font-size: 11px; padding: 2px 8px; }
+/* V8：阶段切换（按自然年 9 段 / 按固定期数自适应） */
+.era-switch { display: inline-flex; gap: 6px; margin-left: 8px; }
+.era-switch button { font-size: 11px; padding: 2px 8px; }
+.era-switch button.on { background: var(--gold); color: #1a1408; border-color: var(--gold); font-weight: 700; }
+.rg-table th { max-width: 78px; }

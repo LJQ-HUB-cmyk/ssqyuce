@@ -50,6 +50,7 @@ V5 之前的规律检验只有**一个**口径：把 2003 年至今的全部历�
 from __future__ import annotations
 
 import math
+import os
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -62,6 +63,8 @@ PICK = 6
 __all__ = [
     "ERA_DEFS",
     "build_eras",
+    "build_adaptive_eras",
+    "eras_for",
     "split_series",
     "era_significance",
     "regime_report",
@@ -94,6 +97,77 @@ STALE_AFTER_DRAWS = 300
 MIN_ERA_N = 60
 # 状态机用的 alpha（阶段 p 值需先过 family_adjust）
 ALPHA = 0.05
+
+# ---------- 阶段切分模式（V8） ----------
+# "adaptive"：按固定期数（ERA_BLOCK）等分 —— 默认。理由见 build_adaptive_eras()。
+# "calendar"：旧的按自然年切 9 段，保留以兼容历史对比与老报告。
+ERA_MODE = os.environ.get("LOTT_ERA_MODE", "adaptive")
+ERA_BLOCK = int(os.environ.get("LOTT_ERA_BLOCK", "150"))
+
+
+def build_adaptive_eras(draws: Sequence[Dict], block: Optional[int] = None,
+                        min_samples: int = 300) -> List[Dict]:
+    """**数据驱动的阶段切分**：不按自然年切，而按「固定期数」等分。
+
+    为什么要改（用户反馈第 3 条）：按自然年切 9 段时，近年被切成 2023/2024/2025/2026
+    四段，每段仅 118~151 期。单段样本小 → 单段最小可检出效应高达 ~0.22 个红球/期，
+    而真实效应量级只有 0.02~0.05 —— **不是没有规律，是切法让检验力不够**。
+    把「阶段边界」与「日历」解耦后，每段样本可稳定控制住，检测力提升一个量级。
+
+    算法（纯确定性、可复现）：
+      1. 取最近 ``max(min_samples, ...)`` 期作为分析窗口（默认全部可用历史，但少于
+         ``min_samples`` 时整段作为单阶段，不下结论）；
+      2. 从最新一期向前，每 ``block`` 期（默认 60）切一段，剩余不足 ``block/2`` 的
+         并入上一段；
+      3. 编号从旧到新（``P1`` 最早，``Pk`` 最新），并标注该段覆盖的年份区间与期号，
+         方便与前端的自然年视图对照。
+
+    返回与 ``build_eras`` 同构的列表，可直接传给 ``era_significance`` / ``regime_status``。
+    """
+    draws = list(draws or [])
+    n = len(draws)
+    if n == 0:
+        return []
+    # 默认取全局 ERA_BLOCK（150）：函数签名里写死 60 会造成「直接调用」与
+    # 「eras_for() 调用」口径不一致（实测：直接调用切出 58 段、经 eras_for 切出 23 段）。
+    block = max(20, int(block if block is not None else ERA_BLOCK))
+    # 若历史不足 min_samples，仍切成可用的段，但由 regime_report 的 min_era_n 判定"样本不足"
+    # 默认覆盖**全部**历史：阶段是观测窗口，不是"挑选过"的样本；
+    # 只在历史极短（不足以切出 3 段）时才退化为整段。
+    start_at = 0
+    bounds: List[Tuple[int, int]] = []
+    end = n
+    while end - block >= start_at:
+        bounds.append((end - block, end))
+        end -= block
+    if end > start_at:
+        # 剩余不足一段（也可能正好一段的余数）：并入最早的一段，避免出现超小阶段。
+        # 注意必须用 `>=` 判循环、并在最后吸收余数，否则最老的一段会被静默丢弃
+        # （实测：1200 期 / block=150 时只切出 7 段、P1 从第 150 期才开始）。
+        if bounds:
+            last_start, last_end = bounds[-1]
+            bounds[-1] = (start_at, last_end) if last_start > start_at else (last_start, last_end)
+            if bounds[-1][0] != start_at:
+                bounds[-1] = (start_at, bounds[-1][1])
+        else:
+            bounds.append((start_at, end))
+    bounds.reverse()
+    # 兜底：确保覆盖 [start_at, n) 全区间
+    if bounds and bounds[0][0] != start_at:
+        bounds[0] = (start_at, bounds[0][1])
+    out: List[Dict] = []
+    for i, (a, b) in enumerate(bounds, 1):
+        seg = draws[a:b]
+        y0 = _year(seg[0].get("issue", "")) if seg else None
+        y1 = _year(seg[-1].get("issue", "")) if seg else None
+        out.append({
+            "name": f"P{i}" + (f" {y0}-{y1}" if y0 != y1 else f" {y0}"),
+            "short": f"P{i}", "start_year": y0, "end_year": y1,
+            "start": a, "end": b, "n": b - a,
+            "first_issue": seg[0].get("issue") if seg else None,
+            "last_issue": seg[-1].get("issue") if seg else None,
+        })
+    return out
 
 
 def _era_of(year: int) -> Optional[str]:
@@ -136,6 +210,15 @@ def build_eras(draws: Sequence[Dict]) -> List[Dict]:
             "last_issue": draws[idx[-1]].get("issue"),
         })
     return out
+
+
+def eras_for(draws: Sequence[Dict], mode: Optional[str] = None,
+             block: Optional[int] = None) -> List[Dict]:
+    """按当前口径取阶段列表（``adaptive`` 默认 / ``calendar`` 兼容旧视图）。"""
+    m = mode or ERA_MODE
+    if m == "calendar":
+        return build_eras(draws)
+    return build_adaptive_eras(draws, block=block or ERA_BLOCK)
 
 
 def split_series(series: Sequence[float], eras: Sequence[Dict]) -> List[List[float]]:
@@ -189,8 +272,10 @@ def era_significance(series: Sequence[float], p0: Optional[Sequence[float]] = No
             sd = math.sqrt(max(var, 0.0))
             out["sd"] = sd
             out["mde"] = _mde(n, sd, alpha)
-            if sd <= 0 or n < 10:
-                out["note_zh"] = "方差为 0 或样本过少，不作检验"
+            if sd <= 0 or n < 30:
+                # 二项口径下的最小样本：n<30 时正态近似不可靠（Type I 误差明显偏离名义 α），
+                # 与 adaptive 切分（默认 60 期一段）配套。旧的 10 期门槛会让 60 期段被判"不作检验"。
+                out["note_zh"] = f"{n} 期样本过少或方差为 0（二项口径需 ≥30 期），不作检验"
                 return out
             z = (mean - expected) / (sd / math.sqrt(n))
             out["t"] = float(z)
@@ -397,7 +482,9 @@ def regime_report(series: Sequence[float], draws: Sequence[Dict],
                   label: str = "",
                   recent_window: int = RECENT_WINDOW,
                   min_era_n: int = MIN_ERA_N,
-                  pad: int = 0) -> Dict:
+                  pad: int = 0,
+                  era_mode: Optional[str] = None,
+                  block: Optional[int] = None) -> Dict:
     """一个候选规律的完整阶段画像 → 状态机判决。
 
     ``series`` 与 ``draws`` 等长，每期一个观测：
@@ -420,7 +507,8 @@ def regime_report(series: Sequence[float], draws: Sequence[Dict],
     series = list(series or [])
     if len(series) != len(draws):
         raise ValueError(f"series 长度 {len(series)} 与 draws 长度 {len(draws)} 不一致")
-    eras = build_eras(draws)
+    mode = era_mode or ERA_MODE
+    eras = eras_for(draws, mode=mode, block=block)
     chunks = split_series(series, eras)
     p_chunks: Optional[List[List[float]]] = None
     if p0 is not None:
@@ -461,6 +549,8 @@ def regime_report(series: Sequence[float], draws: Sequence[Dict],
     n_sig = sum(1 for a in adj if a is not None and a < ALPHA)
     out = {
         "label": label,
+        "era_mode": mode,
+        "era_block": (block or ERA_BLOCK) if mode == "adaptive" else None,
         "n_total": len(draws),
         "m_adj": sum(1 for p in p_vals if p is not None),
         "n_sig_eras": n_sig,

@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>双色球智能预测分析系统</title>
-<link rel="stylesheet" href="/static/style.css?v=20261017.2">
+<link rel="stylesheet" href="/static/style.css?v=20261018.1">
 <!-- ECharts CDN + 本地 fallback -->
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"
   onerror="this.src='/static/vendor/echarts.min.js?v=20260817.7'"></script>
@@ -83,7 +83,7 @@
         <div class="card">
           <h2>🔍 我的号码诊断</h2>
           <div class="diagnose-input">
-            <input id="diagReds" placeholder="红球，逗号分隔，如 1,4,7,12,28,31" maxlength="60">
+            <input id="diagReds" placeholder="红球：空格式或逗号皆可，如 01 04 07 12 28 31" maxlength="60">
             <input id="diagBlue" type="number" min="1" max="16" placeholder="蓝球 1-16">
             <button id="btnDiagnose" onclick="runDiagnose()">诊断</button>
           </div>
@@ -332,7 +332,13 @@
           <div id="evalSub-regime" class="sub-panel hidden">
 
             <div class="card" id="rgOverviewCard">
-              <h2>⏳ 阶段有效性总览 <span class="tag" id="rgOverviewTag">未加载</span></h2>
+              <h2>⏳ 阶段有效性总览 <span class="tag" id="rgOverviewTag">未加载</span>
+                <span class="era-switch" id="eraSwitch">
+                  <button data-era="adaptive" class="on" onclick="setEraMode('adaptive')">自适应（按期数，默认）</button>
+                  <button data-era="calendar" onclick="setEraMode('calendar')">按自然年 9 段</button>
+                </span>
+              </h2>
+              <div class="note" id="eraHint">阶段切分方式：自适应 = 按固定 150 期一段（近年更密、单段检测力提高约 2 倍）；按自然年 = 旧口径。</div>
               <div class="eval-actions">
                 <button id="btnRgLoad" onclick="loadRegimeOverview(false)">▶ 加载阶段画像（约 5~20 秒）</button>
                 <button id="btnRgRefresh" onclick="refreshRegime()">🔄 重算阶段时效（写库）</button>
@@ -353,9 +359,10 @@
             </div>
 
             <div class="card" id="rgLabCard">
-              <h2>🧠 LLM 规律工坊 <span class="tag" id="rgLabTag">未加载</span></h2>
+              <h2>🧠 AI 挖掘 · 验证 · 使用 <span class="tag" id="rgLabTag">未加载</span></h2>
               <div class="eval-actions">
-                <button id="btnLabRun" onclick="runLlmLab()">🧠 让大模型找规律（三轮，1~8 分钟）</button>
+                <button id="btnClosedLoop" class="primary" onclick="runClosedLoop()">🤖 AI 规律闭环（挖掘→验证→使用）</button>
+                <button id="btnLabRun" onclick="runLlmLab()">🧠 只跑 LLM 规律工坊</button>
                 <button id="btnLabLatest" onclick="loadLlmLabLatest()">📄 看最近结果</button>
                 <button id="btnLabRegister" onclick="registerLabClaims()">📥 把已验证规律注册进假说库</button>
                 <span class="hint-inline">LLM 提的每条规律都会被强制映射到维度表并做 as-of 回放，映射不到的直接标为「不可验证」</span>
@@ -562,7 +569,7 @@
   </aside>
 
   
-      <footer>双色球智能预测分析系统 <span class="badge badge-ver" id="verText">v2.3.0</span>（M1-M5 + U1-U9 + V4~V7 已上线）· 仅供研究参考 · 随机性诚实声明 · 数据源 e.17500.cn</footer>
+      <footer>双色球智能预测分析系统 <span class="badge badge-ver" id="verText">v2.4.0</span>（M1-M5 + U1-U9 + V4~V8 已上线）· 仅供研究参考 · 随机性诚实声明 · 数据源 e.17500.cn</footer>
 </div>
 
 <!-- 号码详情弹窗（全局：任意 Tab 均可触发） -->
@@ -577,6 +584,6 @@
 </div>
 
 <div id="toast"></div>
-<script src="/static/app.js?v=20261017.2"></script>
+<script src="/static/app.js?v=20261018.1"></script>
 </body>
 </html>

@@ -1038,8 +1038,14 @@ def regime_of_filter(draws: Sequence[Dict], flt: Dict, start: int = 200,
     scan = asof_scan(draws, flt, start=start, end=end)
     pad = float(np.mean(scan["exp"])) if scan["exp"] else 0.0
     series = pad_series(scan["obs"], draws, scan["start"], fill=pad)
+    # **口径陷阱（V8 修）**：命中数指标（obs=本期命中个数，exp=期望命中数）不能当二项
+    # 比例喂给 era_significance —— 二项口径把「每期命中几个」当成「每期 0/1」，
+    # 会算出方差 = p(1-p) 而非超几何方差，并且把 2 个命中当成 1 个（均值被截断）。
+    # 正确做法：用**配对差值**（obs-exp，均值 0 = 无效应）走 t 检验，与 battle/rigor 同口径。
+    obs_node = pad_series(scan["obs"], draws, scan["start"], fill=pad)
     p0 = pad_series(scan["exp"], draws, scan["start"], fill=pad)
-    rep = regime.regime_report(series, draws, p0=p0, label=flt["label"],
+    delta_series = [float(o) - float(e) for o, e in zip(obs_node, p0)]
+    rep = regime.regime_report(delta_series, draws, p0=None, label=flt["label"],
                                min_era_n=min_era_n, pad=int(scan["start"]))
     rep["scan"] = {k: scan[k] for k in ("target", "n", "k_mean", "start", "end")}
     rep["filter"] = {"key": flt["key"], "name_zh": flt["name_zh"],

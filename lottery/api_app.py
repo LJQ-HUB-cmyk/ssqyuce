@@ -1273,7 +1273,9 @@ def _battle_or_503():
 # ---------- V6：阶段有效性（regime）+ 多维度规律发现 + LLM 规律工坊 ----------
 
 @app.get("/api/regime/overview")
-def regime_overview(limit: int = Query(0, ge=0, le=3490)):
+def regime_overview(limit: int = Query(0, ge=0, le=3490),
+                    era_mode: Optional[str] = Query(None),
+                    era_block: int = Query(0, ge=0, le=600)):
     """阶段时效总览：各阶段边界 + 全部规律的阶段画像 + 状态机分布。
 
     回答用户最关心的两个问题：**规律在哪段时间有效**、**现在还灵不灵**。
@@ -1311,7 +1313,17 @@ def regime_overview(limit: int = Query(0, ge=0, le=3490)):
         counts[k] = counts.get(k, 0) + 1
     return {
         "ok": True,
-        "eras": regime.build_eras(draws),
+        "eras": regime.eras_for(draws, mode=(era_mode or regime.ERA_MODE),
+                                block=(era_block or None)),
+        "era_mode": (era_mode or regime.ERA_MODE),
+        "era_block": regime.ERA_BLOCK if (era_mode or regime.ERA_MODE) == "adaptive" else None,
+        "era_modes": {
+            "adaptive": {"label": "自适应（按固定期数）",
+                         "block": regime.ERA_BLOCK,
+                         "note": "按 150 期一段切分：单段样本更大、检测力更高；近年与早年同等对待"},
+            "calendar": {"label": "按自然年（9 段）",
+                         "note": "2003-2008/…/2026；近年单段仅 118~151 期，检测力低，仅供对照"},
+        },
         "era_defs": [{"name": n, "start_year": lo, "end_year": hi}
                      for n, lo, hi in regime.ERA_DEFS],
         "recent_window": regime.RECENT_WINDOW,
@@ -1589,6 +1601,84 @@ def rules_closed_loop(rounds: int = Query(3, ge=1, le=3),
     return res
 
 
+def _bg_run(kind: str, fn, on_done=None) -> str:
+    """把长耗时操作放进后台线程并登记成 db 任务，供前端轮询进度。
+
+    为什么要有它（用户反馈第 2 条）：AI 闭环/LLM 工坊动辄 1~8 分钟，
+    同步 HTTP 请求期间浏览器只能转圈、也没有任何阶段信息，用户就会觉得"点了没反应"。
+    这里改成「立即返回 task_id → 前端每 3 秒轮询 /api/tasks/{id} → 显示阶段 + 进度」。
+    """
+    import threading
+    import uuid
+
+    tid = f"{kind}_{uuid.uuid4().hex[:8]}"
+    db.create_task(tid, kind)
+
+    def _run():
+        def _progress(frac: float, msg: str) -> None:
+            db.update_task(tid, "running", frac, msg)
+        try:
+            db.update_task(tid, "running", 0.01, "已启动…")
+            result = fn(_progress)
+            conn = db.get_conn()
+            conn.execute("UPDATE tasks SET status=?, progress=?, message=?, result_json=?, updated_at=? WHERE id=?",
+                         ("completed", 1.0, (result or {}).get("note_zh", "完成")[:300],
+                          json.dumps(result or {}, ensure_ascii=False, default=str), time.time(), tid))
+            conn.commit()
+            if on_done:
+                try:
+                    on_done(result)
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception as e:  # noqa: BLE001
+            db.update_task(tid, "failed", 0.0, f"{type(e).__name__}: {e}")
+
+    threading.Thread(target=_run, daemon=True, name=f"bg-{tid}").start()
+    return tid
+
+
+@app.post("/api/rules/closed-loop/async")
+def rules_closed_loop_async(rounds: int = Query(3, ge=1, le=3),
+                            use_llm: int = Query(1, ge=0, le=1)):
+    """**AI 规律闭环（后台任务版）**：立即返回 task_id，前端轮询进度。
+
+    闭环内容与 ``/api/rules/closed-loop`` 相同（挖掘→验证→注册→刷新快照），
+    但不再让浏览器干等：每完成一个阶段就更新任务的 progress/message。
+    """
+    try:
+        from . import llm_lab
+    except ImportError as e:
+        return JSONResponse({"ok": False, "error": "LLM 规律工坊模块尚未就绪",
+                             "detail": str(e)}, status_code=503)
+    draws = db.load_draws()
+    if not draws:
+        return JSONResponse({"ok": False, "error": "本地暂无开奖数据"}, status_code=400)
+    tid = _bg_run("closed_loop",
+                  lambda p: llm_lab.run_closed_loop(draws, rounds=int(rounds),
+                                                    use_llm=bool(use_llm), progress=p))
+    return {"ok": True, "task_id": tid,
+            "note_zh": "AI 规律闭环已在后台运行（约 1~8 分钟），可离开本页，完成后自动刷新"}
+
+
+@app.post("/api/llm_lab/run/async")
+def llm_lab_run_async(rounds: int = Query(3, ge=1, le=3),
+                      use_llm: int = Query(1, ge=0, le=1)):
+    """LLM 规律工坊（后台任务版），与 ``/api/llm_lab/run`` 同逻辑。"""
+    try:
+        from . import llm_lab
+    except ImportError as e:
+        return JSONResponse({"ok": False, "error": "LLM 规律工坊模块尚未就绪",
+                             "detail": str(e)}, status_code=503)
+    draws = db.load_draws()
+    if not draws:
+        return JSONResponse({"ok": False, "error": "本地暂无开奖数据"}, status_code=400)
+    tid = _bg_run("llm_lab",
+                  lambda p: llm_lab.run_lab(draws, rounds=int(rounds),
+                                            use_llm=bool(use_llm), progress=p))
+    return {"ok": True, "task_id": tid,
+            "note_zh": "LLM 规律工坊已在后台运行（约 1~8 分钟），可离开本页"}
+
+
 @app.get("/api/battle/report")
 def battle_report(limit: int = Query(0, ge=0, le=3490),
                   n_tickets: int = Query(10, ge=1, le=20),
@@ -1707,6 +1797,28 @@ try:
     from . import ml_model
     _boot_draws = db.load_draws()
     ml_model.start_ml_warmup(_boot_draws)
+except Exception:  # noqa: BLE001
+    pass
+
+# V8：启动后异步刷新一次规律快照，保证「本期规律使用情况」不会因为镜像重建而读到陈旧快照。
+# 失败只记录日志，绝不阻塞启动。
+def _boot_refresh_rules_snapshot():
+    import time as _t
+    _t.sleep(20)                     # 让启动回测/预测先跑完，避免抢 IO
+    try:
+        from . import patterns_runtime
+        _d = db.load_draws()
+        if _d:
+            r = patterns_runtime.refresh(_d)
+            print("[rules] 启动后规律快照刷新:", (r.get("snapshot") or {}).get("counts"))
+    except Exception as e:  # noqa: BLE001
+        print("[rules] 启动后规律快照刷新失败（不影响出号）:", e)
+
+
+try:
+    import threading as _threading
+    _threading.Thread(target=_boot_refresh_rules_snapshot, daemon=True,
+                      name="boot-rules-refresh").start()
 except Exception:  # noqa: BLE001
     pass
 

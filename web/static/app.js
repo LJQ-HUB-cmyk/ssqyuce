@@ -480,26 +480,88 @@ async function refreshRuleSnapshot() {
   _rgBusy = false;
 }
 
-async function runClosedLoop() {
-  if (_rgBusy) { toast("正在计算中，请稍候"); return; }
-  if (!window.confirm("AI 规律闭环：大模型三轮提规律/自我质疑 → 逐条 as-of 回放验证 → 注册 → 刷新规律快照。\n预计 1~8 分钟，确定开始？")) return;
-  _rgBusy = true;
-  const el = $("#ruleBody");
-  if (el) el.innerHTML = '<div class="track-note warn"><span class="spin">⏳</span> 闭环进行中：挖掘 → 验证 → 注册 → 刷新快照…</div>';
+/**
+ * 提交后台长任务并轮询进度。
+ * 修复用户反馈「点按钮 15 分钟没有任何反应」：同步请求期间页面无任何反馈，
+ * 现改为立即拿到 task_id，每 3 秒刷新「阶段 + 进度 + 已用时间」，并支持离开页面。
+ */
+async function runBackgroundTask(opts) {
+  const {submitPath, renderArea, onDone, btnId, busyText, freeText} = opts;
+  const area = $(renderArea);
+  if (btnId) setBusy(btnId, busyText || "后台运行中…");
+  const t0 = Date.now();
+  const paint = (msg, pct) => {
+    if (!area) return;
+    const sec = Math.round((Date.now() - t0) / 1000);
+    area.innerHTML = '<div class="track-note warn"><span class="spin">⏳</span> ' + escHtml(msg) +
+      (pct !== null && pct !== undefined ? '（' + Math.round(pct * 100) + '%）' : '') +
+      ' · 已用 ' + Math.floor(sec / 60) + '分' + (sec % 60) + '秒' +
+      '<div class="rg-cell-sub">后台运行中，可以离开本页；完成后会自动刷新结果。</div></div>';
+  };
+  paint("提交任务…", 0);
+  let tid = null;
   try {
-    const r = await api("/api/rules/closed-loop?rounds=3&use_llm=1", { method: "POST" });
-    const rt = r.runtime || {};
-    toast("闭环完成：可用规律 " + ((rt.counts || {}).usable || 0) + " 条");
-    await loadLastPrediction();
-    if (typeof loadRegimeOverview === "function") loadRegimeOverview(false);
-  } catch (e) { toast("闭环失败: " + e.message); }
-  _rgBusy = false;
+    const r = await api(submitPath, {method: "POST"});
+    if (!r.ok || !r.task_id) throw new Error(r.error || "提交失败");
+    tid = r.task_id;
+  } catch (e) {
+    if (area) area.innerHTML = '<div class="track-note warn">⚠️ 提交失败：' + escHtml(e.message) + '</div>';
+    if (btnId) setFree(btnId, freeText || "重试");
+    return null;
+  }
+  toast("已提交，后台运行中…");
+  return await new Promise(resolve => {
+    const iv = setInterval(async () => {
+      try {
+        const t = await api("/api/tasks/" + tid);
+        if (t.status === "completed") {
+          clearInterval(iv);
+          const res = t.result || {};
+          if (btnId) setFree(btnId, freeText || "完成");
+          if (area) area.innerHTML = "";
+          if (onDone) onDone(res);
+          resolve(res);
+        } else if (t.status === "failed") {
+          clearInterval(iv);
+          if (btnId) setFree(btnId, freeText || "重试");
+          if (area) area.innerHTML = '<div class="track-note warn">❌ 失败：' + escHtml(t.message || "未知错误") + '</div>';
+          toast("后台任务失败：" + (t.message || ""));
+          resolve(null);
+        } else {
+          paint(t.message || "运行中…", t.progress);
+        }
+      } catch (e) { /* 网络抖动：继续轮询 */ }
+    }, 3000);
+  });
+}
+
+async function runClosedLoop() {
+  if (window._closedLoopRunning) { toast("闭环已在运行中，请等待完成"); return; }
+  if (!window.confirm("AI 规律闭环：维度扫描 → 大模型三轮提规律/自我质疑/修订 → 逐条 as-of 回放验证 → 注册 → 刷新规律快照。\n\n预计 1~8 分钟，将在后台运行并显示每个阶段的进度（可离开本页）。\n\n确定开始？")) return;
+  window._closedLoopRunning = true;
+  const area = document.querySelector("#evalSub-regime:not(.hidden)") ? "#rgLabBody" : "#ruleBody";
+  const res = await runBackgroundTask({
+    submitPath: "/api/rules/closed-loop/async?rounds=3&use_llm=1",
+    renderArea: area,
+    btnId: $("#btnClosedLoop") ? "#btnClosedLoop" : null,
+    busyText: "后台运行中…",
+    freeText: "🤖 AI 规律闭环（挖掘→验证→使用）",
+    onDone: async (r) => {
+      const rt = r.runtime || {};
+      toast("闭环完成：可用规律 " + ((rt.counts || {}).usable || 0) + " 条");
+      if (typeof renderLab === "function" && r.claims) renderLab(r);
+      await loadLastPrediction();
+      if (typeof loadRegimeOverview === "function") loadRegimeOverview(false);
+    },
+  });
+  window._closedLoopRunning = false;
+  return res;
 }
 
 // 载入最近一期预测（进首页时用，带生成时间与规律使用情况）
 async function loadLastPrediction() {
   try {
-    const r = await api("/api/predictions/last");
+    const r = await api("/api/predictions/last?_ts=" + Date.now());
     if (!r || !r.issue) return;
     currentIssue = r.issue;
     renderPredictions(r);
@@ -509,6 +571,29 @@ async function loadLastPrediction() {
       " 注，生成于 " + gen + "）";
     $("#predStatus").style.color = "var(--muted)";
   } catch (e) { /* 首页静默失败，不打扰 */ }
+}
+
+// ==================== 号码格式（全站唯一口径） ====================
+// 用户反馈：复制的号码是 "01 06 12 21 24 31 + 12"，但「我的号码诊断」等处格式不一致。
+// 现在所有「展示/复制/比对」的号码串都只从下面两个函数产出，避免再出现第二种写法
+// （补零工具是文件顶部已有的 pad2 常量，不重复定义）。
+
+/** 单注号码串：`01 06 12 21 24 31 + 12`（红球升序补零，蓝球补零）。 */
+function formatTicket(reds, blue) {
+  const r = (reds || []).map(Number).filter(x => !isNaN(x)).sort((a, b) => a - b);
+  return r.map(pad2).join(" ") + " + " + pad2(Number(blue));
+}
+
+/** 只展示红球：`01 06 12 21 24 31`。 */
+function formatReds(reds) {
+  return (reds || []).map(Number).filter(x => !isNaN(x)).sort((a, b) => a - b).map(pad2).join(" ");
+}
+
+/** 用户输入解析：兼容「01 06 12」「01,06,12」「1 6 12」与全角空格/逗号。 */
+function parseRedsInput(str) {
+  return String(str || "")
+    .replace(/[，、]/g, ",").replace(/\u3000/g, " ")
+    .split(/[\s,]+/).map(s => parseInt(s, 10)).filter(x => !isNaN(x));
 }
 
 // 一句话结构小结：和值 · 三区 · 奇偶
@@ -542,7 +627,7 @@ function toggleTicket(i) {
 function copyTicket(i) {
   const t = window._predTickets?.[i];
   if (!t) return;
-  const txt = t.reds.map(r => String(r).padStart(2,"0")).join(" ") + " + " + String(t.blue).padStart(2,"0");
+  const txt = formatTicket(t.reds, t.blue);
   navigator.clipboard.writeText(txt).then(() => toast("已复制第 " + (i + 1) + " 注")).catch(() => toast("复制失败"));
 }
 
@@ -550,7 +635,7 @@ function copyTicket(i) {
 function copyAllTickets() {
   const items = window._predTickets || [];
   if (!items.length) { toast("暂无预测"); return; }
-  const lines = items.map(t => t.reds.map(r => String(r).padStart(2,"0")).join(" ") + " + " + String(t.blue).padStart(2,"0"));
+  const lines = items.map(t => formatTicket(t.reds, t.blue));
   navigator.clipboard.writeText(lines.join("\n")).then(() => {
     toast("已复制全部 " + items.length + " 注");
     saveMyCopy(items);
@@ -575,7 +660,7 @@ function followMyPick() {
     if (chosen.length >= want) break;
     if (!chosen.includes(t)) chosen.push(t);
   }
-  const lines = chosen.map(t => t.reds.map(r => String(r).padStart(2,"0")).join(" ") + " + " + String(t.blue).padStart(2,"0"));
+  const lines = chosen.map(t => formatTicket(t.reds, t.blue));
   navigator.clipboard.writeText(lines.join("\n")).then(() => {
     toast("跟我买：已选 " + chosen.length + " 注（蓝球覆盖 " + usedBlue.size + " 个）并复制");
     saveMyCopy(chosen);
@@ -651,8 +736,9 @@ function runDiagnose() {
   const redsStr = ($("#diagReds")?.value || "").trim();
   const blueStr = ($("#diagBlue")?.value || "").trim();
   if (!redsStr || !blueStr) { toast("请输入红球和蓝球"); return; }
-  const reds = redsStr.split(",").map(s => parseInt(s.trim())).filter(x => !isNaN(x));
-  const blue = parseInt(blueStr);
+  // 解析口径与复制格式一致：空格/逗号/顿号都接受，号码可带前导零
+  const reds = parseRedsInput(redsStr);
+  const blue = parseInt(blueStr, 10);
   if (reds.length !== 6 || new Set(reds).size !== 6 || blue < 1 || blue > 16) {
     toast("红球需6个不重复1-33整数，蓝球需1-16"); return;
   }
@@ -662,9 +748,12 @@ function runDiagnose() {
     .then(data => {
       if (data.error) { toast(data.error); return; }
       const p = data.profile;
+      window._diagTicket = {reds: p.reds || reds, blue: p.blue || blue};
       const meanFreq = p.freq ? p.freq.reduce((a,b) => a+b, 0) / 33 : 0;
       $("#diagResult").innerHTML =
         '<div class="diagnose-card">' +
+          '<div class="diag-ticket">' + escHtml(formatTicket(p.reds || reds, p.blue || blue)) +
+            '<button class="diag-copy" onclick="copyDiagnoseTicket()">📋 复制</button></div>' +
           '<h4>结构画像</h4>' +
           '<div class="metrics">' +
             metricItem("和值", p.sum, "分位[" + p.sum_pct_low.toFixed(0) + "-" + p.sum_pct_high.toFixed(0) + "] " + (p.sum_in_range ? "✓在区间" : "✗偏离")),
@@ -704,6 +793,15 @@ function runDiagnose() {
     })
     .catch(e => toast("诊断失败: " + e.message))
     .finally(() => setFree("#btnDiagnose", "诊断"));
+}
+
+// 复制上一次诊断的号码（与票卡同一格式）
+function copyDiagnoseTicket() {
+  const t = window._diagTicket;
+  if (!t) { toast("暂无诊断号码"); return; }
+  navigator.clipboard.writeText(formatTicket(t.reds, t.blue))
+    .then(() => toast("已复制 " + formatTicket(t.reds, t.blue)))
+    .catch(() => toast("复制失败"));
 }
 
 function metricItem(label, value, sub) {
@@ -3004,11 +3102,14 @@ function renderMyCopyReceipt(saved, item) {
 
 async function loadAll() {
   try {
+    // 防缓存：预测/健康这类"随时会变"的接口带时间戳，确保刷新页面拿到的是最新数据
+    // （用户反馈：重新生成后刷新页面又显示 15 日的旧数据）。
+    const bust = "?_ts=" + Date.now();
     const [feat, pats, preds, health] = await Promise.all([
       api("/api/features"),
       api("/api/patterns"),
-      api("/api/predictions/last"),
-      api("/api/health"),
+      api("/api/predictions/last" + bust),
+      api("/api/health" + bust),
     ]);
     renderStats(feat);
     renderPatterns(pats.items, pats.summary);
@@ -3087,6 +3188,7 @@ loadAll();
 // ==================== V6：规律时效（阶段有效性）+ 多维度发现 + LLM 规律工坊 ====================
 
 let _rgOverview = null;
+let _eraMode = localStorage.getItem("eraMode") || "adaptive";   // "adaptive" | "calendar"
 let _rgFamilies = null;
 let _rgBusy = false;
 
@@ -3094,6 +3196,8 @@ let _rgBusy = false;
 function openRegimeTab() {
   switchTab("eval");
   setEvalSub("regime");
+  // 显式收起「更多」抽屉：否则遮罩会盖在切换后的页面上，看起来"点了没反应"
+  closeMore();
   if (!_rgOverview) loadRegimeOverview(false);
 }
 
@@ -3193,6 +3297,20 @@ function renderRegimeOverview(r) {
     '它的效果由「实战战绩」子页的 A/B 验证给出。</div>' + '<div class="track-note">' + escHtml(r.note_zh || "") + '</div>';
 }
 
+/** 切换阶段切分口径（自适应按期数 / 自然年 9 段），切换后重算阶段画像。 */
+function setEraMode(mode) {
+  _eraMode = mode === "calendar" ? "calendar" : "adaptive";
+  localStorage.setItem("eraMode", _eraMode);
+  document.querySelectorAll("#eraSwitch button").forEach(b =>
+    b.classList.toggle("on", b.dataset.era === _eraMode));
+  const hint = $("#eraHint");
+  if (hint) hint.textContent = _eraMode === "adaptive"
+    ? "阶段切分方式：自适应 = 按固定 150 期一段（历史约 23 段、近年更密；单年切法只有 118~151 期，检测力不足）。"
+    : "阶段切分方式：按自然年（2003-2008 / … / 2026，共 9 段）。旧口径，单段样本小、检测力低，仅供对照。";
+  _rgOverview = null;
+  loadRegimeOverview(false);
+}
+
 async function loadRegimeOverview(manual) {
   if (_rgBusy) { toast("正在计算中，请稍候"); return; }
   _rgBusy = true;
@@ -3200,7 +3318,7 @@ async function loadRegimeOverview(manual) {
   const tag = $("#rgOverviewTag");
   if (tag) tag.textContent = "加载中…";
   try {
-    const r = await api("/api/regime/overview");
+    const r = await api("/api/regime/overview?era_mode=" + encodeURIComponent(_eraMode));
     _rgOverview = r;
     renderRegimeOverview(r);
     if (manual) toast("阶段画像已刷新");
@@ -3370,24 +3488,24 @@ function renderLab(res) {
 }
 
 async function runLlmLab() {
-  if (_rgBusy) { toast("正在计算中，请稍候"); return; }
-  if (!window.confirm("LLM 规律工坊会调用大模型三轮（提规律 → 自我质疑 → 修订），\n预计 1~8 分钟，期间页面会一直显示忙碌状态。\n\n确定开始吗？")) return;
-  _rgBusy = true;
-  setBusy("#btnLabRun", "大模型思考中（1~8 分钟）…");
+  if (window._labRunning) { toast("工坊已在运行中，请等待完成"); return; }
+  if (!window.confirm("LLM 规律工坊会调用大模型三轮（提规律 → 自我质疑 → 修订），\n预计 1~8 分钟，将在后台运行并显示阶段进度。\n\n确定开始吗？")) return;
+  window._labRunning = true;
   const tag = $("#rgLabTag");
-  if (tag) tag.textContent = "运行中…";
-  const body = $("#rgLabBody");
-  if (body) body.innerHTML = '<div class="track-note warn"><span class="spin">⏳</span> 正在进行：维度扫描 → LLM 提规律 → 自我质疑 → 修订 → 逐条 as-of 回放验证…</div>';
-  try {
-    const r = await api("/api/llm_lab/run?rounds=3&use_llm=1&persist=1", { method: "POST" });
-    renderLab(r);
-    toast("工坊完成：" + ((r.claims || []).length) + " 条规律");
-    loadRegimeOverview(false);
-  } catch (e) {
-    renderLab({ ok: false, detail: e.message });
-  }
-  setFree("#btnLabRun", "🧠 让大模型找规律（三轮，1~8 分钟）");
-  _rgBusy = false;
+  if (tag) tag.textContent = "后台运行中…";
+  await runBackgroundTask({
+    submitPath: "/api/llm_lab/run/async?rounds=3&use_llm=1",
+    renderArea: "#rgLabBody",
+    btnId: $("#btnLabRun") ? "#btnLabRun" : null,
+    busyText: "后台运行中…",
+    freeText: "🧠 只跑 LLM 规律工坊",
+    onDone: (r) => {
+      renderLab(r);
+      toast("工坊完成：" + ((r.claims || []).length) + " 条规律");
+      loadRegimeOverview(false);
+    },
+  });
+  window._labRunning = false;
 }
 
 async function loadLlmLabLatest() {

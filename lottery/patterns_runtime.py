@@ -150,7 +150,9 @@ def build_snapshot(draws: Sequence[Dict], scan: Optional[Dict] = None,
                  "expected_false_positives": scan.get("expected_false_positives"),
                  "best_quick_p_adjusted": scan.get("best_quick_p_adjusted"),
                  "verdict": scan.get("verdict")},
-        "eras": [e.get("name") for e in regime.build_eras(draws)],
+        "eras": [e.get("name") for e in regime.eras_for(draws)],
+        "era_mode": regime.ERA_MODE,
+        "era_block": regime.ERA_BLOCK,
         "rules": rules,
     }
 
