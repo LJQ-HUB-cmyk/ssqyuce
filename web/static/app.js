@@ -1598,6 +1598,8 @@ function setEvalSub(name) {
   if (name === "evolution" && !_evoStatus) loadEvolutionStatus(false);
   // V6：进入「规律时效」子页时自动加载阶段画像（只读快接口，重算仍需显式点击）
   if (name === "regime" && !_rgOverview) loadRegimeOverview(false);
+  // V10-10：进入「综合概览」时加载三卡 + 样本并排（首次才拉，之后靠用户点刷新）
+  if (name === "overview" && !_v10CardsLoaded) { _v10CardsLoaded = true; loadV10Cards(); }
   // 面板由隐藏变为可见时重算图表尺寸（隐藏容器内初始化的图表宽高为 0）
   requestAnimationFrame(() => Object.values(charts).forEach(c => {
     try { if (c && c.resize) c.resize(); } catch (_) {}
@@ -1905,6 +1907,301 @@ async function loadMethodBreakdown() {
     if (area) area.innerHTML = '<div class="note">方法战绩加载失败：' + escHtml(e.message) + "</div>";
   }
 }
+
+// ==================== V10-10：三卡 + 通道徽标 + 样本并排 ====================
+// 三卡是否已加载（首次进入「综合概览」才拉取，避免开局打满 4 个重请求）
+let _v10CardsLoaded = false;
+
+// 数据来源（每个卡只有唯一出口，前后端不各写一份口径）：
+//   🧾 票单分布  → GET /api/portfolio/distribution → engine.ticket_distribution()
+//   📋 前置注册  → GET /api/registry/status        → hypothesis.load_registry() + 快照 prereg
+//   🤖 ML 诊断   → GET /api/ml/diagnosis           → ml_model.diagnose_ml_channels()
+//   📐 样本并排  → GET /api/samples/side-by-side   → replay.samples_side_by_side()
+//   通道口径    → GET /api/info                    → methods.resolve_channels()
+
+const FAMILY_LABEL = {stat:"统计基线", blend:"融合 blend", llm:"LLM 推理",
+  ml:"ML 模型", uniform:"均匀随机"};
+
+/** 小数格式化：null/NaN → "-"，其余保留 d 位。 */
+function _f(v, d) {
+  if (v === null || v === undefined || v === "" || isNaN(Number(v))) return "-";
+  return Number(v).toFixed(d === undefined ? 4 : d);
+}
+/** 概率 → 百分比（0 必须显示成 0.0%，不能像 pct() 那样被当假值吞掉）。 */
+function _p2(v, d) {
+  if (v === null || v === undefined || isNaN(Number(v))) return "-";
+  return (Number(v) * 100).toFixed(d === undefined ? 2 : d) + "%";
+}
+
+// ----- 通道口径徽标（本期推荐页） -----
+function renderChannelBadges(ch) {
+  const el = $("#channelBadges");
+  if (!el) return;
+  if (!ch) { el.innerHTML = '<span class="ch-badge muted">通道口径不可用</span>'; return; }
+  const fams = ch.families || {};
+  const order = ["stat", "blend", "ml", "llm", "uniform"];
+  let h = order.map(k => {
+    const on = !!fams[k];
+    return '<span class="ch-badge ' + (on ? "on" : "off") + '" title="方法族 ' + k +
+      (on ? "：已启用" : "：已关闭") + '">' + (on ? "✓ " : "✕ ") +
+      escHtml(FAMILY_LABEL[k] || k) + "</span>";
+  }).join("");
+  const canPick = !!ch.llm_can_pick;
+  h += '<span class="ch-badge ' + (canPick ? "pick" : "nopick") + '" title="' +
+    (canPick ? "LLM 可以出号（llm_output_mode=" + escHtml(ch.llm_output_mode || "") + "）"
+             : "LLM 不参与出号（llm_output_mode=" + escHtml(ch.llm_output_mode || "off") + "）") +
+    '">' + (canPick ? "🤖 LLM 出号：是" : "🤖 LLM 出号：否") + "</span>";
+  h += '<span class="ch-badge muted" title="生效开关来源 / 运行模式 / 快照指纹">' +
+    escHtml((ch.source || "?") + " · " + (ch.mode || "?") + " · " + (ch.llm_output_mode || "?")) +
+    "</span>";
+  el.innerHTML = h;
+}
+
+// ----- 卡 1：票单分布 -----
+function renderDistribution(data) {
+  const body = $("#distBody"), tag = $("#distTag");
+  if (!body) return;
+  if (!data || data.ok === false) {
+    if (tag) tag.textContent = "不可用";
+    body.innerHTML = '<div class="note">票单分布不可用：' +
+      escHtml((data && data.error) || "接口未返回") + "</div>";
+    return;
+  }
+  const d = data.distribution || {};
+  const par = d.p_at_least_r || {};
+  const honesty = data.honesty || {};
+  if (tag) tag.textContent = (data.source === "prediction"
+      ? "当前推荐 " + (d.n ?? 0) + " 注" + (data.issue ? " · " + data.issue : "")
+      : "示例票 " + (d.n ?? 0) + " 注") +
+      (data.exact ? " · 精确枚举" : " · iid 近似");
+  const metric = (k, v, sub) =>
+    '<div class="v10-metric"><div class="k">' + k + '</div><div class="v">' + v +
+    "</div>" + (sub ? '<div class="sub">' + sub + "</div>" : "") + "</div>";
+  body.innerHTML =
+    // 诚实边界提示条（规格要求：不可省略）
+    '<div class="v10-honesty"><b>改变分布不改变 EV：</b>' +
+      escHtml(honesty.note_zh || "只改变波动结构，不改变期望值。") + "</div>" +
+    '<div class="v10-metrics">' +
+      metric("期望命中 E", _f(d.expected_hits, 3), "= n·12/11，与选号无关") +
+      metric("P(≥4 红)", _p2(par["4"]), d.p_at_least_r_method === "exact_enum"
+        ? "精确枚举" : "近似：" + _p2((d.p_at_least_r_iid || {})["4"])) +
+      metric("P(≥5 红)", _p2(par["5"]), d.p_at_least_r_method === "exact_enum"
+        ? "精确枚举" : "近似：" + _p2((d.p_at_least_r_iid || {})["5"])) +
+      metric("冗余度 Ā", _f(d.redundancy, 4),
+        "中性值 " + _f(d.redundancy_neutral, 4) + "（12/11）· 上限 " + _f(d.redundancy_max, 3)) +
+      metric("方差比", _f(d.var_ratio, 4), "var_T/σ² 下界 0") +
+      metric("P(≥1 蓝)", _p2(d.p_any_blue), "覆盖 " + (d.blue_coverage_count ?? "-") + "/16") +
+    "</div>" +
+    '<div class="v10-metrics">' +
+      metric("仅六等奖返奖比", _f(d.ev_ratio_sixth, 5), "= 0.15625，与注数无关") +
+      metric("整注返奖比（全奖级）", _f(d.ev_ratio_full, 4),
+        "严格口径 " + _f(d.ev_ratio_full_strict, 4)) +
+    "</div>" +
+    // 奖金假设必须与 ev_ratio_full 一起展示
+    '<div class="v10-honesty"><b>奖金假设（浮动奖只能给假设常量）：</b>' +
+      escHtml(d.prize_assumption || "未提供") +
+      (d.ev_ratio_full_note ? "；" + escHtml(d.ev_ratio_full_note) : "") + "</div>" +
+    '<div class="note">' + escHtml(d.var_ratio_note || data.note_zh || "") + "</div>";
+}
+
+async function loadDistribution() {
+  try { renderDistribution(await api("/api/portfolio/distribution")); }
+  catch(e) {
+    const body = $("#distBody"), tag = $("#distTag");
+    if (tag) tag.textContent = "不可用";
+    if (body) body.innerHTML = '<div class="note">票单分布加载失败：' + escHtml(e.message) + "</div>";
+  }
+}
+
+// ----- 卡 2：前置注册 -----
+function renderRegistry(rep) {
+  const body = $("#preregBody"), tag = $("#preregTag");
+  if (!body) return;
+  if (!rep || rep.ok === false) {
+    if (tag) tag.textContent = "不可用";
+    body.innerHTML = '<div class="note">前置注册状态不可用：' +
+      escHtml((rep && rep.error) || "接口未返回") + "</div>";
+    return;
+  }
+  if (tag) tag.textContent = "已登记 " + (rep.n_total || 0) + " 条 · 累计检验 " +
+    (rep.n_tested_cumulative || 0) + " 次";
+  const cnt = (k, label, cls) =>
+    '<div class="v10-metric"><div class="k">' + label + '</div><div class="v">' +
+    (rep[k] ?? 0) + "</div>" + (cls ? '<div class="sub">' + cls + "</div>" : "") + "</div>";
+  const items = rep.items || [];
+  const rows = items.length
+    ? items.map(it => {
+        const st = it.prereg_status || "-";
+        const cls = st === "passed" ? "gradeA" : (st === "failed" || st === "invalidated")
+          ? "gradeC" : "";
+        return "<tr><td class='mono'>" + escHtml(String(it.exp_id || "-")) + "</td>" +
+          "<td>" + escHtml(String(it.source || "-")) + "</td>" +
+          "<td><span class='badge " + cls + "'>" + escHtml(st) + "</span></td>" +
+          "<td>" + _f(it.p_cumulative, 5) + "</td>" +
+          "<td>" + (it.n_tested_cumulative ?? "-") + "</td>" +
+          "<td>" + (it.divergence ? "⚠ 分叉" : "—") + "</td>" +
+          "<td class='v10-reason'>" + escHtml(it.reason || "-") + "</td></tr>";
+      }).join("")
+    : "<tr><td colspan='7' class='v10-reason'>暂无已登记实验（前置注册由每期调度器写入）。</td></tr>";
+  const snap = rep.snapshot || {};
+  body.innerHTML =
+    '<div class="v10-metrics">' +
+      cnt("registered", "已登记") + cnt("passed", "通过 passed") +
+      cnt("provisional", "暂定 provisional", "批内显著但累计不显著") +
+      cnt("failed", "失败 failed") + cnt("invalidated", "失效") +
+    "</div>" +
+    '<div class="v10-metrics">' +
+      '<div class="v10-metric"><div class="k">累计检验次数 n_tested_cumulative</div>' +
+        '<div class="v">' + (rep.n_tested_cumulative ?? 0) + '</div>' +
+        '<div class="sub">Bonferroni 校正分母（R1）· 上期判定 ' +
+        escHtml(String(rep.last_issue || "-")) + '</div></div>' +
+      '<div class="v10-metric"><div class="k">批规模约束</div><div class="v">' +
+        (rep.min_batch_size ?? "-") + " ~ " + (rep.max_batch_size ?? "-") + '</div>' +
+        '<div class="sub">R2 每批最少条数 / R5 上限</div></div>' +
+    "</div>" +
+    '<div class="scroll"><table class="v10-table"><thead><tr>' +
+      "<th>exp_id</th><th>来源</th><th>prereg 状态</th><th>p_cumulative</th>" +
+      "<th>n_tested_cum</th><th>口径分叉</th><th>理由</th>" +
+    "</tr></thead><tbody>" + rows + "</tbody></table></div>" +
+    '<div class="note">' + escHtml(rep.note_zh || "") + "</div>" +
+    (snap.available
+      ? '<div class="note">规律快照基准 ' + escHtml(String(snap.base_issue || "-")) +
+        " · 快照内 usable/monitor/rejected = " +
+        JSON.stringify(snap.counts || {}) + (snap.stale ? " · ⚠ 快照已过期" : "") + "</div>"
+      : '<div class="note">规律快照尚未生成（前端只看已登记实验）。</div>');
+}
+
+async function loadRegistryStatus() {
+  try { renderRegistry(await api("/api/registry/status")); }
+  catch(e) {
+    const body = $("#preregBody"), tag = $("#preregTag");
+    if (tag) tag.textContent = "不可用";
+    if (body) body.innerHTML = '<div class="note">前置注册状态加载失败：' + escHtml(e.message) + "</div>";
+  }
+}
+
+// ----- 卡 3：ML 诊断 -----
+function renderMlDiagnosis(rep) {
+  const body = $("#mlDiagBody"), tag = $("#mlDiagTag");
+  if (!body) return;
+  if (!rep) { if (tag) tag.textContent = "未运行"; return; }
+  if (rep.ok === false && !rep.channels) {
+    if (tag) tag.textContent = "不可用";
+    body.innerHTML = '<div class="note">ML 诊断不可用：' + escHtml(rep.error || "未知错误") +
+      "</div>";
+    return;
+  }
+  const trusted = !!rep.trusted;
+  if (tag) {
+    tag.textContent = trusted ? "trusted=True" : "trusted=False"
+      + (rep.cached ? " · 缓存" : "") ;
+  }
+  const chans = rep.channels || {};
+  const chRows = Object.keys(chans).map(k => {
+    const c = chans[k] || {};
+    return "<tr><td class='mono'>" + escHtml(k) + "</td><td>" +
+      (c.trusted ? "<span class='badge gradeA'>可信</span>"
+                 : "<span class='badge gradeC'>不可信</span>") +
+      "</td><td>" + escHtml(String(c.tier || "-")) + "</td><td>" + _f(c.p_value, 4) +
+      "</td><td>" + (c.n_numbers ?? "-") + "</td><td>" +
+      (c.n_samples_per_number ?? "-") + "</td><td>" +
+      (c.importance_significant ? "是" : "否") + "</td></tr>";
+  }).join("");
+  body.innerHTML =
+    '<div class="v10-metrics">' +
+      '<div class="v10-metric"><div class="k">trusted</div><div class="v">' +
+        (trusted ? "True" : "False") + "</div><div class='sub'>两通道同时可信才算 True</div></div>" +
+      '<div class="v10-metric"><div class="k">tier</div><div class="v">' +
+        escHtml(String(rep.tier || "-")) + '</div><div class="sub">signal_found / monitor</div></div>' +
+      '<div class="v10-metric"><div class="k">样本期数</div><div class="v">' +
+        (rep.n_draws ?? "-") + '</div><div class="sub">max_issues=' +
+        ((rep.params || {}).max_issues ?? "-") + "</div></div>" +
+    "</div>" +
+    // 诚实边界提示条（规格要求：不可省略）
+    '<div class="v10-honesty"><b>trusted=False 是随机彩票的诚实结论，不是故障。</b> ' +
+      escHtml(rep.honesty_zh || "") + "</div>" +
+    (chRows ? '<div class="scroll"><table class="v10-table"><thead><tr>' +
+      "<th>通道</th><th>可信</th><th>tier</th><th>联合 p 值</th><th>号码数</th>" +
+      "<th>每号码样本</th><th>重要性显著</th></tr></thead><tbody>" + chRows +
+      "</tbody></table></div>" : "") +
+    '<div class="note">' + escHtml(rep.note_zh || "") + "</div>";
+}
+
+async function runMlDiagnosis(force) {
+  const body = $("#mlDiagBody"), tag = $("#mlDiagTag"), btn = $("#btnMlDiag");
+  if (body) body.innerHTML = '<div class="note">🤖 ML 诊断运行中（置换检验，约 10~30s）…</div>';
+  if (tag) tag.textContent = "运行中…";
+  if (btn) { btn.disabled = true; }
+  try {
+    const url = "/api/ml/diagnosis" + (force ? "?force=true&max_numbers=3&n_null=20" : "");
+    renderMlDiagnosis(await api(url));
+  } catch(e) {
+    if (tag) tag.textContent = "失败";
+    if (body) body.innerHTML = '<div class="note">ML 诊断失败：' + escHtml(e.message) + "</div>";
+  } finally {
+    if (btn) { btn.disabled = false; }
+  }
+}
+
+// ----- 卡 4：两套样本并排（禁止相加） -----
+function renderSamplesSideBySide(rep) {
+  const body = $("#samplesBody"), tag = $("#samplesTag");
+  if (!body) return;
+  if (!rep || rep.ok === false) {
+    if (tag) tag.textContent = "不可用";
+    body.innerHTML = '<div class="note">样本并排不可用：' +
+      escHtml((rep && rep.error) || "接口未返回") + "</div>";
+    return;
+  }
+  const live = rep.live || {}, replayBlk = rep.replay || {};
+  if (tag) tag.textContent = "mixable=" + (rep.mixable ? "True" : "False") + " · 禁止相加";
+  const side = (title, blk, cls) => {
+    const sig = blk.significance || {};
+    return '<div class="v10-side ' + cls + '">' +
+      "<div><b>" + escHtml(title) + "</b></div>" +
+      '<div class="note">source = <span class="mono">' + escHtml(String(blk.source || "-")) +
+        "</span></div>" +
+      "<table class='v10-table'><tbody>" +
+      "<tr><th>样本期数 n_issues</th><td>" + (blk.n_issues ?? 0) + "</td></tr>" +
+      "<tr><th>注数 n_tickets</th><td>" + (blk.n_tickets ?? 0) + "</td></tr>" +
+      "<tr><th>可检出 MDE</th><td>" + _f(blk.mde, 4) + "</td></tr>" +
+      "<tr><th>红球平均命中</th><td>" + _f(blk.red_hits_mean, 4) + "</td></tr>" +
+      "<tr><th>蓝球命中率</th><td>" + _p2(blk.blue_hit_rate) + "</td></tr>" +
+      (sig && sig.p_value !== undefined
+        ? "<tr><th>显著性 p</th><td>" + _f(sig.p_value, 4) + "</td></tr>" : "") +
+      "</tbody></table>" +
+      '<div class="note">' + escHtml(blk.note_zh || blk.source_zh || "") + "</div>" +
+      "</div>";
+  };
+  body.innerHTML =
+    '<div class="v10-honesty"><b>两套样本禁止相加：</b>' +
+      escHtml(rep.note_zh || "来源与口径都不同，只允许并排对照。") + "</div>" +
+    '<div class="v10-sides">' +
+      side("真实交战样本", live, "live") +
+      side("离线回放样本", replayBlk, "replay") +
+    "</div>" +
+    '<div class="v10-nomix">mixable = False：本页刻意不显示任何合计/加权平均。' +
+      (replayBlk.modes_zh ? " " + escHtml(replayBlk.modes_zh) : "") + "</div>";
+}
+
+async function loadSamplesSideBySide() {
+  try { renderSamplesSideBySide(await api("/api/samples/side-by-side")); }
+  catch(e) {
+    const body = $("#samplesBody"), tag = $("#samplesTag");
+    if (tag) tag.textContent = "不可用";
+    if (body) body.innerHTML = '<div class="note">样本并排加载失败：' + escHtml(e.message) + "</div>";
+  }
+}
+
+/** V10-10：三卡 + 样本并排的统一加载入口（页面初始化 / 切到评估页时调用）。 */
+async function loadV10Cards() {
+  await Promise.all([
+    loadDistribution(),
+    loadRegistryStatus(),
+    loadSamplesSideBySide(),
+  ]);
+}
+
 
 // ==================== LLM 离线评估（M3.1） ====================
 
@@ -3274,6 +3571,8 @@ async function loadAll() {
       }
       // V10-04b：用后端 channels.llm_can_pick 回填「启用 LLM」默认值
       await applyChannelDefaults(info);
+      // V10-10：本期推荐页的出号通道口径徽标（families + llm_can_pick）
+      renderChannelBadges(info && info.channels);
       const cum = await api("/api/eval/cumulative?limit=120");
       renderTrackRecord(cum);   // 门槛更新后重绘，确保展示与后端一致
     } catch(e) {}

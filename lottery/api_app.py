@@ -5,7 +5,7 @@ import json
 import hmac
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -1146,6 +1146,318 @@ def portfolio_expected_value(limit: int = Query(1, ge=1, le=20)):
                         "彩票是负期望游戏，长期必亏是数学结论而非系统缺陷。"),
         "honesty": "双色球为独立随机事件，本系统不承诺中奖率，也不改变期望值。",
     }
+
+
+# ==========================================================================
+# V10-10：前端三卡的数据接口（票单分布 / 前置注册 / ML 诊断 / LLM 对照臂）
+#
+# 【序列化纪律】以下所有端点返回体**不得含 numpy 标量/数组**（``np.float64``、
+# ``np.int64``、``np.ndarray`` 都不是 JSON 可序列化类型，FastAPI 默认编码器会抛
+# ``TypeError: Object of type float64 is not JSON serializable``）。底层统计函数
+# （``ticket_distribution`` / ``method_breakdown`` / ``battle`` / ``ml_model``）
+# 虽然已尽量返回原生类型，但新增字段随时可能漏 —— 故统一过一遍
+# ``_jsonable()`` 做深拷贝+类型归一，**不信任**上游"应该是原生类型"。
+# ==========================================================================
+
+def _jsonable(obj: Any, _depth: int = 0) -> Any:
+    """把返回体递归归一成 JSON 原生类型（numpy 标量 / dict 键 / None）。
+
+    - ``np.generic``（float64/int64/bool_ …）→ ``.item()`` 转 Python 原生；
+    - ``np.ndarray`` → ``.tolist()`` 后继续递归；
+    - dict / list / tuple 递归处理，dict 的键统一转 ``str``；
+    - 其它不可序列化对象 → ``repr()``（宁可显示成字符串，也不让端点 500）。
+    """
+    if _depth > 12:                                   # pragma: no cover - 纯防御
+        return repr(obj)
+    try:
+        import numpy as _np
+    except Exception:                                 # pragma: no cover - numpy 是硬依赖
+        _np = None
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+    if _np is not None:
+        if isinstance(obj, _np.generic):
+            return obj.item()
+        if isinstance(obj, _np.ndarray):
+            return _jsonable(obj.tolist(), _depth + 1)
+    if isinstance(obj, dict):
+        return {str(k): _jsonable(v, _depth + 1) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_jsonable(v, _depth + 1) for v in obj]
+    return repr(obj)
+
+
+@app.get("/api/portfolio/distribution")
+def portfolio_distribution(issues: int = Query(1, ge=1, le=20),
+                           exact: bool = Query(True)):
+    """V10-10「🧾 票单分布」卡：当前推荐注组合的解析分布统计。
+
+    数据源唯一：``engine.ticket_distribution()``（V10-03）。无预测时用固定示例票
+    （2 注不重复号）以便前端永远能渲染一张完整的卡，但会明确标 ``source="sample"``。
+
+    ``exact=True``（默认）：P(≥r红) 走 C(33,6) 全枚举（诚实口径，n=10 约 0.1~0.2s）；
+    ``exact=False``：iid 近似（热路径/慢机器），返回体里 ``p_at_least_r_method``
+    会变成 ``"iid_approx"``，前端据此提示"近似值不可当结论"。
+
+    **诚实边界**：改变票单分布（冗余度/方差比）只改变命中数的**波动结构**，
+    **不改变期望值** —— ``ev_ratio_sixth`` / ``ev_ratio_full`` 与选号无关，恒为常数。
+    """
+    from . import engine as E
+    tickets: List[Dict] = db.load_last_predictions() or []
+    issue = None
+    source = "prediction"
+    if tickets:
+        issue = tickets[0].get("issue")
+    else:
+        # 无预测时的示例票：只为了让卡片有内容，不冒充真实推荐
+        source = "sample"
+        tickets = [
+            {"reds": [1, 2, 3, 4, 5, 6], "blue": 1, "method": "sample"},
+            {"reds": [7, 8, 9, 10, 11, 12], "blue": 2, "method": "sample"},
+        ]
+    try:
+        dist = E.ticket_distribution(tickets, with_distribution_exact=bool(exact))
+    except (ValueError, TypeError) as exc:
+        return JSONResponse({"ok": False, "error": f"票单分布计算失败: {exc}"},
+                            status_code=400)
+    return _jsonable({
+        "ok": True,
+        "issue": issue,
+        "source": source,
+        "source_zh": ("当前推荐注" if source == "prediction" else "示例票（暂无预测）"),
+        "exact": bool(exact),
+        "distribution": dist,
+        # 这三条是"诚实边界"，前端必须原样展示，不得省略：
+        "honesty": {
+            "distribution_changes_ev": False,
+            "note_zh": ("改变票单分布（冗余度 / 方差 / 尾部概率）只改变命中数与奖金的"
+                        "**波动结构**，不改变期望值：任何组合的返奖比都恒等于"
+                        "ev_ratio_sixth / ev_ratio_full，与选号方法无关。"),
+            "prize_assumption": dist.get("prize_assumption"),
+        },
+        "note_zh": "分布统计是组合结构事实，不是中奖预测；双色球为独立随机事件。",
+    })
+
+
+@app.get("/api/registry/status")
+def registry_status(include_scan: bool = Query(False)):
+    """V10-10「📋 前置注册」卡：已登记实验的计数 + 每条规则的 prereg 理由 + 累计检验数。
+
+    数据源（只读，**不**跑 ``evaluate_prereg``，判定由调度器唯一写者负责）：
+      1. ``hypothesis.load_registry()`` → 每条假说的 ``prereg_*`` 字段 + 库根 counters；
+      2. ``patterns_runtime.load_snapshot()`` → 快照里每条规则的 ``prereg`` 子块
+         （含 ``reason`` / ``divergence`` / ``n_tested_batch`` / ``n_tested_cumulative``）。
+    ``include_scan=True`` 时把快照中来自维度扫描（无 prereg）的规则也列出来并标
+    ``prereg_status=None``，默认只列已登记实验，避免把扫描线索误读成"路过注册"。
+    """
+    from . import hypothesis, patterns_runtime
+    reg = hypothesis.load_registry() or {}
+    hyps = reg.get("hypotheses") or []
+    counters = reg.get("counters") if isinstance(reg.get("counters"), dict) else {}
+
+    items: List[Dict] = []
+    for h in hyps:
+        if not isinstance(h, dict):
+            continue
+        status = h.get("prereg_status")
+        if status is None and not include_scan:
+            continue
+        items.append({
+            "exp_id": h.get("exp_id") or h.get("id"),
+            "hyp_id": h.get("id"),
+            "statement": h.get("statement"),
+            "source": h.get("source") or "stat",
+            "prereg_status": status,
+            "prereg_ok": bool(h.get("prereg_ok")),
+            "batch_id": h.get("batch_id"),
+            "scope": h.get("scope"),
+            "p_batch": h.get("p_batch"),
+            "p_cumulative": h.get("p_cumulative"),
+            "n_tested_batch": h.get("n_tested_batch"),
+            "n_tested_cumulative": h.get("n_tested_cumulative"),
+            "divergence": bool(h.get("divergence")),
+            "reason": h.get("prereg_reason"),
+            "evaluate_after_issue": h.get("evaluate_after_issue"),
+            "frozen_until_issue": h.get("frozen_until_issue"),
+            "hyp_status": h.get("status"),
+        })
+    items.sort(key=lambda x: (str(x.get("prereg_status") or "zz"), str(x.get("exp_id") or "")))
+
+    counts = {s: 0 for s in hypothesis.PREREG_STATUSES}
+    for it in items:
+        st = str(it.get("prereg_status") or "")
+        if st in counts:
+            counts[st] += 1
+    judged = sum(counts[s] for s in ("passed", "provisional", "failed", "invalidated"))
+
+    snapshot = patterns_runtime.load_snapshot()
+    snap_rules = []
+    if snapshot:
+        for r in (snapshot.get("rules") or []):
+            pre = r.get("prereg") or {}
+            if not pre and not include_scan:
+                continue
+            if not pre and include_scan:
+                snap_rules.append({
+                    "id": r.get("id"), "source": r.get("source"),
+                    "prereg_status": None, "usable": bool(r.get("usable")),
+                    "tier": r.get("tier"), "reason": "维度扫描线索，未登记前置实验",
+                })
+                continue
+            snap_rules.append({
+                "id": r.get("id"), "source": r.get("source"),
+                "prereg_status": pre.get("status"),
+                "prereg_ok": bool(pre.get("status") == "passed"),
+                "exp_id": pre.get("exp_id"), "scope": pre.get("scope"),
+                "p_batch": pre.get("p_batch"), "p_cumulative": pre.get("p_cumulative"),
+                "n_tested_batch": pre.get("n_tested_batch"),
+                "n_tested_cumulative": pre.get("n_tested_cumulative"),
+                "divergence": bool(pre.get("divergence")),
+                "reason": pre.get("reason"),
+                "usable": bool(r.get("usable")), "tier": r.get("tier"),
+            })
+
+    return _jsonable({
+        "ok": True,
+        "counts": counts,
+        "registered": counts.get("registered", 0) + counts.get("running", 0),
+        "passed": counts.get("passed", 0),
+        "provisional": counts.get("provisional", 0),
+        "failed": counts.get("failed", 0),
+        "invalidated": counts.get("invalidated", 0),
+        "judged": judged,
+        "n_total": len(items),
+        "n_tested_cumulative": int(counters.get("n_tested_cumulative") or 0),
+        "last_issue": counters.get("last_issue"),
+        "min_batch_size": getattr(hypothesis, "MIN_BATCH_SIZE", None),
+        "max_batch_size": getattr(hypothesis, "MAX_BATCH_SIZE", None),
+        "items": items,
+        "snapshot": {
+            "available": bool(snapshot),
+            "base_issue": (snapshot or {}).get("base_issue"),
+            "generated_at": (snapshot or {}).get("generated_at"),
+            "stale": bool((snapshot or {}).get("stale")),
+            "counts": (snapshot or {}).get("counts"),
+            "rules": snap_rules,
+        },
+        "note_zh": ("前置注册把「我找了 N 次」变成「我只检验了事先承诺的 M 条」："
+                    "只有 passed（累计口径 Bonferroni 校正后 p<α）才允许影响出号；"
+                    "provisional（批内显著但累计不显著）与 failed 一律不得使用。"),
+    })
+
+
+@app.get("/api/ml/diagnosis")
+def ml_diagnosis(max_issues: int = Query(800, ge=100, le=3500),
+                 max_numbers: int = Query(3, ge=1, le=12),
+                 n_null: int = Query(20, ge=5, le=200),
+                 colors: Optional[str] = Query(None),
+                 force: bool = Query(False)):
+    """V10-10「🤖 ML 诊断」卡：ML 通道是否可信（置换重要性 + 联合打乱标签零分布）。
+
+    数据源唯一：``ml_model.diagnose_ml_channels()``（V10-08）。
+    默认参数刻意比底层默认**更轻**（2 个通道 × 3 个号码 × 20 次零复制，约 10~30s），
+    因为这是页面卡片的同步请求；``force=False`` 且 10 分钟内已有结果时直接返回缓存。
+
+    **诚实边界**：真实彩票数据上 ``trusted=False`` 是**预期结论**（零假设为真，
+    没有可学习的信号），不是系统故障 —— 返回体里 ``honesty_zh`` 字段必须原样展示。
+    """
+    import time as _time
+    from . import ml_model
+
+    colors_t = tuple(c.strip() for c in (colors or "red,blue").split(",") if c.strip())
+    colors_t = tuple(c for c in colors_t if c in ("red", "blue")) or ("red", "blue")
+    draws = db.load_draws()
+    if not draws:
+        return JSONResponse({"ok": False, "error": "本地暂无开奖数据"}, status_code=400)
+    # 缓存键必须含**数据集指纹**：只按参数缓存的话，开奖数据更新后 10 分钟内
+    # 仍会返回上一批数据算出的 trustworthy 结论（缓存把结论"钉死"在旧样本上）。
+    dataset_fp = f"{len(draws)}:{db.max_issue()}"
+    cache_key = (colors_t, int(max_issues), int(max_numbers), int(n_null), dataset_fp)
+    now = _time.time()
+    cached = _ML_DIAG_CACHE.get("result")
+    if (not force and cached and cached.get("key") == cache_key
+            and now - float(cached.get("at") or 0) < _ML_DIAG_TTL):
+        out = dict(cached["value"])
+        out["cached"] = True
+        out["cache_age_s"] = round(now - float(cached["at"]), 1)
+        return _jsonable(out)
+    try:
+        diag = ml_model.diagnose_ml_channels(
+            draws, colors=colors_t, max_issues=int(max_issues),
+            max_numbers=int(max_numbers), n_null=int(n_null))
+    except Exception as exc:                          # noqa: BLE001 - 诊断失败不 500
+        return JSONResponse({"ok": False, "error": f"ML 诊断失败: {exc}"}, status_code=200)
+
+    payload = {
+        "ok": bool(diag.get("ok", True)),
+        "trusted": bool(diag.get("trusted")),
+        "tier": diag.get("tier"),
+        "channels": diag.get("channels") or {},
+        "params": {"max_issues": int(max_issues), "max_numbers": int(max_numbers),
+                   "n_null": int(n_null), "colors": list(colors_t)},
+        "n_draws": len(draws),
+        "dataset_fingerprint": dataset_fp,
+        "cached": False,
+        "honesty_zh": ("ML 通道的可信度用**真实开奖数据**上的置换重要性检验判定。"
+                       "在纯随机数据（双色球即是）上 trusted=False 是**诚实且预期**的"
+                       "结论：它说明模型没有学到可泛化的信号，不是故障、不是 bug，"
+                       "也不代表模型代码有错。样本不足时「不显著」同样不能当作"
+                       "「信号不存在」的证据。"),
+        "note_zh": ("诊断只在少量号码上做（默认 3 个/通道）以控制耗时；"
+                    "要提高功效需扩大 max_numbers / max_issues，代价是分钟级耗时。"),
+    }
+    _ML_DIAG_CACHE["result"] = {"key": cache_key, "at": now, "value": payload}
+    return _jsonable(payload)
+
+
+# ML 诊断结果缓存（进程内，TTL 见下）。诊断一次 10~30s，页面刷新不该反复重算。
+_ML_DIAG_TTL = 600.0
+_ML_DIAG_CACHE: Dict[str, Any] = {}
+
+
+@app.get("/api/llm/arm")
+def llm_arm(limit_issues: Optional[int] = Query(None, ge=1, le=1000),
+            brief: bool = Query(False)):
+    """V10-10：LLM 出号**独立对照臂**结论（V10-09 的 ``battle.llm_arm_report``）。
+
+    只用真实已发生的 ``eval_details``（llm 不可回放），不读 experiments / prereg /
+    假说库 —— 所以假说库为空或全 failed **不影响**本结论（防死锁的代码层保证）。
+    ``brief=True`` 时只返回 ``llm_arm_brief`` 的一行摘要（前端徽标用）。
+    """
+    from . import battle
+    try:
+        report = battle.llm_arm_report(limit_issues=limit_issues)
+    except Exception as exc:                          # noqa: BLE001 - 报表失败不 500
+        return JSONResponse({"ok": False, "error": f"LLM 对照臂报告失败: {exc}"},
+                            status_code=200)
+    payload = {"ok": True, "brief_mode": bool(brief)}
+    if brief:
+        payload["brief"] = battle.llm_arm_brief(report)
+    else:
+        payload["report"] = report
+        payload["brief"] = battle.llm_arm_brief(report)
+    return _jsonable(payload)
+
+
+@app.get("/api/samples/side-by-side")
+def samples_side_by_side(mode: str = Query("replay")):
+    """V10-10：真实交战样本 vs 离线回放样本**并排**（``mixable=False``，禁止相加）。
+
+    数据源唯一：``replay.samples_side_by_side()``。返回体刻意不含 ``combined`` /
+    ``pooled`` / ``total`` 等跨来源字段 —— 两套样本物理分表、来源与口径都不同。
+    本端点再兜一层断言：若底层哪天混进了合计字段，这里直接报错而不是悄悄放行。
+    """
+    from . import replay
+    try:
+        data = replay.samples_side_by_side(mode=mode)
+    except Exception as exc:                          # noqa: BLE001
+        return JSONResponse({"ok": False, "error": f"样本并排失败: {exc}"}, status_code=200)
+    for banned in ("combined", "pooled", "total", "merged", "sum"):
+        if banned in data:                            # pragma: no cover - 防御性
+            return JSONResponse(
+                {"ok": False, "error": f"样本并排返回体含跨来源合计字段 {banned!r}，"
+                                       "违反 mixable=False 契约"}, status_code=200)
+    return _jsonable({"ok": True, **data})
 
 
 # ---------- 页面 ----------

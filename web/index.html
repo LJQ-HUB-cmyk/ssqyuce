@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>双色球智能预测分析系统</title>
-<link rel="stylesheet" href="/static/style.css?v=20261018.4">
+<link rel="stylesheet" href="/static/style.css?v=20261018.5">
 <!-- ECharts CDN + 本地 fallback -->
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"
   onerror="this.src='/static/vendor/echarts.min.js?v=20260817.7'"></script>
@@ -61,6 +61,9 @@
         <div class="home-hero">
           <div>
             <div class="hero-title">🎯 本期推荐 <span class="tag" id="predIssue"></span></div>
+            <!-- V10-10：出号通道口径徽标（families 启用族 + llm_can_pick），
+                 数据来自 /api/info 的 channels（= resolve_channels()，唯一判据） -->
+            <div class="channel-badges" id="channelBadges"><span class="ch-badge muted">通道口径加载中…</span></div>
             <div class="hero-countdown" id="predCountdown"></div>
           </div>
           <div class="hero-actions">
@@ -290,6 +293,35 @@
             <!-- V10-04b：方法战绩按族分列（llm / stat / blend / ml / uniform），不得相加 -->
             <div id="methodBreakdownArea" style="margin-top:12px"></div>
             <div id="onlineEvalArea" style="margin-top:12px"></div>
+
+            <!-- ==================== V10-10 三卡 ==================== -->
+            <!-- 卡 1：票单分布（engine.ticket_distribution） -->
+            <div class="card" id="distCard" style="margin-top:16px">
+              <h2>🧾 票单分布 <span class="tag" id="distTag">加载中…</span></h2>
+              <div id="distBody"><div class="note">读取当前推荐注的组合分布统计…</div></div>
+            </div>
+
+            <!-- 卡 2：前置注册（hypothesis.load_registry + patterns_runtime 快照 prereg） -->
+            <div class="card" id="preregCard" style="margin-top:16px">
+              <h2>📋 前置注册 <span class="tag" id="preregTag">加载中…</span></h2>
+              <div id="preregBody"><div class="note">读取已登记实验的判定状态…</div></div>
+            </div>
+
+            <!-- 卡 3：ML 诊断（ml_model.diagnose_ml_channels） -->
+            <div class="card" id="mlDiagCard" style="margin-top:16px">
+              <h2>🤖 ML 诊断 <span class="tag" id="mlDiagTag">未运行</span></h2>
+              <div class="eval-actions">
+                <button id="btnMlDiag" onclick="runMlDiagnosis(true)">运行 ML 诊断（约 10~30s）</button>
+                <span class="hint-inline">置换重要性 + 联合打乱标签零分布；判定 ML 通道是否可信</span>
+              </div>
+              <div id="mlDiagBody"><div class="note">尚未诊断。真实彩票数据上 trusted=False 是预期结论。</div></div>
+            </div>
+
+            <!-- 卡 4：两套样本并排（replay.samples_side_by_side，mixable=False，禁止相加） -->
+            <div class="card" id="samplesCard" style="margin-top:16px">
+              <h2>📐 样本并排 <span class="tag" id="samplesTag">加载中…</span></h2>
+              <div id="samplesBody"><div class="note">读取真实交战样本与离线回放样本…</div></div>
+            </div>
           </div>
 
           <!-- 累计对照 -->
@@ -588,6 +620,6 @@
 </div>
 
 <div id="toast"></div>
-<script src="/static/app.js?v=20261018.4"></script>
+<script src="/static/app.js?v=20261018.5"></script>
 </body>
 </html>

@@ -590,3 +590,46 @@ footer { color: var(--muted); font-size: 12px; text-align: center; margin-top: 2
 .era-switch button { font-size: 11px; padding: 2px 8px; }
 .era-switch button.on { background: var(--gold); color: #1a1408; border-color: var(--gold); font-weight: 700; }
 .rg-table th { max-width: 78px; }
+
+/* ==========================================================================
+   V10-10：通道口径徽标 + 三卡（票单分布 / 前置注册 / ML 诊断）+ 样本并排
+   ========================================================================== */
+
+/* 本期推荐的通道口径徽标：哪些族启用 + LLM 能否出号 */
+.channel-badges { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 2px; }
+.ch-badge {
+  font-size: 11px; padding: 2px 8px; border-radius: 10px;
+  border: 1px solid var(--border); color: var(--muted); white-space: nowrap;
+}
+.ch-badge.on { color: var(--green); border-color: var(--green); }
+.ch-badge.off { color: var(--muted); opacity: .65; text-decoration: line-through; }
+.ch-badge.pick { color: var(--purple); border-color: var(--purple); font-weight: 700; }
+.ch-badge.nopick { color: var(--muted); border-color: var(--border); }
+.ch-badge.muted { opacity: .7; }
+
+/* 三卡内的小指标块 */
+.v10-metrics { display: flex; flex-wrap: wrap; gap: 10px; margin: 8px 0; }
+.v10-metric {
+  flex: 1 1 130px; min-width: 120px; padding: 8px 10px;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--panel2, transparent);
+}
+.v10-metric .k { font-size: 11px; color: var(--muted); }
+.v10-metric .v { font-size: 18px; font-weight: 700; margin: 2px 0; }
+.v10-metric .sub { font-size: 10.5px; color: var(--muted); }
+
+/* 诚实边界提示条：不可省略（改变分布不改变 EV / trusted=False 不是故障） */
+.v10-honesty {
+  margin: 8px 0; padding: 8px 10px; border-radius: 8px;
+  border-left: 3px solid var(--gold); background: rgba(212, 175, 55, .08);
+  font-size: 11.5px; line-height: 1.6; color: var(--text);
+}
+.v10-honesty b { color: var(--gold); }
+
+/* 前置注册 / 样本并排表格 */
+.v10-table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+.v10-table th, .v10-table td { padding: 4px 6px; border-bottom: 1px solid var(--border); text-align: left; }
+.v10-table th { color: var(--muted); font-weight: 600; }
+.v10-reason { color: var(--muted); font-size: 11px; }
+.v10-side { flex: 1 1 240px; min-width: 220px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; }
+.v10-sides { display: flex; flex-wrap: wrap; gap: 10px; margin: 8px 0; }
+.v10-nomix { color: var(--muted); font-size: 11px; font-style: italic; }
