@@ -499,6 +499,13 @@ def compare_methods(results: Sequence[Dict], baseline_method: str = "uniform",
     * 红球：逐期配对的 **Wilcoxon 符号秩检验**（双侧）
     * 蓝球：**McNemar** 精确检验（双侧）
     * 两路证据用 Fisher 合并为一个 p 值
+
+    **A/B 是双向的，判据必须双侧（V10-14 / D-1）**：``p_value`` /
+    ``p_adjusted`` 在本函数里**天然是双侧**（Wilcoxon 与 McNemar 都是双侧），
+    并额外以 ``p_two_sided`` / ``p_adjusted_two_sided`` 显式命名供审计。
+    不要改回 ``rigor.strategy_significance`` 的单侧 ``adjusted_p``：那是
+    「策略是否显著更优」的单侧口径，当某方法**显著更差**时它趋于 1.0，
+    会让下面 ``verdict`` 的「显著更差」分支变成永不可达的死代码。
     * 多重检验：对**整组**配对 p 值做 Bonferroni 与 BH(FDR) 校正
       （复用 ``rigor.bonferroni`` / ``rigor.benjamini_hochberg``；
       ``rigor.strategy_significance_multi`` 用于红球主口径的校正交叉校验）
@@ -600,6 +607,11 @@ def compare_methods(results: Sequence[Dict], baseline_method: str = "uniform",
             "p_adjusted": None,
             "p_bonferroni": None,
             "p_bh": None,
+            # V10-14 / D-1：显式双侧别名（与 p_value / p_adjusted 同值——
+            # 因为本函数的检验本来就是双侧的；具名是为了让审计一眼看出口径，
+            # 也防止将来有人把它换成 rigor 的单侧 adjusted_p）
+            "p_two_sided": p,
+            "p_adjusted_two_sided": None,
             "better": bool(delta_red > 0 or (delta_red == 0 and delta_blue > 0)),
             "red": wil,
             "blue": mcn,
@@ -624,6 +636,7 @@ def compare_methods(results: Sequence[Dict], baseline_method: str = "uniform",
             # 采用 BH（更贴合「在 K 个候选里找规律」的 FDR 口径）；同时保留
             # Bonferroni 供复核，绝不静默吞掉更保守的那个。
             raw[i]["p_adjusted"] = float(min(pb, ph))
+            raw[i]["p_adjusted_two_sided"] = raw[i]["p_adjusted"]   # D-1：双侧即本口径
         out["n_significant_uncorrected"] = int(sum(1 for x in ps if x < alpha))
         out["n_significant_corrected"] = int(
             sum(1 for i in valid if raw[i]["p_value"] < alpha / max(1, len(ps))))
@@ -640,12 +653,16 @@ def compare_methods(results: Sequence[Dict], baseline_method: str = "uniform",
             r["verdict"] = "无显著差异"
             r["verdict_reason_zh"] = "两方法逐期结果完全一致，无可检验差异。"
             continue
-        p_adj = r["p_adjusted"] if r["p_adjusted"] is not None else r["p_value"]
+        # V10-14 / D-1：判决显式读**双侧**字段。曾用 rigor 的单侧 adjusted_p，
+        # 结果「显著更差」分支永不可达（策略更差时单侧 p → 1.0）。
+        p_adj = (r.get("p_adjusted_two_sided")
+                 if r.get("p_adjusted_two_sided") is not None
+                 else (r["p_adjusted"] if r["p_adjusted"] is not None else r["p_value"]))
         if p_adj < alpha:
             r["verdict"] = "显著更优" if r["better"] else "显著更差"
             r["verdict_reason_zh"] = (
-                f"{r['n_issues']} 期配对，多重检验校正后 p={p_adj:.4g}"
-                f"（未校正 p={r['p_value']:.4g}）。")
+                f"{r['n_issues']} 期配对，多重检验校正后双侧 p={p_adj:.4g}"
+                f"（未校正双侧 p={r['p_two_sided']:.4g}）。")
         else:
             r["verdict"] = "无显著差异"
             r["verdict_reason_zh"] = (

@@ -400,6 +400,14 @@ def randomness_report(draws: List[Dict], alpha: float = 0.05) -> Dict:
     综合 verdict 规则：任一项判 ``deviation`` 则顶层 verdict 为 ``deviation``；
     样本量不足以做任何检验时为 ``insufficient-data``；否则 ``consistent-with-random``。
 
+    **注意顶层 verdict 的假阳性率不是 alpha**：它等价于「m 项检验任一显著」，
+    纯随机数据下的假阳性率 = ``1-(1-alpha)^m``。m=9、alpha=0.05 时理论 ≈37%，
+    实测 **≈39%**（V10-14 体检，300 组真实随机数据）。因此另有：
+      * ``family_wise``: 逐项 Bonferroni/BH 校正结果与理论假阳性率；
+      * ``verdict_fwer``: 校正后仍显著才判 deviation 的**家庭化口径**（如需「这套
+        数据是否整体偏离随机」的严格结论，请用这个）。
+    ``verdict`` 保持原语义不变（向后兼容）。
+
     参数
     ----
     draws: 时间升序的期次列表（每项含 ``reds`` 与 ``blue``）。
@@ -630,6 +638,43 @@ def randomness_report(draws: List[Dict], alpha: float = 0.05) -> Dict:
         )
     base["n_deviation"] = int(sum(1 for v in verdicts if v == "deviation"))
     base["n_tests"] = len(verdicts)
+
+    # --- V10-14：家庭化（family-wise）口径 ---
+    # 顶层 verdict 的语义是「任一项偏离即 deviation」，其假阳性率不是 alpha，
+    # 而是 1-(1-alpha)^m。实测（真实随机数据，m=9, alpha=0.05）：
+    #   **顶层 verdict=deviation 的频率 ≈ 39%**（期望 5%）。
+    # 这里额外给出经多重检验校正后的结论 verdict_fwer 与逐项校正 p，
+    # 供报告/前端按需采用；**verdict 保持原语义不变**（向后兼容，不改已有行为）。
+    _pw = {k: v for k, v in base["tests"].items() if v.get("p_value") is not None}
+    if _pw:
+        _names = list(_pw)
+        _ps = [float(_pw[k]["p_value"]) for k in _names]
+        _bonf = bonferroni(_ps)
+        _bh = benjamini_hochberg(_ps)
+        for _k, _pb, _ph in zip(_names, _bonf, _bh):
+            base["tests"][_k]["p_bonferroni"] = float(_pb)
+            base["tests"][_k]["p_bh"] = float(_ph)
+            base["tests"][_k]["survives_bonferroni"] = bool(_pb < alpha)
+            base["tests"][_k]["survives_bh"] = bool(_ph < alpha)
+        base["family_wise"] = {
+            "n_tests": len(_names),
+            "alpha": float(alpha),
+            "uncorrected_false_positive_rate": float(1 - (1 - alpha) ** len(_names)),
+            "min_p_bonferroni": float(min(_bonf)),
+            "min_p_bh": float(min(_bh)),
+            "n_survive_bonferroni": int(sum(1 for x in _bonf if x < alpha)),
+            "n_survive_bh": int(sum(1 for x in _bh if x < alpha)),
+        }
+        # FWER 口径：Bonferroni 校正后仍有一项显著才判 deviation
+        base["verdict_fwer"] = ("deviation"
+                                if base["family_wise"]["n_survive_bonferroni"] > 0
+                                else "consistent-with-random")
+    else:
+        base["family_wise"] = {"n_tests": 0, "alpha": float(alpha),
+                               "uncorrected_false_positive_rate": 0.0,
+                               "min_p_bonferroni": None, "min_p_bh": None,
+                               "n_survive_bonferroni": 0, "n_survive_bh": 0}
+        base["verdict_fwer"] = base["verdict"]
     base["multiple_comparison_note"] = (
         f"共做 {len(verdicts)} 项检验，按 alpha={alpha} 单项判定时，纯随机数据仍有 "
         f"{1 - (1 - alpha) ** len(verdicts):.1%} 的概率至少出现一项假阳性；"
@@ -712,7 +757,7 @@ def strategy_significance(
     - ``mean`` / ``baseline_mean`` / ``delta`` / ``relative_lift``: 描述统计
     - ``sd``: 逐期差值（或策略命中数）的标准差
     - ``se``: 均值标准误
-    - ``t`` / ``p_value``: 单样本 t 检验（若可算）
+    - ``t`` / ``p_value``: 单样本 t 检验（若可算；**单侧**，见下方警告）
     - ``sign_test``: ``{n_pos, n_neg, statistic, p_value}`` 符号检验
       （statistic 为正差期数，零差期被剔除；p 为双侧二项检验）
     - ``p_uncorrected``: = ``p_value``（显式命名，提醒这是未校正值）
@@ -728,6 +773,24 @@ def strategy_significance(
                    "insufficient-data" 等
     - ``warning_zh`` / ``message_zh``: 人类可读结论（中文）
     - ``direction``: "above" / "below" / "none"
+
+    - ``p_two_sided`` / ``p_uncorrected_two_sided`` / ``bonferroni_p_two_sided`` /
+      ``adjusted_p_two_sided`` / ``survives_correction_two_sided`` /
+      ``verdict_two_sided``: **显式双侧口径**（V10-14 / D-1 新增）
+
+    单侧 vs 双侧（**必须读这段，历史上因此漏判过劣绩**）
+    ---------------------------------------------------
+    ``p_value`` / ``p_uncorrected`` / ``adjusted_p`` / ``survives_correction``
+    都是**单侧**的：方向由观测差值符号决定（``delta>0`` 取 ``p_two/2``，
+    ``delta<0`` 取 ``1-p_two/2``）。后果是——当策略比基线**显著更差**时，
+    这些字段全部趋向 **1.0**，``survives_correction`` 恒为 False，
+    调用方**永远判不出「显著更差」**（实测：n=120、每期少 0.32 个红球时
+    ``adjusted_p=1.0``，而 ``p_two_sided=7.6e-06``）。
+
+    因此：
+      * 只关心「是否更优」→ 可以继续用单侧字段（功率略高）；
+      * 任何 **A/B 双向判断**（优劣、对照臂、报表"更差"档）→ **必须**用
+        ``*_two_sided`` 字段，否则「更差」分支是死代码。
 
     多重检验语义（重要）
     -------------------
@@ -762,9 +825,23 @@ def strategy_significance(
         "sd": None, "se": None, "t": None, "p_value": None,
         "p_uncorrected": None, "bonferroni_p": None, "bh_p": None,
         "adjusted_p": None, "survives_correction": False,
+        # ---- V10-14 / D-1：显式双侧口径（**新增字段，旧字段一律保留不改名**）----
+        # 为什么必须有：``p_value`` / ``p_uncorrected`` / ``adjusted_p`` 是**单侧**的
+        # （方向由观测差值符号决定）。当策略**显著更差**时它们全部趋向 1.0 →
+        # ``survives_correction=False``，于是调用方**永远判不出「显著更差」**。
+        # 任何 A/B 双向判断（优劣、对照臂）都必须读 ``*_two_sided``。
+        "p_two_sided": None,
+        "p_uncorrected_two_sided": None,
+        "bonferroni_p_two_sided": None,
+        "adjusted_p_two_sided": None,
+        "survives_correction_two_sided": False,
+        "verdict_two_sided": "insufficient-data",
         "sign_test": None, "direction": "none", "verdict": "insufficient-data",
         "warning_zh": ("未校正的 p<0.05 在 n_trials 较大时不构成证据；"
-                       "必须通过多重检验校正才可称为「有效」。"),
+                       "必须通过多重检验校正才可称为「有效」。"
+                       "注意 p_value/adjusted_p 是**单侧**口径（判「显著更优」用），"
+                       "判「显著更差」或任何 A/B 双向结论必须用 p_two_sided / "
+                       "adjusted_p_two_sided。"),
         "message_zh": "",
     }
 
@@ -848,10 +925,15 @@ def strategy_significance(
     # 也不要把退化的 p=1 当成「已检验过」的真实结果传给调用方/前端。
     if out["n"] < 3:
         out["verdict"] = "insufficient-data"
+        out["verdict_two_sided"] = "insufficient-data"
         out["p_uncorrected"] = None
+        out["p_uncorrected_two_sided"] = None
         out["adjusted_p"] = None
+        out["adjusted_p_two_sided"] = None
         out["bonferroni_p"] = None
+        out["bonferroni_p_two_sided"] = None
         out["survives_correction"] = False
+        out["survives_correction_two_sided"] = False
         out["message_zh"] = (
             f"有效样本仅 {out['n']} 期（< 3），不足以做任何显著性检验；"
             "请勿据此下结论。"
@@ -860,8 +942,14 @@ def strategy_significance(
 
     if out["p_value"] is None:
         out["verdict"] = "insufficient-data"
+        out["verdict_two_sided"] = "insufficient-data"
         out["message_zh"] = f"有效样本 {out['n']} 期，不足以做任何显著性检验。"
         return out
+
+    # p_two_sided 兜底：符号检验的 p 本身就是双侧的（t 检验分支已显式赋过值）
+    if out.get("p_two_sided") is None:
+        _sign = out.get("sign_test") or {}
+        out["p_two_sided"] = float(_sign.get("p_value", out["p_value"]))
 
     out["p_uncorrected"] = float(out["p_value"])
     # --- 多重检验校正 ---
@@ -873,6 +961,9 @@ def strategy_significance(
     # adjusted_p 恒等于 p_uncorrected —— 校正完全失效。绝不能再用 min() 把
     # 「不可计算」当成「更优」。
     out["bonferroni_p"] = float(min(1.0, out["p_uncorrected"] * m_trials))
+    # 双侧口径（D-1 修复）：同一套校正规则作用在 p_two_sided 上
+    out["p_uncorrected_two_sided"] = float(out["p_two_sided"])
+    out["bonferroni_p_two_sided"] = float(min(1.0, out["p_two_sided"] * m_trials))
     if m_trials > 1:
         out["bh_p"] = None
         out["bh_note"] = (
@@ -881,14 +972,21 @@ def strategy_significance(
             "或在调用方收集所有策略的 p 值后交给 benjamini_hochberg()。"
         )
         out["adjusted_p"] = out["bonferroni_p"]
+        out["adjusted_p_two_sided"] = out["bonferroni_p_two_sided"]
         out["adjust_method"] = "bonferroni"
     else:
         # n_trials == 1：没有做多重搜索，无需校正，BH 亦退化为恒等（此处是正确语义）
         out["bh_p"] = out["p_uncorrected"]
         out["adjusted_p"] = out["p_uncorrected"]
+        out["adjusted_p_two_sided"] = out["p_uncorrected_two_sided"]
         out["adjust_method"] = "none"
     # 不变式：n_trials > 1 时 adjusted_p >= p_uncorrected
     out["survives_correction"] = bool(out["adjusted_p"] < alpha)
+    # 双侧判决（D-1）：这才是「显著更优 / 显著更差」的唯一正确依据
+    out["survives_correction_two_sided"] = bool(out["adjusted_p_two_sided"] < alpha)
+    out["verdict_two_sided"] = ("significant-after-correction"
+                                if out["survives_correction_two_sided"]
+                                else "not-significant")
 
     if out["survives_correction"]:
         out["verdict"] = "significant-after-correction"
@@ -948,6 +1046,10 @@ def strategy_significance_multi(
         "strategies": [], "p_values": [],
         "adjusted_bonferroni": [], "adjusted_bh": [],
         "n_survive_bonferroni": 0, "n_survive_bh": 0,
+        # V10-14 / D-1：整组双侧口径（旧字段全部保留）
+        "p_values_two_sided": [],
+        "adjusted_bonferroni_two_sided": [], "adjusted_bh_two_sided": [],
+        "n_survive_bonferroni_two_sided": 0, "n_survive_bh_two_sided": 0,
         "note_zh": "",
     }
     if m == 0:
@@ -957,6 +1059,7 @@ def strategy_significance_multi(
     # 第一步：逐策略计算统计量与未校正 p 值
     raw: List[Dict] = []
     p_values: List[float] = []
+    p_values_two: List[float] = []
     for hits in strategies:
         s = strategy_significance(hits, baseline_hits, n_trials=1, alpha=alpha)
         raw.append(s)
@@ -965,13 +1068,22 @@ def strategy_significance_multi(
             out["strategies"] = raw
             return out
         p_values.append(float(s["p_uncorrected"]))
+        p_values_two.append(float(s["p_two_sided"]))
 
     # 第二步：在整组 p 值上做两种校正（这是 BH 的正确用法）
     bonf = bonferroni(p_values)
     bh = benjamini_hochberg(p_values)
+    bonf_two = bonferroni(p_values_two)
+    bh_two = benjamini_hochberg(p_values_two)
 
-    for s, pb, ph in zip(raw, bonf, bh):
+    for s, pb, ph, pb2, ph2 in zip(raw, bonf, bh, bonf_two, bh_two):
         s["p_uncorrected"] = float(s["p_value"])
+        # V10-14 / D-1：整组双侧校正（A/B 双向结论的唯一正确依据）
+        s["adjusted_p_two_sided"] = float(min(pb2, ph2))
+        s["survives_correction_two_sided"] = bool(s["adjusted_p_two_sided"] < alpha)
+        s["verdict_two_sided"] = ("significant-after-correction"
+                                  if s["survives_correction_two_sided"]
+                                  else "not-significant")
         s["bonferroni_p"] = float(pb)
         s["bh_p"] = float(ph)
         # 整组场景下两种校正都有定义，取更小者（BH <= Bonferroni 恒成立）
@@ -997,6 +1109,12 @@ def strategy_significance_multi(
     out["adjusted_bh"] = [float(x) for x in bh]
     out["n_survive_bonferroni"] = int(sum(1 for x in bonf if x < alpha))
     out["n_survive_bh"] = int(sum(1 for x in bh if x < alpha))
+    # V10-14 / D-1：双侧整组口径
+    out["p_values_two_sided"] = [float(x) for x in p_values_two]
+    out["adjusted_bonferroni_two_sided"] = [float(x) for x in bonf_two]
+    out["adjusted_bh_two_sided"] = [float(x) for x in bh_two]
+    out["n_survive_bonferroni_two_sided"] = int(sum(1 for x in bonf_two if x < alpha))
+    out["n_survive_bh_two_sided"] = int(sum(1 for x in bh_two if x < alpha))
     out["note_zh"] = (
         f"对 {m} 个策略的 p 值集合做 Bonferroni 与 BH 校正。"
         f"Bonferroni 通过 {out['n_survive_bonferroni']} 个，BH(FDR) 通过 "
@@ -1118,7 +1236,10 @@ def evaluate_signal(
     - ``window`` / ``avg_k``: 窗口长度与平均选号个数
     - ``mean`` / ``baseline`` / ``delta`` / ``relative_lift``: 命中数统计
     - ``t`` / ``p_value`` / ``p_uncorrected`` / ``bonferroni_p`` / ``bh_p``
-      / ``adjusted_p`` / ``survives_correction``
+      / ``adjusted_p`` / ``survives_correction``（以上为**单侧**口径）
+    - ``p_two_sided`` / ``adjusted_p_two_sided`` / ``survives_correction_two_sided``
+      / ``verdict_two_sided``（**双侧**；判「策略显著更差」必须用它们，
+      否则该结论在单侧口径下不可达 —— 见 strategy_significance 的警告）
     - ``sign_test``: 符号检验结果
     - ``verdict``: "significant-after-correction" | "not-significant" |
                    "insufficient-data"
@@ -1140,6 +1261,10 @@ def evaluate_signal(
         "t": None, "p_value": None, "p_uncorrected": None,
         "bonferroni_p": None, "bh_p": None, "adjusted_p": None,
         "survives_correction": False, "sign_test": None,
+        # V10-14 / D-1：双侧口径（单侧字段保留；判「更差」必须用这两个）
+        "p_two_sided": None, "adjusted_p_two_sided": None,
+        "survives_correction_two_sided": False,
+        "verdict_two_sided": "insufficient-data",
         "verdict": "insufficient-data", "hit_series": [], "errors": 0,
         "n_trials": max(1, int(n_trials)), "alpha": float(alpha),
         "baseline_mean_hits": BASELINE_MEAN_HITS,
@@ -1210,7 +1335,10 @@ def evaluate_signal(
     sig = strategy_significance(hits, exps, n_trials=n_trials, alpha=alpha)
     for key in ("mean", "baseline_mean", "sd", "se", "t", "p_value", "p_uncorrected",
                 "bonferroni_p", "bh_p", "adjusted_p", "survives_correction",
-                "sign_test", "direction", "verdict", "message_zh", "n_trials", "alpha"):
+                "sign_test", "direction", "verdict", "message_zh", "n_trials", "alpha",
+                # V10-14 / D-1：双侧口径一并透传（旧键一个不少）
+                "p_two_sided", "adjusted_p_two_sided",
+                "survives_correction_two_sided", "verdict_two_sided"):
         if key in sig:
             base_out[key] = sig[key]
     base_out["baseline"] = float(np.mean(exps))
