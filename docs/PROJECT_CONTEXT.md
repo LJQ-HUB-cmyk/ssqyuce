@@ -8,15 +8,15 @@
 
 ## 2. 当前发布状态
 
-- 发布版本：`v2.1.0`
-- 构建标识：`2026-10-V5`
-- 当前主分支提交：见 `git log -1`（V5 自进化系统提交）
+- 发布版本：`v2.2.0`
+- 构建标识：`2026-10-V6`
+- 当前主分支提交：见 `git log -1`（V6 阶段有效性 + 多维度规律 + LLM 规律工坊提交）
 - GitHub：`https://github.com/jiam9069/ssqyuce`
 - **部署形态：单节点**（Docker Compose，容器 `ssq-predictor`，端口 `18000`）
 
   | 节点 | 路径 / 入口 | 状态（2026-10-15 实测） |
   |---|---|---|
-  | **本机（bero_de）** | `/root/DSH/应用/ssqyuce` | ✅ **v2.1.0 / 2026-10-V5**，容器 healthy |
+  | **本机（bero_de）** | `/root/DSH/应用/ssqyuce` | ✅ **v2.2.0 / 2026-10-V6**，容器 healthy |
   | 公网入口 | `https://ssq.ff88.de` | ✅ 同版本，`/api/info` 已核验 |
 
   除本机外**没有其他部署节点**。
@@ -34,6 +34,10 @@
   > ZT.JP.Plus 上没有 ssq，R71s.AI 与 BF.US 也已不存在。
   > **当前唯一的数据副本就是本机 `/root/DSH/应用/ssqyuce/data/`，因此它的备份是唯一的安全网。**
 
+- V6（2026-10-17）追加：新增 `GET /api/regime/overview`、`POST /api/regime/refresh`、
+  `GET /api/discovery/families`、`GET /api/discovery/scan`、`GET/POST /api/llm_lab/{latest,run,register}`、
+  `GET /api/backtest/regime`，前端新增「评估报告 → ⏳ 规律时效」工作台；
+  `?v=` → `20261017.1`（app.js / style.css 同步）。诊断依据见 `docs/V6_REGIME_DIAGNOSIS.md`。
 - 最近验证（2026-10-15，本机）：容器 `healthy`，`/api/info` 返回 v2.1.0 / 2026-10-V5；
   V4 三个端点 + V5 三个端点（`/api/battle/report`、`/api/evolution/status`、`/api/evolution/run`）均 200；
   公网 `https://ssq.ff88.de` 同样返回 v2.1.0，`/static/app.js?v=20261015.2` 返回 `x-cache-status: MISS`（缓存已换新键）。

@@ -292,11 +292,16 @@ def test_ab_structural_delta_is_bounded_and_finite():
     from lottery import evolution as _E
     draws = [{"issue": str(2026000 + i), "reds": [((i * 7 + j) % 33) + 1 for j in range(6)],
               "blue": (i % 16) + 1} for i in range(140)]
-    d_red, d_blue, n = _E._ab_structural_delta(
+    # V6：返回值增加第 4 项（Wilcoxon 检验明细）。
+    # 背景：V5 的实现用「同一候选池的前 n 注」当两个臂，结构规则只改变顺序，
+    # 平均值上几乎恒为 0 —— 结构类假说注定「无显著差异」，是评估口径的伪影。
+    # V6 改为两臂独立采样（各 n_tickets 注），因此 Δ 是真实可检验的随机变量。
+    d_red, d_blue, n, detail = _E._ab_structural_delta(
         draws, 100, [{"rule": "keep_last"}], [4, 9], 1, 42)
     assert math.isfinite(d_red) and math.isfinite(d_blue)
     assert -6.0 <= d_red <= 6.0 and -1.0 <= d_blue <= 1.0
     assert n >= 0
+    assert isinstance(detail, dict)
 
 
 def test_predict_with_evolution_reports_empty_registry_honestly(monkeypatch, tmp_path):

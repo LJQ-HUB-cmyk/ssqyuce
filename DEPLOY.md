@@ -78,7 +78,9 @@ curl http://<VPS_IP>:18000/api/health
 > 的版本号（缓存键含 query，改版本号即换新键），否则用户拿到的仍是旧前端。
 > 只有 `index.html` 本身不缓存，所以只改版本号、无需清入口缓存。
 >
-> 当前版本：`?v=20261015.2`（V5 自进化交付，`APP_VERSION=2.1.0` / `APP_BUILD=2026-10-V5`）。
+> 当前版本：`?v=20261017.1`（V6 阶段有效性交付，`APP_VERSION=2.2.0` / `APP_BUILD=2026-10-V6`）。
+> V6 新增前端工作台「评估报告 → ⏳ 规律时效」（app.js + index.html + style.css 均有实质改动，
+> 三处必须同时升 `?v=`）。
 
 ## 四·补、V4 诚实口径端点的部署验证
 
@@ -99,7 +101,7 @@ curl -s http://127.0.0.1:18000/api/portfolio/expected-value
 公网入口另需确认缓存已换新键（应返回 `x-cache-status: MISS`）：
 
 ```bash
-curl -sI "https://ssq.ff88.de/static/app.js?v=20261015.1" | grep -i x-cache-status
+curl -sI "https://ssq.ff88.de/static/app.js?v=20261017.1" | grep -i x-cache-status
 ```
 
 
@@ -297,3 +299,42 @@ grep -rIl "LOTT_LLM_API_KEY\|ghp_" $(git ls-files) 2>/dev/null   # 应为空
 > 的细粒度令牌，并吊销旧令牌。
 
 升级本机即完成全量部署（当前为单节点，见第六节）。
+## 四·补三、V6 阶段有效性端点的部署验证
+
+V6 新增 8 个端点，全部为**只读或短耗时**（`/api/llm_lab/run` 除外，它要调三轮大模型）：
+
+```bash
+# 1) 维度表（20 族 91 组参数，毫秒级）
+curl -s http://127.0.0.1:18000/api/discovery/families | head -c 160
+# 期望：{"ok":true,"families":[...],"n_families":20,"n_combos":91,...}
+
+# 2) 多维度 as-of 扫描（约 5~15 秒；首次冷启动略慢）
+curl -s "http://127.0.0.1:18000/api/discovery/scan?top=10" | head -c 260
+# 期望：含 "n_tested"、"expected_false_positives"、"verdict"（纯随机下预期 4~5 个假阳性）
+
+# 3) 阶段时效总览（毫秒级；未标注过时 items 里 regime_status 为 null）
+curl -s http://127.0.0.1:18000/api/regime/overview | head -c 200
+
+# 4) 重算阶段时效（写 data/hypotheses.json，约 5~20 秒）
+curl -s -X POST http://127.0.0.1:18000/api/regime/refresh
+# 期望：{"ok":true,"annotated":N,"no_dimension":M,"total":N+M}
+
+# 5) 检索式核验（任意维度 + 档位）
+curl -s "http://127.0.0.1:18000/api/backtest/regime?key=hot&params=%7B%22window%22%3A30%2C%22k%22%3A6%7D" | head -c 240
+
+# 6) LLM 规律工坊最近结果 / 注册
+curl -s http://127.0.0.1:18000/api/llm_lab/latest | head -c 200
+```
+
+⚠️ `/api/llm_lab/run` 会调用大模型三轮（提规律 → 自我质疑 → 修订），
+推理型模型单轮 30~60 秒，**整轮 1~8 分钟**。入口节点 `proxy_read_timeout` 为 300 秒，
+从公网触发可能 504 —— 建议在容器内网侧触发，或直接等每期调度器跑完再在页面看结果：
+
+```bash
+docker exec ssq-predictor curl -s -X POST \
+  "http://127.0.0.1:18000/api/llm_lab/run?rounds=3&use_llm=1&persist=1" | head -c 400
+```
+
+**已知边界（不是故障）**：若网关上的推理型模型本轮不可用，`llm_lab` 会返回
+`{"ok":true,"llm_used":false,"error":"第 1 轮失败: ..."}`，并照常给出维度扫描结果。
+这是刻意的降级设计——**绝不因为大模型挂了就把扫描结论伪装成模型结论**。

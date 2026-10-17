@@ -1297,6 +1297,8 @@ function setEvalSub(name) {
   $$(".sub-panel").forEach(p => p.classList.toggle("hidden", p.id !== "evalSub-" + name));
   // V5：进入「实战战绩」子页时拉一次进化状态（快接口），重操作回放留给显式点击
   if (name === "evolution" && !_evoStatus) loadEvolutionStatus(false);
+  // V6：进入「规律时效」子页时自动加载阶段画像（只读快接口，重算仍需显式点击）
+  if (name === "regime" && !_rgOverview) loadRegimeOverview(false);
   // 面板由隐藏变为可见时重算图表尺寸（隐藏容器内初始化的图表宽高为 0）
   requestAnimationFrame(() => Object.values(charts).forEach(c => {
     try { if (c && c.resize) c.resize(); } catch (_) {}
@@ -2929,3 +2931,393 @@ window.addEventListener("hashchange", () => {
 });
 
 loadAll();
+
+// ==================== V6：规律时效（阶段有效性）+ 多维度发现 + LLM 规律工坊 ====================
+
+let _rgOverview = null;
+let _rgFamilies = null;
+let _rgBusy = false;
+
+/** 「更多 → 规律时效」入口：切到评估页并选中对应子页。 */
+function openRegimeTab() {
+  switchTab("eval");
+  setEvalSub("regime");
+  if (!_rgOverview) loadRegimeOverview(false);
+}
+
+const RG_STATUS_ORDER = ["persistent", "emerging", "fading", "stale", "flipped",
+  "reversed", "noise", "no_dimension", "insufficient", "error", "unannotated"];
+const RG_STATUS_COLOR = {
+  persistent: "var(--green)", emerging: "var(--gold)", fading: "var(--yellow, #d29922)",
+  stale: "var(--red)", flipped: "var(--red)", reversed: "var(--muted)",
+  noise: "var(--muted)", no_dimension: "var(--muted)", insufficient: "var(--muted)",
+  error: "var(--red)", unannotated: "var(--muted)",
+};
+
+function rgEraCell(era, status) {
+  // 单元格：年份段 + 效应 + 校正后 p（显著时才着色）
+  const p = era.p_adjusted;
+  const sig = (p !== null && p !== undefined && p < 0.05);
+  const d = era.delta;
+  const cls = sig ? (d >= 0 ? "pos" : "neg") : "flat";
+  const dtxt = (d === null || d === undefined) ? "—" : (d >= 0 ? "+" : "") + Number(d).toFixed(3);
+  return '<td class="' + cls + '" title="' + escHtml((era.note_zh || "")) + '">' +
+    '<div class="rg-cell">' + (sig ? "★ " : "") + dtxt + '</div>' +
+    '<div class="rg-cell-sub">' + (p === null || p === undefined ? "—" : "p=" + Number(p).toFixed(3)) + '</div>' +
+    '</td>';
+}
+
+function renderRegimeOverview(r) {
+  const el = $("#rgOverviewBody");
+  const tag = $("#rgOverviewTag");
+  if (!el) return;
+  if (!r || r.ok === false) {
+    if (tag) tag.textContent = "加载失败";
+    el.innerHTML = '<div class="track-note warn">⚠️ ' + escHtml((r && r.error) || "读取失败") +
+      '。<b>此处不代表没有规律</b>。</div>';
+    return;
+  }
+  const counts = r.status_counts || {};
+  const items = r.items || [];
+  const eras = r.eras || [];
+  const legend = r.status_legend || {};
+  if (tag) tag.textContent = "共 " + items.length + " 条 · " + eras.length + " 个阶段";
+
+  let metrics = '<div class="track-metrics">';
+  metrics += '<div class="track-item"><div class="k">阶段数</div><div class="v">' + eras.length +
+    '<span class="sub">' + escHtml((eras[0] && eras[0].name) || "") + " … " +
+    escHtml((eras[eras.length - 1] && eras[eras.length - 1].name) || "") + '</div></div>';
+  for (const st of RG_STATUS_ORDER) {
+    if (!counts[st]) continue;
+    metrics += '<div class="track-item"><div class="k">' + escHtml(legend[st] || st) +
+      '</div><div class="v" style="color:' + (RG_STATUS_COLOR[st] || "inherit") + '">' +
+      counts[st] + '</div></div>';
+  }
+  metrics += '</div>';
+
+  let banner = '<div class="multi-correct-banner' + ((counts.stale || counts.flipped) ? ' warn' : '') + '">' +
+    '<div class="mcb-main">用户问题「近期规律都不生效」的量化答案：' +
+    '<b style="color:var(--red)">' + (counts.stale || 0) + ' 条陈旧</b> · ' +
+    '<b style="color:var(--gold)">' + (counts.fading || 0) + ' 条衰减</b> · ' +
+    '<b style="color:var(--green)">' + (counts.persistent || 0) + ' 条持续</b></div>' +
+    '<div class="mcb-sub">判定口径：每阶段单独检验并做 BH 校正；「陈旧」= 最近一次显著距今超过 ' +
+    (r.stale_after_draws || 300) + ' 期；「衰减」= 上一阶段显著但最近阶段不再显著。' +
+    '阶段样本门槛 ' + (r.min_era_n || 60) + ' 期，近期加权窗口 ' + (r.recent_window || 150) + ' 期。</div>' +
+    '</div>';
+
+  let table = '<div class="scroll"><table class="battle-table rg-table"><thead><tr><th>规律</th><th>假说状态</th>';
+  for (const e of eras) table += '<th>' + escHtml(e.name) + '<div class="rg-th-sub">n=' + e.n + '</div></th>';
+  table += '<th>近期效应</th><th>状态判定</th></tr></thead><tbody>';
+  const sorted = items.slice().sort((a, b) => {
+    const ia = RG_STATUS_ORDER.indexOf(a.regime_status || "unannotated");
+    const ib = RG_STATUS_ORDER.indexOf(b.regime_status || "unannotated");
+    return ia - ib;
+  });
+  for (const it of sorted) {
+    const st = it.regime_status || "unannotated";
+    const rg = (it.regime || {});
+    table += '<tr><td title="' + escHtml(it.statement || "") + '">' + escHtml((it.statement || "").slice(0, 42)) +
+      '<div class="rg-cell-sub">' + escHtml(it.action_type || "") + '</div></td>' +
+      '<td class="flat">' + escHtml(it.status || "") + '</td>';
+    const erows = (it.eras || []);
+    if (erows.length) {
+      for (const e of erows) table += rgEraCell(e, st);
+      for (let i = erows.length; i < eras.length; i++) table += '<td class="flat">—</td>';
+    } else {
+      for (let i = 0; i < eras.length; i++) table += '<td class="flat"><span class="insufficient-txt">无维度</span></td>';
+    }
+    const eff = it.recent_effect;
+    table += '<td class="' + (eff === null || eff === undefined ? "flat" : (eff >= 0 ? "pos" : "neg")) + '">' +
+      (eff === null || eff === undefined ? "—" : (eff >= 0 ? "+" : "") + Number(eff).toFixed(3)) + '</td>' +
+      '<td style="text-align:left"><span class="rg-badge" style="border-color:' + (RG_STATUS_COLOR[st] || "var(--border)") +
+      ';color:' + (RG_STATUS_COLOR[st] || "inherit") + '">' + escHtml(it.regime_label || st) + '</span>' +
+      '<div class="rg-cell-sub">' + escHtml((it.regime_reason || "").slice(0, 90)) + '</div></td></tr>';
+  }
+  if (!sorted.length) table += '<tr><td colspan="' + (eras.length + 3) + '" class="flat">假说库为空：先跑一次「跑一轮进化」或「LLM 规律工坊」。</td></tr>';
+  table += '</tbody></table></div>';
+
+  el.innerHTML = metrics + banner + table +
+    '<div class="track-note">📖 单元格 = 该阶段效应（★ 表示 BH 校正后显著）；「无维度」= 该规律不是按维度表述的（结构类/权重类），' +
+    '它的效果由「实战战绩」子页的 A/B 验证给出。</div>' + '<div class="track-note">' + escHtml(r.note_zh || "") + '</div>';
+}
+
+async function loadRegimeOverview(manual) {
+  if (_rgBusy) { toast("正在计算中，请稍候"); return; }
+  _rgBusy = true;
+  setBusy("#btnRgLoad", "加载中…");
+  const tag = $("#rgOverviewTag");
+  if (tag) tag.textContent = "加载中…";
+  try {
+    const r = await api("/api/regime/overview");
+    _rgOverview = r;
+    renderRegimeOverview(r);
+    if (manual) toast("阶段画像已刷新");
+  } catch (e) {
+    renderRegimeOverview({ ok: false, error: e.message });
+  }
+  setFree("#btnRgLoad", "▶ 加载阶段画像（约 5~20 秒）");
+  _rgBusy = false;
+}
+
+async function refreshRegime() {
+  if (_rgBusy) { toast("正在计算中，请稍候"); return; }
+  if (!window.confirm("重算全部假说的阶段时效，会写回 data/hypotheses.json。\n预计 5~30 秒，确定继续？")) return;
+  _rgBusy = true;
+  setBusy("#btnRgRefresh", "重算中…");
+  try {
+    const r = await api("/api/regime/refresh", { method: "POST" });
+    toast("已标注 " + (r.annotated || 0) + " 条（无维度 " + (r.no_dimension || 0) + " 条）");
+    await loadRegimeOverview(false);
+  } catch (e) { toast("重算失败: " + e.message); }
+  setFree("#btnRgRefresh", "🔄 重算阶段时效（写库）");
+  _rgBusy = false;
+}
+
+/* ---------- 多维度发现 ---------- */
+
+function renderDiscovery(res) {
+  const el = $("#rgDiscoveryBody");
+  const tag = $("#rgDiscoveryTag");
+  if (!el) return;
+  if (!res || res.ok === false) {
+    if (tag) tag.textContent = "失败";
+    el.innerHTML = '<div class="track-note warn">⚠️ ' + escHtml((res && res.error) || "扫描失败") + '</div>';
+    return;
+  }
+  if (tag) tag.textContent = res.n_tested + " 组 · 校正后最优 p=" +
+    (res.best_quick_p_adjusted === null || res.best_quick_p_adjusted === undefined ? "—" :
+      Number(res.best_quick_p_adjusted).toFixed(3));
+  const sc = res.scan_summary || res;
+  let h = '<div class="multi-correct-banner' + ((res.status_count && (res.status_count.persistent || res.status_count.emerging)) ? ' warn' : '') + '">' +
+    '<div class="mcb-main">扫描 <b>' + (res.n_tested || 0) + '</b> 组维度×参数 · 纯随机预期假阳性约 <b>' +
+    Number(res.expected_false_positives || 0).toFixed(1) + '</b> 个 · 结论：' + escHtml(res.verdict || "") + '</div>' +
+    '<div class="mcb-sub">' + escHtml(res.note_zh || "") + '『阶段状态』是该维度在全历史上的阶段画像，不是出号建议。</div></div>';
+  h += '<div class="scroll"><table class="battle-table"><thead><tr>' +
+    '<th>维度</th><th>参数</th><th>n</th><th>均值</th><th>期望</th><th>差值</th><th>z</th>' +
+    '<th>p</th><th>BH校正p</th><th>阶段状态</th></tr></thead><tbody>';
+  for (const it of (res.items || [])) {
+    const q = it.quick || {};
+    const f = it.filter || {};
+    h += '<tr><td>' + escHtml(f.name_zh || f.key) + '<div class="rg-cell-sub">' + escHtml(f.target || "") + '</div></td>' +
+      '<td class="flat" style="text-align:left">' + escHtml(JSON.stringify(f.params || {})) + '</td>' +
+      '<td>' + (q.n || 0) + '</td><td>' + Number(q.mean || 0).toFixed(4) + '</td>' +
+      '<td class="flat">' + Number(q.expected || 0).toFixed(4) + '</td>' +
+      '<td class="' + (q.delta >= 0 ? "pos" : "neg") + '">' + (q.delta >= 0 ? "+" : "") + Number(q.delta || 0).toFixed(4) + '</td>' +
+      '<td>' + Number(q.z || 0).toFixed(2) + '</td>' +
+      '<td>' + (q.p === undefined ? "—" : Number(q.p).toFixed(4)) + '</td>' +
+      '<td>' + (q.p_adjusted === undefined || q.p_adjusted === null ? "—" : "<b>" + Number(q.p_adjusted).toFixed(3) + "</b>") + '</td>' +
+      '<td style="text-align:left"><span class="rg-badge" style="border-color:' + (RG_STATUS_COLOR[it.status] || "var(--border)") +
+      ';color:' + (RG_STATUS_COLOR[it.status] || "inherit") + '">' + escHtml(it.status_zh || it.status || "") + '</span>' +
+      '<div class="rg-cell-sub">' + escHtml((it.reason_zh || "").slice(0, 80)) + '</div></td></tr>';
+  }
+  h += '</tbody></table></div>';
+  el.innerHTML = h;
+}
+
+async function runDiscoveryScan() {
+  if (_rgBusy) { toast("正在计算中，请稍候"); return; }
+  _rgBusy = true;
+  setBusy("#btnDiscScan", "扫描中…");
+  const tag = $("#rgDiscoveryTag");
+  if (tag) tag.textContent = "扫描中…";
+  try {
+    const r = await api("/api/discovery/scan?top=15&refresh=1");
+    renderDiscovery(r);
+    toast("扫描完成：" + (r.n_tested || 0) + " 组");
+  } catch (e) {
+    renderDiscovery({ ok: false, error: e.message });
+  }
+  setFree("#btnDiscScan", "🛰️ 扫描维度空间（约 5~30 秒）");
+  _rgBusy = false;
+}
+
+async function loadDiscoveryFamilies() {
+  const el = $("#rgFamiliesBody");
+  if (_rgFamilies) {
+    el.innerHTML = el.innerHTML ? "" : renderFamilies(_rgFamilies);
+    return;
+  }
+  try {
+    const r = await api("/api/discovery/families");
+    _rgFamilies = r;
+    el.innerHTML = renderFamilies(r);
+    fillProbeFamilies(r);
+  } catch (e) { toast("维度表加载失败: " + e.message); }
+}
+
+function renderFamilies(r) {
+  let h = '<div class="track-note">共 ' + (r.n_families || 0) + ' 个维度族、' + (r.n_combos || 0) + ' 组参数（这就是「可搜索的规律空间」）。</div>' +
+    '<div class="scroll"><table class="battle-table"><thead><tr><th>族</th><th>维度</th><th>定义</th><th>参数组数</th></tr></thead><tbody>';
+  for (const f of (r.families || [])) {
+    h += '<tr><td>' + escHtml(f.name_zh) + '</td><td class="flat" style="text-align:left">' + escHtml(f.dim_zh) +
+      '</td><td class="flat" style="text-align:left">' + escHtml(f.ratio) + '</td><td>' + f.n_param_sets + '</td></tr>';
+  }
+  return h + '</tbody></table></div>';
+}
+
+/* ---------- LLM 规律工坊 ---------- */
+
+const LAB_VERDICT_COLOR = {
+  support: "var(--green)", reject: "var(--red)", regime_only: "var(--gold)",
+  noise: "var(--muted)", unmappable: "var(--muted)", insufficient: "var(--muted)",
+};
+
+function renderLab(res) {
+  const el = $("#rgLabBody");
+  const tag = $("#rgLabTag");
+  if (!el) return;
+  if (!res || res.ok === false) {
+    if (tag) tag.textContent = "失败";
+    el.innerHTML = '<div class="track-note warn">⚠️ ' + escHtml((res && (res.detail || res.error)) || "失败") + '</div>';
+    return;
+  }
+  const claims = res.claims || [];
+  const counts = res.verdict_counts || res.summary || {};
+  if (tag) tag.textContent = claims.length + " 条 · LLM " + (res.llm_used ? "已参与" : "未参与");
+  let h = "";
+  if (res.error) h += '<div class="track-note warn">⚠️ ' + escHtml(res.error) + '</div>';
+  if (res.overall) h += '<div class="multi-correct-banner"><div class="mcb-main">模型总结</div><div class="mcb-sub">' +
+    escHtml(res.overall) + '</div></div>';
+  h += '<div class="track-metrics">';
+  for (const k of Object.keys(counts)) {
+    h += '<div class="track-item"><div class="k">' + escHtml(k) + '</div><div class="v" style="color:' +
+      (LAB_VERDICT_COLOR[k] || "inherit") + '">' + counts[k] + '</div></div>';
+  }
+  h += '</div>';
+  if (claims.length) {
+    h += '<div class="scroll"><table class="battle-table"><thead><tr><th>LLM 提出的规律</th><th>落地维度</th>' +
+      '<th>n</th><th>近期效应</th><th>校正p</th><th>结论</th></tr></thead><tbody>';
+    for (const c of claims) {
+      const st = c.regime_status || (c.regime && c.regime.status) || "";
+      h += '<tr><td style="text-align:left">' + escHtml(c.title || "") +
+        (c.mechanism ? '<div class="rg-cell-sub">机理：' + escHtml(String(c.mechanism).slice(0, 90)) + '</div>' : "") +
+        (c.stage_view ? '<div class="rg-cell-sub">阶段判断：' + escHtml(String(c.stage_view).slice(0, 90)) + '</div>' : "") + '</td>' +
+        '<td style="text-align:left">' + escHtml(c.label || ((c.filters || []).map(f => f.key + JSON.stringify(f.params || {})).join(" + "))) + '</td>' +
+        '<td>' + (c.n || 0) + '</td>' +
+        '<td class="' + (c.effect === null || c.effect === undefined ? "flat" : (c.effect >= 0 ? "pos" : "neg")) + '">' +
+        (c.effect === null || c.effect === undefined ? "—" : (c.effect >= 0 ? "+" : "") + Number(c.effect).toFixed(4)) + '</td>' +
+        '<td>' + (c.p_adjusted === null || c.p_adjusted === undefined ? "—" : Number(c.p_adjusted).toFixed(4)) + '</td>' +
+        '<td style="text-align:left"><span class="rg-badge" style="border-color:' + (LAB_VERDICT_COLOR[c.verdict] || "var(--border)") +
+        ';color:' + (LAB_VERDICT_COLOR[c.verdict] || "inherit") + '">' + escHtml(c.verdict_zh || c.verdict || "") + '</span>' +
+        '<div class="rg-cell-sub">' + escHtml((c.reason || "").slice(0, 110)) + '</div></td></tr>';
+    }
+    h += '</tbody></table></div>';
+  } else {
+    h += '<div class="track-note">本轮没有产生可展示的规律。' +
+      (res.llm_used ? "（LLM 参与但未给出可落地的规律）" : "（LLM 未参与，只做了维度扫描）") + '</div>';
+  }
+  if ((res.next_dimensions || []).length) {
+    h += '<div class="track-note">💡 模型建议继续挖的角度：' + res.next_dimensions.map(escHtml).join("、") + '</div>';
+  }
+  if (res.scan_summary) {
+    h += '<div class="track-note">扫描伴随结论：' + escHtml(res.scan_summary.verdict || "") +
+      '（已测 ' + (res.scan_summary.n_tested || 0) + ' 组，预期假阳性 ' +
+      Number(res.scan_summary.expected_false_positives || 0).toFixed(1) + ' 个）</div>';
+  }
+  el.innerHTML = h;
+}
+
+async function runLlmLab() {
+  if (_rgBusy) { toast("正在计算中，请稍候"); return; }
+  if (!window.confirm("LLM 规律工坊会调用大模型三轮（提规律 → 自我质疑 → 修订），\n预计 1~8 分钟，期间页面会一直显示忙碌状态。\n\n确定开始吗？")) return;
+  _rgBusy = true;
+  setBusy("#btnLabRun", "大模型思考中（1~8 分钟）…");
+  const tag = $("#rgLabTag");
+  if (tag) tag.textContent = "运行中…";
+  const body = $("#rgLabBody");
+  if (body) body.innerHTML = '<div class="track-note warn"><span class="spin">⏳</span> 正在进行：维度扫描 → LLM 提规律 → 自我质疑 → 修订 → 逐条 as-of 回放验证…</div>';
+  try {
+    const r = await api("/api/llm_lab/run?rounds=3&use_llm=1&persist=1", { method: "POST" });
+    renderLab(r);
+    toast("工坊完成：" + ((r.claims || []).length) + " 条规律");
+    loadRegimeOverview(false);
+  } catch (e) {
+    renderLab({ ok: false, detail: e.message });
+  }
+  setFree("#btnLabRun", "🧠 让大模型找规律（三轮，1~8 分钟）");
+  _rgBusy = false;
+}
+
+async function loadLlmLabLatest() {
+  try {
+    const r = await api("/api/llm_lab/latest");
+    renderLab(r);
+  } catch (e) { toast("读取失败: " + e.message); }
+}
+
+async function registerLabClaims() {
+  if (!window.confirm("把工坊里已通过 as-of 回放（support/reject/仅阶段有效）的规律注册进假说库。\nunmappable 与 noise 不会入库。继续？")) return;
+  try {
+    const r = await api("/api/llm_lab/register", { method: "POST" });
+    toast("已注册 " + ((r.registered && r.registered.registered) || 0) + " 条（跳过 " + (r.skipped_n || 0) + " 条）");
+    loadRegimeOverview(false);
+  } catch (e) { toast("注册失败: " + e.message); }
+}
+
+/* ---------- 检索式核验 ---------- */
+
+function fillProbeFamilies(r) {
+  const sel = $("#rgProbeFamily");
+  if (!sel || sel.dataset.filled) return;
+  sel.innerHTML = "";
+  for (const f of (r.families || [])) {
+    const o = document.createElement("option");
+    o.value = f.key;
+    o.textContent = f.name_zh + "（" + f.dim_zh + "）";
+    sel.appendChild(o);
+  }
+  sel.dataset.filled = "1";
+  syncProbeParams();
+}
+
+async function syncProbeParams() {
+  if (!_rgFamilies) { await loadDiscoveryFamilies(); return; }
+  const key = $("#rgProbeFamily") && $("#rgProbeFamily").value;
+  const fam = ((_rgFamilies.families) || []).find(f => f.key === key);
+  const sel = $("#rgProbeParams");
+  if (!sel || !fam) return;
+  sel.innerHTML = "";
+  (fam.params || []).forEach((p, i) => {
+    const o = document.createElement("option");
+    o.value = String(i);
+    o.textContent = JSON.stringify(p);
+    sel.appendChild(o);
+  });
+}
+
+async function probeParams() {
+  if (!_rgFamilies) { await loadDiscoveryFamilies(); }
+  const key = ($("#rgProbeFamily") || {}).value;
+  const fam = ((_rgFamilies && _rgFamilies.families) || []).find(f => f.key === key);
+  const idx = Number((($("#rgProbeParams") || {}).value) || 0);
+  if (!fam) { toast("请先选择维度"); return; }
+  const params = (fam.params || [])[idx] || {};
+  const el = $("#rgProbeBody");
+  if (el) el.innerHTML = '<div class="track-note"><span class="spin">⏳</span> 正在 as-of 回放…</div>';
+  try {
+    const r = await api("/api/backtest/regime?key=" + encodeURIComponent(key) +
+      "&params=" + encodeURIComponent(JSON.stringify(params)));
+    const rg = r.regime || {};
+    let h = '<div class="multi-correct-banner"><div class="mcb-main">' + escHtml(r.filter && r.filter.label) +
+      ' → <b style="color:' + (RG_STATUS_COLOR[rg.status] || "inherit") + '">' + escHtml(rg.label_zh || rg.status) + '</b></div>' +
+      '<div class="mcb-sub">' + escHtml(rg.reason_zh || "") + '</div></div>';
+    h += '<div class="scroll"><table class="battle-table"><thead><tr><th>阶段</th><th>n</th><th>均值</th><th>期望</th><th>差值</th><th>p</th><th>BH校正p</th></tr></thead><tbody>';
+    for (const e of (rg.eras || [])) {
+      h += '<tr><td style="text-align:left">' + escHtml(e.era) + '</td><td>' + (e.n || 0) + '</td>' +
+        '<td>' + (e.mean === null || e.mean === undefined ? "—" : Number(e.mean).toFixed(4)) + '</td>' +
+        '<td class="flat">' + (e.expected === null || e.expected === undefined ? "—" : Number(e.expected).toFixed(4)) + '</td>' +
+        '<td class="' + (e.delta >= 0 ? "pos" : "neg") + '">' + (e.delta === null || e.delta === undefined ? "—" :
+          (e.delta >= 0 ? "+" : "") + Number(e.delta).toFixed(4)) + '</td>' +
+        '<td>' + (e.p_value === null || e.p_value === undefined ? "—" : Number(e.p_value).toFixed(4)) + '</td>' +
+        '<td>' + (e.p_adjusted === null || e.p_adjusted === undefined ? "—" : Number(e.p_adjusted).toFixed(4)) + '</td></tr>';
+    }
+    const rc = rg.recent || {};
+    h += '</tbody></table></div><div class="track-note">近期加权窗口：' + (rc.n || 0) + ' 期，效应 ' +
+      (rc.delta === null || rc.delta === undefined ? "—" : Number(rc.delta).toFixed(4)) +
+      '，校正后 p=' + (rc.p_adjusted === null || rc.p_adjusted === undefined ? "—" : Number(rc.p_adjusted).toFixed(4)) +
+      '；可检出下限 ' + (rc.mde === null || rc.mde === undefined ? "—" : Number(rc.mde).toFixed(4)) + '</div>';
+    if (el) el.innerHTML = h;
+  } catch (e) {
+    if (el) el.innerHTML = '<div class="track-note warn">⚠️ ' + escHtml(e.message) + '</div>';
+  }
+}

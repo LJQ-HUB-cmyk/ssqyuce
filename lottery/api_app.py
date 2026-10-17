@@ -1138,14 +1138,29 @@ def _evolution_step(limit: int = 0, use_llm: bool = True) -> dict:
                         "llm_used": mined.get("llm_used"), "llm_error": mined.get("llm_error")}
     summary["registered"] = reg
 
-    # 2) 对**全部** proposed 假说做 A/B 实战验证 —— 这是它们唯一的晋升通道
+    # 1b) V6：把「规律工坊」里已验证过阶段的 LLM 规律也注册进假说库
+    #     （只收 support/reject/regime_only，unmappable/noise 一律不入库）
+    try:
+        from . import llm_lab
+        if llm_lab.load_claims().get("claims"):
+            summary["llm_lab_registered"] = evolution.register_llm_lab_claims(draws)
+    except Exception as e:  # noqa: BLE001
+        summary["llm_lab_registered"] = {"error": f"{type(e).__name__}: {e}"}
+
+    # 2) 对**全部** proposed 假说做实战验证 —— 这是它们唯一的晋升通道。
+    #    V6：按假说类型分派验证口径。维度化的走 as-of 筛选条件回放（任何假说都有
+    #    非平凡数字），其余走结构/方法权重的 A/B 配对回放。
     hyps = evolution._as_hyp_list(hypothesis.load_registry())
     proposed = [h for h in hyps if h.get("status") == "proposed"]
     results = []
     for h in proposed:
+        act = h.get("action") if isinstance(h.get("action"), dict) else {}
         try:
-            results.append(evolution.verify_hypothesis_ab(
-                h, draws, n_tickets=5, start=max(300, len(draws) - 600)))
+            if act.get("type") in ("prefer_red_filter", "prefer_blue_filter"):
+                results.append(evolution.verify_discovery_hypothesis(h, draws, start=200))
+            else:
+                results.append(evolution.verify_hypothesis_ab(
+                    h, draws, n_tickets=5, start=max(300, len(draws) - 600)))
         except Exception as e:  # noqa: BLE001
             print(f"[evolution] 假说 {h.get('id')} 验证失败: {e}")
     summary["verified"] = len(results)
@@ -1158,6 +1173,12 @@ def _evolution_step(limit: int = 0, use_llm: bool = True) -> dict:
         "insufficient": len(resolution.get("insufficient") or []),
         "unchanged": resolution.get("unchanged"),
     }
+
+    # 3b) V6：阶段时效标注（每条假说带「现在是否还有效」）
+    try:
+        summary["regime_annotated"] = evolution.annotate_hypotheses(draws)
+    except Exception as e:  # noqa: BLE001
+        summary["regime_annotated"] = {"error": f"{type(e).__name__}: {e}"}
 
     # 4) 报告当前生效的出号策略覆盖项
     st = evolution.evolution_status()
@@ -1198,6 +1219,257 @@ def _battle_or_503():
              "detail": str(e), "hint": "该端点需 lottery/battle.py；其余功能不受影响。"},
             status_code=503)
     return battle, None
+
+
+# ---------- V6：阶段有效性（regime）+ 多维度规律发现 + LLM 规律工坊 ----------
+
+@app.get("/api/regime/overview")
+def regime_overview(limit: int = Query(0, ge=0, le=3490)):
+    """阶段时效总览：各阶段边界 + 全部规律的阶段画像 + 状态机分布。
+
+    回答用户最关心的两个问题：**规律在哪段时间有效**、**现在还灵不灵**。
+    """
+    try:
+        from . import evolution, hypothesis, regime
+    except ImportError as e:
+        return JSONResponse({"ok": False, "available": False,
+                             "error": "阶段时效模块尚未就绪", "detail": str(e)},
+                            status_code=503)
+    draws = db.load_draws()
+    if limit:
+        draws = draws[-int(limit):]
+    if not draws:
+        return JSONResponse({"ok": False, "error": "本地暂无开奖数据"}, status_code=400)
+    hyps = evolution._as_hyp_list(hypothesis.load_registry())
+    items = []
+    for h in hyps:
+        rep = h.get("regime") or {}
+        items.append({
+            "id": h.get("id"), "family": h.get("family"),
+            "statement": h.get("statement"), "status": h.get("status"),
+            "action_type": (h.get("action") or {}).get("type"),
+            "regime_status": rep.get("status"),
+            "regime_label": rep.get("label_zh"),
+            "regime_reason": rep.get("reason_zh"),
+            "recent_effect": rep.get("effect"),
+            "p_adjusted_recent": rep.get("p_adjusted_recent"),
+            "n_sig_eras": rep.get("n_sig_eras"),
+            "last_significant_era": rep.get("last_significant_era"),
+        })
+    counts: Dict[str, int] = {}
+    for it in items:
+        k = it.get("regime_status") or "unannotated"
+        counts[k] = counts.get(k, 0) + 1
+    return {
+        "ok": True,
+        "eras": regime.build_eras(draws),
+        "era_defs": [{"name": n, "start_year": lo, "end_year": hi}
+                     for n, lo, hi in regime.ERA_DEFS],
+        "recent_window": regime.RECENT_WINDOW,
+        "stale_after_draws": regime.STALE_AFTER_DRAWS,
+        "min_era_n": regime.MIN_ERA_N,
+        "status_counts": counts,
+        "status_legend": {k: regime_status_label(k) for k in
+                          list(counts.keys()) + list(REGIME_STATUS_ORDER)},
+        "items": items,
+        "n_draws": len(draws),
+        "note_zh": ("状态机口径：每个规律被切成 9 个阶段（近年更细），每阶段做显著性与"
+                    "BH 校正；『陈旧』= 最近一次显著距今超过 "
+                    f"{regime.STALE_AFTER_DRAWS} 期，正是「规律不再生效」的量化形态。"),
+    }
+
+
+REGIME_STATUS_ORDER = ["persistent", "emerging", "fading", "stale", "flipped",
+                       "reversed", "noise", "no_dimension", "insufficient", "error"]
+
+
+def regime_status_label(status: str) -> str:
+    return {
+        "persistent": "持续有效（最近阶段仍显著）",
+        "emerging": "新兴线索（只有最近阶段显著，未确认）",
+        "fading": "正在衰减（上一阶段有效，最近失效）",
+        "stale": "陈旧（曾显著，已被新数据推翻）",
+        "flipped": "方向反转（疑似伪规律）",
+        "reversed": "已失效（仅早期阶段显著）",
+        "noise": "未检出（各阶段均不显著）",
+        "no_dimension": "无可回放维度（结构类/权重类）",
+        "insufficient": "样本不足",
+        "error": "阶段分析失败",
+        "unannotated": "尚未标注（点「重算阶段时效」）",
+    }.get(status or "", status or "")
+
+
+@app.post("/api/regime/refresh")
+def regime_refresh(start: int = Query(200, ge=60, le=3000)):
+    """重算全部假说的阶段时效标注（写回 data/hypotheses.json）。"""
+    try:
+        from . import evolution
+    except ImportError as e:
+        return JSONResponse({"ok": False, "error": "阶段时效模块尚未就绪",
+                             "detail": str(e)}, status_code=503)
+    draws = db.load_draws()
+    if not draws:
+        return JSONResponse({"ok": False, "error": "本地暂无开奖数据"}, status_code=400)
+    try:
+        r = evolution.annotate_hypotheses(draws, start=int(start))
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": "标注失败",
+                             "detail": f"{type(e).__name__}: {e}"}, status_code=503)
+    return {"ok": True, **r}
+
+
+@app.get("/api/discovery/families")
+def discovery_families():
+    """维度表：可搜索的规律空间（20+ 族、90+ 组参数）。"""
+    try:
+        from . import discovery
+    except ImportError as e:
+        return JSONResponse({"ok": False, "error": "维度模块尚未就绪",
+                             "detail": str(e)}, status_code=503)
+    fams = discovery.family_catalog()
+    dims: Dict[str, int] = {}
+    for f in fams:
+        dims[f["dim_zh"]] = dims.get(f["dim_zh"], 0) + f["n_param_sets"]
+    return {"ok": True, "families": fams, "n_families": len(fams),
+            "n_combos": discovery.combo_space_size(), "dims": dims}
+
+
+@app.get("/api/discovery/scan")
+def discovery_scan(top: int = Query(12, ge=1, le=60),
+                   fast_window: int = Query(600, ge=200, le=3000),
+                   families: Optional[str] = Query(None),
+                   refresh: int = Query(0, ge=0, le=1)):
+    """多维度 as-of 扫描：枚举维度×参数，给每条候选做阶段画像。
+
+    严格 as-of：第 t 期只用 draws[:t] 计算筛选条件；扫描的搜索成本（已测组合数、
+    纯随机预期假阳性数）一并返回，避免把「搜出来的」当「发现的」。
+    """
+    try:
+        from . import discovery
+    except ImportError as e:
+        return JSONResponse({"ok": False, "error": "维度模块尚未就绪",
+                             "detail": str(e)}, status_code=503)
+    draws = db.load_draws()
+    if not draws:
+        return JSONResponse({"ok": False, "error": "本地暂无开奖数据"}, status_code=400)
+    flist = [x.strip() for x in families.split(",") if x.strip()] if families else None
+    try:
+        res = discovery.discover(draws, top=int(top), fast_window=int(fast_window),
+                                 families=flist, use_cache=not bool(refresh))
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": "扫描失败",
+                             "detail": f"{type(e).__name__}: {e}"}, status_code=503)
+    out = dict(res)
+    out["ok"] = True
+    out["n_draws"] = len(draws)
+    return out
+
+
+def _llm_lab_modules():
+    from . import discovery, llm_lab
+    return discovery, llm_lab
+
+
+@app.get("/api/llm_lab/latest")
+def llm_lab_latest(limit: int = Query(40, ge=1, le=200)):
+    """最近一次规律工坊的结果（LLM 规律 + 逐条落地验证 + 阶段画像）。"""
+    try:
+        _, llm_lab = _llm_lab_modules()
+    except ImportError as e:
+        return JSONResponse({"ok": False, "available": False,
+                             "error": "LLM 规律工坊模块尚未就绪", "detail": str(e)},
+                            status_code=503)
+    data = llm_lab.load_claims()
+    claims = (data.get("claims") or [])[:int(limit)]
+    counts: Dict[str, int] = {}
+    for c in claims:
+        k = c.get("verdict") or "unknown"
+        counts[k] = counts.get(k, 0) + 1
+    return {"ok": True, "available": True, "updated_at": data.get("updated_at"),
+            "runs": (data.get("runs") or [])[:5],
+            "claims": claims, "verdict_counts": counts,
+            "verdict_legend": llm_lab.VERDICTS,
+            "n_stored": len(data.get("claims") or [])}
+
+
+@app.post("/api/llm_lab/run")
+def llm_lab_run(rounds: int = Query(3, ge=1, le=3),
+                use_llm: int = Query(1, ge=0, le=1),
+                persist: int = Query(1, ge=0, le=1)):
+    """跑一次规律工坊：维度扫描 → 多轮 LLM 提规律/自我质疑/修订 → 逐条落地验证 → 落盘。
+
+    耗时：LLM 三轮各 1~3 分钟（推理型模型更久），维度扫描约 5~10 秒。
+    ``use_llm=0`` 时只跑维度扫描与阶段画像（用于无 LLM 环境自检）。
+    """
+    try:
+        from . import discovery, llm_lab
+    except ImportError as e:
+        return JSONResponse({"ok": False, "available": False,
+                             "error": "LLM 规律工坊模块尚未就绪", "detail": str(e)},
+                            status_code=503)
+    draws = db.load_draws()
+    if not draws:
+        return JSONResponse({"ok": False, "error": "本地暂无开奖数据"}, status_code=400)
+    try:
+        res = llm_lab.run_lab(draws, rounds=int(rounds), use_llm=bool(use_llm),
+                              persist=bool(persist))
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": "工坊执行失败",
+                             "detail": f"{type(e).__name__}: {e}"}, status_code=503)
+    res.setdefault("ok", True)
+    return res
+
+
+@app.post("/api/llm_lab/register")
+def llm_lab_register():
+    """把工坊里 verified 的规律注册进假说库（unmappable/noise 不入库）。"""
+    try:
+        from . import evolution
+    except ImportError as e:
+        return JSONResponse({"ok": False, "error": "进化模块尚未就绪",
+                             "detail": str(e)}, status_code=503)
+    draws = db.load_draws()
+    if not draws:
+        return JSONResponse({"ok": False, "error": "本地暂无开奖数据"}, status_code=400)
+    try:
+        r = evolution.register_llm_lab_claims(draws)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": "注册失败",
+                             "detail": f"{type(e).__name__}: {e}"}, status_code=503)
+    return {"ok": True, **r}
+
+
+@app.get("/api/backtest/regime")
+def backtest_regime(key: str = Query(..., min_length=1),
+                    params: Optional[str] = Query(None),
+                    start: int = Query(200, ge=60, le=3000)):
+    """任意维度组合的**检索式核验**：as-of 回放 + 阶段时效（前端「核验」按钮用）。
+
+    ``params`` 是 JSON 字符串，例如 ``{"window":30,"k":6}``。
+    """
+    try:
+        from . import discovery
+    except ImportError as e:
+        return JSONResponse({"ok": False, "error": "维度模块尚未就绪",
+                             "detail": str(e)}, status_code=503)
+    draws = db.load_draws()
+    if not draws:
+        return JSONResponse({"ok": False, "error": "本地暂无开奖数据"}, status_code=400)
+    try:
+        p = json.loads(params) if params else (discovery.FAMILY_BY_KEY.get(key) or {}).get("params", [{}])[0]
+    except (json.JSONDecodeError, TypeError):
+        return JSONResponse({"ok": False, "error": f"params 不是合法 JSON：{params}"},
+                            status_code=400)
+    try:
+        flt = discovery.make_filter(key, p or {})
+        rep = discovery.regime_of_filter(draws, flt, start=int(start))
+    except KeyError as e:
+        return JSONResponse({"ok": False, "error": f"未知维度：{e}"}, status_code=400)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": "回放失败",
+                             "detail": f"{type(e).__name__}: {e}"}, status_code=503)
+    return {"ok": True, "filter": {"key": key, "params": p, "label": flt["label"],
+                                   "target": flt["target"]}, "regime": rep}
 
 
 @app.get("/api/battle/report")

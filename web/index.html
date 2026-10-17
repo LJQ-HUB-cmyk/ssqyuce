@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>双色球智能预测分析系统</title>
-<link rel="stylesheet" href="/static/style.css?v=20261015.2">
+<link rel="stylesheet" href="/static/style.css?v=20261017.1">
 <!-- ECharts CDN + 本地 fallback -->
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"
   onerror="this.src='/static/vendor/echarts.min.js?v=20260817.7'"></script>
@@ -266,6 +266,7 @@
             <div class="subtab" data-sub="ml" onclick="setEvalSub('ml')">🤖 ML 模型</div>
             <div class="subtab" data-sub="llm" onclick="setEvalSub('llm')">🧠 LLM 通道</div>
             <div class="subtab" data-sub="evolution" onclick="setEvalSub('evolution')">🧬 实战战绩</div>
+            <div class="subtab" data-sub="regime" onclick="setEvalSub('regime')">⏳ 规律时效</div>
           </div>
 
           <!-- 综合概览 -->
@@ -317,6 +318,54 @@
               <span class="hint-inline">三通道对比（stat / stat+LLM / random），后台运行约 5~30 分钟</span>
             </div>
             <div id="llmEvalArea"><div class="note">🧠 LLM 三通道评估：完成后展示对比、paired p 值与成本估算。</div></div>
+          </div>
+
+          <!-- V6：规律时效 + 多维度发现 + LLM 规律工坊 -->
+          <div id="evalSub-regime" class="sub-panel hidden">
+
+            <div class="card" id="rgOverviewCard">
+              <h2>⏳ 阶段有效性总览 <span class="tag" id="rgOverviewTag">未加载</span></h2>
+              <div class="eval-actions">
+                <button id="btnRgLoad" onclick="loadRegimeOverview(false)">▶ 加载阶段画像（约 5~20 秒）</button>
+                <button id="btnRgRefresh" onclick="refreshRegime()">🔄 重算阶段时效（写库）</button>
+                <span class="hint-inline">每个规律被切成 9 个年份阶段（近年更细），逐阶段做检验 + BH 校正</span>
+              </div>
+              <div id="rgOverviewBody"><div class="note">规律是否「近期失效」，要靠阶段画像回答：哪一段显著、最近一次显著距今多少期。</div></div>
+            </div>
+
+            <div class="card" id="rgDiscoveryCard">
+              <h2>🔭 多维度规律发现 <span class="tag" id="rgDiscoveryTag">未加载</span></h2>
+              <div class="eval-actions">
+                <button id="btnDiscScan" onclick="runDiscoveryScan()">🛰️ 扫描维度空间（约 5~30 秒）</button>
+                <button id="btnDiscFamilies" onclick="loadDiscoveryFamilies()">📚 看维度表</button>
+                <span class="hint-inline">严格 as-of 回放：第 t 期只用 t 之前的数据算筛选条件</span>
+              </div>
+              <div id="rgDiscoveryBody"><div class="note">20 个维度族 × 91 组参数（频率/遗漏/连出/重号/邻号/同尾/三区/派生号/共现/开奖日/形态条件/蓝球 6 类）。</div></div>
+              <div id="rgFamiliesBody"></div>
+            </div>
+
+            <div class="card" id="rgLabCard">
+              <h2>🧠 LLM 规律工坊 <span class="tag" id="rgLabTag">未加载</span></h2>
+              <div class="eval-actions">
+                <button id="btnLabRun" onclick="runLlmLab()">🧠 让大模型找规律（三轮，1~8 分钟）</button>
+                <button id="btnLabLatest" onclick="loadLlmLabLatest()">📄 看最近结果</button>
+                <button id="btnLabRegister" onclick="registerLabClaims()">📥 把已验证规律注册进假说库</button>
+                <span class="hint-inline">LLM 提的每条规律都会被强制映射到维度表并做 as-of 回放，映射不到的直接标为「不可验证」</span>
+              </div>
+              <div id="rgLabBody"><div class="note">工坊流程：喂给它阶段序列与维度表 → 提规律 → 自我质疑 → 修订 → 逐条落地回放 → 给出结论与阶段画像。</div></div>
+            </div>
+
+            <div class="card" id="rgProbeCard">
+              <h2>🔎 检索式核验 <span class="tag">任意维度 × 参数 · as-of</span></h2>
+              <div class="eval-actions">
+                <select id="rgProbeFamily" class="range-sel" onchange="syncProbeParams()"></select>
+                <select id="rgProbeParams" class="range-sel"></select>
+                <button onclick="probeParams()">🧪 核验</button>
+                <span class="hint-inline">选一个维度与档位，立刻看到它的阶段画像（前端已内建参数档位，无需手填）</span>
+              </div>
+              <div id="rgProbeBody"><div class="note">用于回答「我怀疑某条规律」这类问题：选好就能看到它在每个年份段的表现。</div></div>
+            </div>
+
           </div>
 
           <!-- 实战战绩 + 进化过程（V5）：按方法在真实开奖上的逐期对照 -->
@@ -493,6 +542,7 @@
       <div class="gtitle">研究</div>
       <button class="more-item" onclick="switchTab('analysis')">📈 数据分析</button>
       <button class="more-item" onclick="switchTab('patterns')">🔬 规律研究</button>
+      <button class="more-item" onclick="openRegimeTab()">⏳ 规律时效</button>
       <button class="more-item" onclick="switchTab('replay')">🗓️ 历史回放</button>
     </div>
     <div class="more-group">
@@ -504,7 +554,7 @@
   </aside>
 
   
-      <footer>双色球智能预测分析系统 <span class="badge badge-ver" id="verText">v1.0.2</span>（M1-M5 + U1-U9 已上线）· 仅供研究参考 · 随机性诚实声明 · 数据源 e.17500.cn</footer>
+      <footer>双色球智能预测分析系统 <span class="badge badge-ver" id="verText">v2.2.0</span>（M1-M5 + U1-U9 + V4/V5/V6 已上线）· 仅供研究参考 · 随机性诚实声明 · 数据源 e.17500.cn</footer>
 </div>
 
 <!-- 号码详情弹窗（全局：任意 Tab 均可触发） -->
@@ -519,6 +569,6 @@
 </div>
 
 <div id="toast"></div>
-<script src="/static/app.js?v=20261015.2"></script>
+<script src="/static/app.js?v=20261017.1"></script>
 </body>
 </html>

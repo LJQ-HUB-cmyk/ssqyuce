@@ -552,3 +552,15 @@ footer { color: var(--muted); font-size: 12px; text-align: center; margin-top: 2
 .receipt-list .ticket { margin-bottom: 6px; }
 .receipt-list .ticket:last-child { margin-bottom: 0; }
 .receipt-copy-tag { color: var(--muted); margin-top: 10px; }
+
+/* ==================== V6：规律时效（阶段有效性） ==================== */
+.rg-table td { white-space: nowrap; }
+.rg-table td:first-child { white-space: normal; min-width: 180px; }
+.rg-table th { font-weight: 600; }
+.rg-th-sub { font-size: 10px; color: var(--muted); font-weight: 400; }
+.rg-cell { font-variant-numeric: tabular-nums; }
+.rg-cell-sub { font-size: 10px; color: var(--muted); font-weight: 400; line-height: 1.5; }
+.rg-badge { display: inline-block; font-size: 11px; font-weight: 700; padding: 1px 7px;
+  border: 1px solid var(--border); border-radius: 10px; white-space: nowrap; }
+#evalSub-regime .multi-correct-banner .mcb-main b { font-size: 16px; }
+#rgProbeCard .range-sel { max-width: 320px; }

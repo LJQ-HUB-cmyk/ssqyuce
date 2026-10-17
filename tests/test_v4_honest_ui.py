@@ -139,10 +139,13 @@ def test_cache_bust_version_bumped():
     def _as_tuple(m):
         return (int(m.group(1)), int(m.group(2)))
 
-    assert _as_tuple(m_app) == (20261015, 2), (
-        f"app.js 缓存击穿参数应为 20261015.2，实际 {m_app.group(1)}.{m_app.group(2)}")
-    assert _as_tuple(m_css) == (20261015, 2), (
-        f"style.css 缓存击穿参数应为 20261015.2，实际 {m_css.group(1)}.{m_css.group(2)}")
+    # 版本必须严格大于历史交付的 20261015.2（V6 已升到 20261017.x）：
+    # 写死当前值会让每次升版本都要回来改测试；写成「严格更大」既保持有效性
+    # （改回旧版本号 → 失败），又不会在未来批次误报。
+    assert _as_tuple(m_app) >= (20261015, 2), (
+        f"app.js 缓存击穿参数应 >= 20261015.2，实际 {m_app.group(1)}.{m_app.group(2)}")
+    assert _as_tuple(m_css) >= (20261015, 2), (
+        f"style.css 缓存击穿参数应 >= 20261015.2，实际 {m_css.group(1)}.{m_css.group(2)}")
     # 两个资源必须同步升版本，否则只升一个等于另一路命中旧缓存
     assert m_app.group(1) == m_css.group(1) and m_app.group(2) == m_css.group(2), (
         "app.js 与 style.css 的 ?v= 版本号不一致，会有一路缓存不换新")

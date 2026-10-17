@@ -84,6 +84,12 @@ ALLOWED_ACTION_TYPES: Tuple[str, ...] = (
     "prefer_structure",
     "blue_dedupe",
     "blue_uniform",
+    # V6：维度化动作——把「筛选条件」直接变成出号偏置。
+    # 没有它们，凡是按「近 W 期热号 / 遗漏 / 邻号 / 共现」表述的规律
+    # （也就是 LLM 与维度扫描最自然产出的那类）都无法进入出号，
+    # 假说库只会堆满「无法执行」的空话。
+    "prefer_red_filter",
+    "prefer_blue_filter",
 )
 
 #: ``prefer_structure`` 允许的结构化选号规则
@@ -865,6 +871,28 @@ def _normalize_action(action: Any) -> Tuple[Optional[Dict], Optional[str]]:
         if not nums:
             return None, "prefer_numbers 缺少 1-33 范围内的有效红球"
         return {"type": "prefer_numbers", "numbers": nums}, None
+    if atype in ("prefer_red_filter", "prefer_blue_filter"):
+        # V6：维度化动作——形状必须能被 discovery.make_filter 实例化，
+        # 否则「可验证」只是一句空话。这里只校验形状与白名单，参数合法性由
+        # discovery 的维度表把关（校验函数集中在一处，避免两套漂移）。
+        spec = action.get("filter")
+        if not isinstance(spec, dict) or not isinstance(spec.get("key"), str) or not spec["key"]:
+            return None, f"{atype} 缺少 filter.key"
+        try:
+            from . import discovery
+        except ImportError as e:
+            return None, f"维度模块不可用：{e}"
+        if spec["key"] not in discovery.FAMILY_BY_KEY:
+            return None, f"维度 {spec['key']!r} 不在维度表内"
+        params = spec.get("params") or {}
+        if not isinstance(params, dict):
+            return None, f"{atype} 的 filter.params 必须是对象"
+        want = "red" if atype == "prefer_red_filter" else "blue"
+        if discovery.FAMILY_BY_KEY[spec["key"]]["target"] != want:
+            return None, f"维度 {spec['key']!r} 的目标不是{want}球"
+        gain = _as_float(action.get("gain"), 1.5)
+        return {"type": atype, "filter": {"key": spec["key"], "params": params},
+                "gain": _round(_clip(gain, 1.0, 3.0), 3)}, None
     if atype == "prefer_structure":
         rule = action.get("rule")
         if not isinstance(rule, str) or rule not in ALLOWED_STRUCTURE_RULES:

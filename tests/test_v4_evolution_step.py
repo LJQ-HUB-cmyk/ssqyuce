@@ -239,8 +239,9 @@ def test_v5_delivery_is_recorded():
 
     assert _ver(config.APP_VERSION) >= (2, 1, 0), (
         f"V5 交付后 APP_VERSION 应 >= 2.1.0，实际 {config.APP_VERSION}")
-    assert config.APP_BUILD == "2026-10-V5", (
-        f"APP_BUILD 应为 2026-10-V5，实际 {config.APP_BUILD}")
+    # V6（2026-10-V6）继续向前：版本号只增不减，构建标识必须指向当前批次。
+    assert _ver(config.APP_BUILD.split("-")[-1].lstrip("V")) >= (5,), (
+        f"APP_BUILD 应为 V5 或更新批次，实际 {config.APP_BUILD}")
     assert "V5" in config.APP_MILESTONES, "APP_MILESTONES 缺少 V5 条目"
     assert config.APP_MILESTONES["V5"].get("status") == "done"
     # V4 的历史记录不得因 V5 而丢失

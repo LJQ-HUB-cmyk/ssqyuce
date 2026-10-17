@@ -23,8 +23,8 @@ BACKUP_DATA_URL = (os.environ.get("LOTT_BACKUP_DATA_URL") or "").strip() or None
 
 # ---------- 版本信息（前端主页 / API / GitHub 说明统一引用） ----------
 
-APP_VERSION = "2.1.0"          # v5 方案：自进化交付批次（战斗回放 + LLM 规律提炼 + A/B 验证闭环）
-APP_BUILD = "2026-10-V5"       # 构建标识（V5 交付批次）
+APP_VERSION = "2.2.0"          # v6 方案：阶段有效性（regime）+ 多维度发现 + LLM 规律工坊
+APP_BUILD = "2026-10-V6"       # 构建标识（V6 交付批次）
 APP_MILESTONES = {
     "M1": {"status": "done",    "desc": "前端 Tab 工作台 + 规律库扩容 29 条 + 自动挖掘管道 + 任务系统"},
     "M2": {"status": "done",    "desc": "GBDT/RF 概率模型 + 滚动 Brier 加权融合 + 概率校准 + 蓝球独立投票 + ML walk-forward 评估"},
@@ -41,6 +41,7 @@ APP_MILESTONES = {
     "U8": {"status": "done", "desc": "推理型模型输出预算自适应（含预算记忆）+ 设置页模型唯一事实来源 + 观察轮报错聚合 + 上期开奖回执列出上期推荐逐注命中"},
     "U9": {"status": "done", "desc": "历史战绩口径修正：期数取接口实际去重样本（不再是用字面量 N / 各方法相加），样本不足不给最佳方法结论；卡片下移至「上期开奖回执」之后"},
     "V4": {"status": "done", "desc": "诚实口径改造：/api/rigor/randomness + /api/rigor/signal + /api/portfolio/expected-value 三个端点（缺 rigor 模块时优雅降级 503）；前端不再把随机波动当能力展示——所有比率必须带样本量与「样本不足，不构成结论」提示，新增「随机性检验」卡展示最小可检出提升量"},
+    "V6": {"status": "done", "desc": "阶段有效性 + 多维度规律：新增 lottery/regime.py（9 阶段切分 + 逐阶段检验 + BH 校正 + 近 3 期加权 + 持续/新兴/衰减/陈旧/反转/伪规律状态机 + 近 150 期加权检验）、lottery/discovery.py（20 维度族 × 91 组参数的 as-of 快速筛选与阶段画像，单次扫描约数秒）、lottery/llm_lab.py（LLM 规律工坊：全历史阶段序列 + 维度表 + 搜索成本喂给模型，三轮提规律/自我质疑/修订，每条规律强制映射维度表并做 as-of 回放，映射不到判不可验证）；A/B 验证修复（两臂独立采样，结构类假说不再恒为 0 差异；对照组由 uniform 改为实际部署基线）；前端新增「规律时效」工作台（阶段热力图 + 维度扫描 + LLM 工坊 + 检索式核验）"},
     "V5": {"status": "done", "desc": "自进化系统：lottery/battle.py 方法级 walk-forward 战斗回放（红球 Wilcoxon + 蓝球 McNemar + Bonferroni/BH 校正）+ lottery/hypothesis.py LLM 规律提炼与假说库（LLM 失败必降级）+ lottery/evolution.py 进化闭环（假说→出号策略→A/B 实战验证→validated/rejected 裁决）；调度器每期开奖后自动跑一轮进化；前端「实战战绩」子页呈现战绩榜（ROI 双口径）、两两对比（未校正 N→校正 M）、规律库与进化操作"},
 }
 

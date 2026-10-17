@@ -60,6 +60,11 @@ _ACTION_KINDS = (
     "blue_dedupe",
     "blue_uniform",
     "prefer_structure",
+    # V6：维度化动作——``discovery`` 把「筛选条件」翻译成红/蓝号码集合后再放大。
+    # 没有这两个类型，凡是「热号/遗漏/邻号/共现」这类按筛选条件表述的规律
+    # 都会被白名单拒掉，这正是 LLM 假说「永远无法进入出号」的一半原因。
+    "prefer_red_filter",
+    "prefer_blue_filter",
 )
 
 # ``prefer_structure`` 支持的规则名（与 hypothesis 挖掘端约定一致）。
@@ -98,7 +103,7 @@ def EVO_EMPTY_OVERRIDES() -> Dict:
     """空的出号策略覆盖项（降级路径与无假说时共用）。"""
     return {"method_weights": {}, "red_boost": [], "blue_boost": [],
             "blue_dedupe": False, "blue_uniform": False,
-            "structure_rules": [], "applied": [], "skipped": []}
+            "structure_rules": [], "filters": [], "applied": [], "skipped": []}
 
 
 def apply_hypotheses(hypotheses: List[Dict],
@@ -116,6 +121,8 @@ def apply_hypotheses(hypotheses: List[Dict],
           "blue_boost":     [3, 9],                    # 需要加权放大的蓝球号
           "blue_dedupe":    True|False,                # 蓝球是否强制去重覆盖
           "blue_uniform":   True|False,                # 蓝球是否压平
+          "structure_rules":[{rule, ...}],             # 候选组合的结构取向
+          "filters":        [{kind, filter, gain}],    # V6：维度化筛选条件（discovery 语法）
           "applied":        [hyp_id, ...],             # 实际生效的假说
           "skipped":        [{"id":..., "reason":...}]
         }
@@ -160,6 +167,15 @@ def apply_hypotheses(hypotheses: List[Dict],
 
         elif kind == "blue_uniform":
             out["blue_uniform"] = bool(act.get("enabled", True))
+
+        elif kind in ("prefer_red_filter", "prefer_blue_filter"):
+            spec = act.get("filter")
+            keys = sorted((spec or {}).keys()) if isinstance(spec, dict) else []
+            if not isinstance(spec, dict) or "key" not in spec:
+                out["skipped"].append({"id": hid, "reason": "prefer_*_filter 缺少 filter 定义"})
+                continue
+            out["filters"].append({"id": hid, "kind": kind, "filter": spec,
+                                   "gain": float(act.get("gain", 1.5)), "keys": keys})
 
         elif kind == "prefer_structure":
             rule = act.get("rule")
@@ -255,12 +271,15 @@ def _renorm(v: np.ndarray, target: float) -> np.ndarray:
 
 def apply_overrides_to_probs(red_blend: Optional[np.ndarray],
                              blue_blend: Optional[np.ndarray],
-                             overrides: Dict) -> tuple:
+                             overrides: Dict,
+                             history: Optional[List[Dict]] = None) -> tuple:
     """把 strategy overrides 实际作用到红/蓝概率向量上，返回新向量。
 
     - 方法权重通过 ``red_pool``/``blue_pool`` 在融合阶段生效（见
       ``_weighted_pool``），本函数只处理号码级偏置与蓝球口径；
     - ``red_boost`` / ``blue_boost`` 只做乘性放大，不增删号码、不改排序合法性；
+    - ``filters``（V6）需要 ``history``（**as-of，只含当期之前的数据**）来求值；
+      未提供 history 时跳过并保证不抛异常——绝不用未来数据算筛选条件；
     - 输出保持与输入相同的归一化口径（红球 sum=6、蓝球 sum=1）。
     """
     red = None if red_blend is None else np.array(red_blend, dtype=float)
@@ -272,6 +291,30 @@ def apply_overrides_to_probs(red_blend: Optional[np.ndarray],
             if 1 <= int(n) <= len(red):
                 red[int(n) - 1] *= 2.0              # 温和偏置：放大一倍，不制造独裁
         red = _renorm(red, 6.0)
+
+    # V6：维度化筛选条件（as-of）。放大倍数沿用「温和偏置」哲学，并按条数衰减，
+    # 避免多条规律叠加后把某个号码变成独裁。
+    if history:
+        from . import discovery as _disc
+        for item in (overrides or {}).get("filters") or []:
+            try:
+                flt = _disc.make_filter(item["filter"]["key"],
+                                        item["filter"].get("params") or {})
+                chosen = set(int(x) for x in (flt["selector"](list(history)) or set()))
+            except Exception:  # noqa: BLE001 —— 维度不可用不应影响出号
+                continue
+            gain = float(item.get("gain") or 1.5)
+            gain = min(max(gain, 1.0), _NUMBER_GAIN_MAX)
+            if item["kind"] == "prefer_red_filter" and red is not None:
+                for n in chosen:
+                    if 1 <= n <= len(red):
+                        red[n - 1] *= gain
+                red = _renorm(red, 6.0)
+            elif item["kind"] == "prefer_blue_filter" and blue is not None:
+                for n in chosen:
+                    if 1 <= n <= len(blue):
+                        blue[n - 1] *= gain
+                blue = _renorm(blue, 1.0)
 
     if blue is not None:
         if (overrides or {}).get("blue_uniform"):
@@ -363,6 +406,151 @@ def evolve_once(draws: List[Dict], use_llm: Optional[bool] = None,
     result["resolution"] = resolution
     result["elapsed_sec"] = round(time.time() - t0, 2)
     return result
+
+
+# ---------- V6：阶段时效标注（让每条规律都带「现在还灵不灵」） ----------
+
+def annotate_hypotheses(draws: List[Dict], registry_path=None,
+                        start: int = 200) -> Dict:
+    """给假说库里的每条假说补一份**阶段画像**（``regime``）并落库。
+
+    为什么必须做这件事：V5 的假说只有「显著/不显著」一个二元状态，
+    用户看到的就是「近期规律都不生效」却查不到是哪一条、从哪年开始失效。
+    阶段画像给出每个年份段的效应与校正后 p、最近窗口效应、以及状态机判决
+    （持续/衰减/陈旧/新兴/反转/未检出），回答的正是「阶段有效性」这个问题。
+
+    实现：能落到维度表的假说用其筛选条件做 as-of 回放；不能落地的
+    （纯结构类/方法权重类）标注 ``no_dimension`` 并说明原因，不假装有结论。
+    """
+    from . import hypothesis
+
+    draws = list(draws or [])          # 归一成 list：_load_registry 的入参约定不能吃 list[dict]
+    reg = hypothesis.load_registry(registry_path)
+    hyps = _as_hyp_list(reg)
+    annotated = 0
+    skipped = 0
+    for h in hyps:
+        act = h.get("action") if isinstance(h.get("action"), dict) else {}
+        spec = act.get("filter") if act.get("type") in ("prefer_red_filter", "prefer_blue_filter") else None
+        if not isinstance(spec, dict) or not spec.get("key"):
+            struct = hypo_structure_filter(h)
+            spec = struct
+        if not spec:
+            h["regime"] = {"status": "no_dimension",
+                           "label_zh": "无可回放维度",
+                           "reason_zh": "该假说不是按维度表述的（结构类/方法权重类），"
+                                        "无法做 as-of 阶段回放；其效果由 A/B 实战验证给出"}
+            skipped += 1
+            continue
+        try:
+            rep = verify_discovery_hypothesis({"action": {"type": "prefer_red_filter",
+                                                          "filter": spec}, "id": h.get("id")},
+                                              draws, start=start)
+            # 结构性缺省：verify_discovery_hypothesis 只返回精简字段，这里用
+            # discovery.regime_of_filter 拿到完整状态机（label_zh/reason_zh）。
+            from . import discovery as _disc
+            full = _disc.regime_of_filter(
+                draws, _disc.make_filter(spec["key"], spec.get("params") or {}), start=start)
+            h["regime"] = {"status": full.get("status"), "label_zh": full.get("label_zh"),
+                           "reason_zh": full.get("reason_zh"),
+                           "n_sig_eras": full.get("n_sig_eras"),
+                           "last_significant_era": full.get("last_significant_era"),
+                           "recent_delta": (full.get("recent") or {}).get("delta"),
+                           "p_adjusted_recent": (full.get("recent") or {}).get("p_adjusted"),
+                           "n_issues": (full.get("scan") or {}).get("n"),
+                           "source": "structure_filter" if not (
+                               act.get("type") in ("prefer_red_filter", "prefer_blue_filter")) else "filter"}
+            annotated += 1
+        except Exception as e:  # noqa: BLE001
+            h["regime"] = {"status": "error", "reason_zh": f"{type(e).__name__}: {e}"}
+            skipped += 1
+    try:
+        hypothesis._save_registry(reg, registry_path)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": str(e), "annotated": annotated}
+    return {"ok": True, "annotated": annotated, "no_dimension": skipped, "total": len(hyps)}
+
+
+def hypo_structure_filter(h: Dict) -> Optional[Dict]:
+    """把 ``prefer_structure`` 假说翻译成等价的维度表筛选条件（可回放）。
+
+    这是让「结构类规律」也能拿到阶段画像的桥：结构规则里的
+    keep_last / neighbors_of_last / gap2 在维度表里都有同名维度，
+    奇偶与三区形态则映射到 ``pattern_cont`` 的条件分布。
+    """
+    act = h.get("action") if isinstance(h.get("action"), dict) else {}
+    if act.get("type") != "prefer_structure":
+        return None
+    rule = act.get("rule")
+    mapping = {
+        "keep_last": {"key": "repeat", "params": {"back": 1}},
+        "avoid_last": {"key": "repeat", "params": {"back": 1}},
+        "neighbors_of_last": {"key": "neighbor", "params": {"back": 1, "offset": 1}},
+        "gap2": {"key": "repeat2", "params": {"back": 2}},
+        "odd_target": {"key": "pattern_cont", "params": {"feature": "odd", "k": 6}},
+        "zone_target": {"key": "zone_lag", "params": {"zone": 0}},
+        "sum_target": {"key": "pattern_cont", "params": {"feature": "sumtail", "k": 6}},
+    }
+    return mapping.get(str(rule))
+
+
+def register_llm_lab_claims(draws: List[Dict], registry_path=None,
+                            start: int = 200) -> Dict:
+    """V6：把 LLM 工坊产出的规律注册成假说（**只注册可落地且不是噪声的**）。
+
+    规则（防止假说库变成垃圾场）：
+    * ``unmappable`` / ``insufficient`` → 不注册（不可验证的东西没有资格进库）；
+    * ``noise`` → 不注册（与随机无异，注册只会稀释库里有效条目）；
+    * ``support`` / ``reject`` / ``regime_only`` → 注册，动作翻译成
+      ``prefer_red_filter`` / ``prefer_blue_filter``，并在 evidence 里带上
+      阶段画像与判定，随后由 ``resolve_registry`` 统一裁决。
+    """
+    from . import hypothesis, llm_lab
+
+    data = llm_lab.load_claims()
+    latest = (data.get("claims") or [])[:40]
+    picked: List[Dict] = []
+    skipped: List[Dict] = []
+    for c in latest:
+        v = c.get("verdict")
+        if v in ("unmappable", "insufficient", "noise", None):
+            skipped.append({"title": c.get("title"), "reason": f"verdict={v}"})
+            continue
+        filters = c.get("filters") or []
+        if not filters:
+            skipped.append({"title": c.get("title"), "reason": "无 filters"})
+            continue
+        f0 = filters[0]
+        if not discovery_params_ok(f0):
+            skipped.append({"title": c.get("title"), "reason": "维度/参数不可落地"})
+            continue
+        target = llm_lab.discovery_target(f0["key"])
+        act = {"type": "prefer_red_filter" if target == "red" else "prefer_blue_filter",
+               "filter": {"key": f0["key"], "params": f0.get("params") or {}}}
+        stmt = f"LLM规律「{c.get('title')}」：维度 {f0['key']} {f0.get('params') or {}}；" \
+               f"阶段判定={c.get('verdict_zh')}；{str(c.get('reason') or '')[:120]}"
+        picked.append(hypothesis._build_hypothesis(
+            family=f"llm_lab_{f0['key']}", statement=stmt, action=act,
+            params={"filter": f0, "mode": c.get("mode")},
+            evidence={"n": c.get("n"), "effect": c.get("effect"),
+                      "p_adjusted": c.get("p_adjusted"),
+                      "regime": (c.get("regime") or {}).get("status"),
+                      "llm_title": c.get("title"), "llm_mechanism": c.get("mechanism")},
+            source="llm", n_samples=int(c.get("n") or 0)))
+    reg = hypothesis.register_hypotheses(picked, registry_path=registry_path)
+    return {"registered": reg, "picked": len(picked), "skipped": skipped[:20],
+            "skipped_n": len(skipped)}
+
+
+def discovery_params_ok(f: Dict) -> bool:
+    from . import discovery
+
+    fam = discovery.FAMILY_BY_KEY.get(str((f or {}).get("key")))
+    if not fam:
+        return False
+    if not fam.get("params"):
+        return True
+    return dict(f.get("params") or {}) in fam["params"]
 
 
 def evolution_status(registry_path=None) -> Dict:
@@ -504,7 +692,8 @@ def _count_status(hyps: List[Dict]) -> Dict[str, int]:
 # ---------- 假说 A/B 实战验证（闭环的最后一环） ----------
 
 def verify_hypothesis_ab(hyp: Dict, draws: List[Dict], n_tickets: int = 10,
-                         start: int = 300, seed: int = 42) -> Dict:
+                         start: int = 300, seed: int = 42,
+                         baseline_method: str = "blue_coverage") -> Dict:
     """用「施加该假说 vs 不施加」的配对回放，给出这条规律的实战效果。
 
     这是把假说从 ``proposed`` 推向 ``validated``/``rejected`` 的关键一步：
@@ -522,11 +711,24 @@ def verify_hypothesis_ab(hyp: Dict, draws: List[Dict], n_tickets: int = 10,
     """
     from . import battle, engine
 
+    # 维度化假说优先走 as-of 口径（对照 = 理论期望，任何假说都有非平凡数字）
     act = hyp.get("action") if isinstance(hyp.get("action"), dict) else {}
+    if act.get("type") in ("prefer_red_filter", "prefer_blue_filter"):
+        return verify_discovery_hypothesis(hyp, draws, start=min(start, 200))
+
     method = str(act.get("method") or "") or None
 
-    base = battle.replay_method("uniform", draws, n_tickets=n_tickets,
-                                start=start, seed=seed)
+    # V5 缺陷修复：对照组曾是 ``uniform``（均匀随机），而系统真实出号是
+    # engine.predict_next 的集成 + 蓝球覆盖优化。拿「结构偏置」去和纯随机比，
+    # 量到的是「蓝球覆盖带来的提升」而不是这条假说的效果，Δ 被系统性虚高。
+    # 现在对照组 = 当前实际部署的基线方法（默认 blue_coverage）。
+    try:
+        base = battle.replay_method(baseline_method, draws, n_tickets=n_tickets,
+                                    start=start, seed=seed)
+    except Exception:  # noqa: BLE001 —— 未知方法名时退回 uniform，不让验证整体失败
+        baseline_method = "uniform"
+        base = battle.replay_method("uniform", draws, n_tickets=n_tickets,
+                                    start=start, seed=seed)
     # 实验组：把该假说标成 validated 后折叠成覆盖项，再作用于候选生成
     probe = dict(hyp)
     probe["status"] = "validated"
@@ -543,8 +745,9 @@ def verify_hypothesis_ab(hyp: Dict, draws: List[Dict], n_tickets: int = 10,
     # 结构/号码级偏置无法在 battle.replay_method 内部注入（它按方法名出号），
     # 故用「结构规则重排 + 命中统计」的方式做配对评估：
     # 对每一期，看该期的真实开奖与「按规则筛选后的候选」是否更好。
+    detail: Dict = {}
     if rules or red_boost or blue_boost:
-        delta_red, delta_blue, n_pair = _ab_structural_delta(
+        delta_red, delta_blue, n_pair, detail = _ab_structural_delta(
             draws, start, rules, red_boost, n_tickets, seed)
     else:
         delta_red, delta_blue, n_pair = 0.0, 0.0, int(base.get("issues") or 0)
@@ -555,35 +758,110 @@ def verify_hypothesis_ab(hyp: Dict, draws: List[Dict], n_tickets: int = 10,
         "n_issues": n_pair,
         "delta_red_hits": round(delta_red, 6),
         "delta_blue_rate": round(delta_blue, 6),
-        "baseline_method": "uniform",
+        "ab_test": detail,
+        "baseline_method": baseline_method,
         "ab": {"rules": [r.get("rule") for r in rules],
                "red_boost": red_boost, "blue_boost": blue_boost,
                "n_tickets": n_tickets, "start": start, "seed": seed},
     }
 
 
+def verify_discovery_hypothesis(hyp: Dict, draws: List[Dict], start: int = 200) -> Dict:
+    """V6：维度化假说的实战验证——as-of 回放 + 阶段画像。
+
+    与 ``verify_hypothesis_ab`` 的区别：后者比较的是「候选重排前后」，对
+    ``boost_method`` / ``prefer_numbers`` 这类不改变候选集合的假说恒等于 0；
+    本函数直接在**真实开奖**上度量筛选条件的效力，因此任何能落地到维度表的假说
+    都有一个非平凡的数字。
+
+    返回结构与 ``verify_hypothesis_ab`` 兼容（含 ``method``/``hyp_id``/``n_issues``/
+    ``delta_red_hits``/``p_adjusted``），可直接交给 ``hypothesis.resolve_registry``；
+    另外附带 ``regime`` 阶段画像与 ``evidence`` 摘要。
+    """
+    from . import discovery, regime
+
+    act = hyp.get("action") if isinstance(hyp.get("action"), dict) else {}
+    spec = act.get("filter") or {}
+    hyp_id = hyp.get("id")
+    if not isinstance(spec, dict) or not spec.get("key"):
+        return {"method": act.get("method"), "hyp_id": hyp_id, "n_issues": 0,
+                "delta_red_hits": 0.0, "verdict": "unverifiable",
+                "note_zh": "该假说不含维度化筛选条件，无法用 discovery 口径验证"}
+    try:
+        flt = discovery.make_filter(str(spec["key"]), spec.get("params") or {})
+        rep = discovery.regime_of_filter(draws, flt, start=start)
+    except Exception as e:  # noqa: BLE001
+        return {"method": act.get("method"), "hyp_id": hyp_id, "n_issues": 0,
+                "delta_red_hits": 0.0, "verdict": "error",
+                "note_zh": f"{type(e).__name__}: {e}"}
+    scan = rep.get("scan") or {}
+    recent = rep.get("recent") or {}
+    delta = recent.get("delta")
+    n = int(scan.get("n") or 0)
+    # 蓝球口径的效应是「命中率差」，需换算成与红球可比的量级（×6 注）后再比较门限，
+    # 否则 1/16 的基线会让任何蓝球差都显得很小。
+    if flt["target"] == "blue" and delta is not None:
+        comparable = float(delta) * 6.0
+    else:
+        comparable = float(delta or 0.0)
+    p_adj = recent.get("p_adjusted")
+    verdict = "无显著差异"
+    if p_adj is not None and p_adj < regime.ALPHA:
+        verdict = "支持" if comparable > 0 else "反对"
+    return {
+        "method": act.get("method"), "hyp_id": hyp_id, "n_issues": n,
+        "delta_red_hits": round(comparable, 6),
+        "delta_native": delta, "target": flt["target"],
+        "p_value": recent.get("p_value"), "p_adjusted": p_adj,
+        "verdict": verdict,
+        "regime": {"status": rep.get("status"), "status_zh": rep.get("label_zh"),
+                   "reason": rep.get("reason_zh"), "n_sig_eras": rep.get("n_sig_eras"),
+                   "last_significant_era": rep.get("last_significant_era")},
+        "baseline_method": "as-of 筛选条件 vs 理论期望",
+        "note_zh": rep.get("note_zh"),
+    }
+
+
 def _ab_structural_delta(draws: List[Dict], start: int, rules: List[Dict],
                          red_boost: List[int], n_tickets: int,
                          seed: int) -> tuple:
-    """配对计算「施加结构/号码偏置」相对基线的红球命中差。
+    """配对计算「施加结构/号码偏置」相对基线出号的**逐注**红球命中差。
 
-    对每一期 t：用 ``draws[:t]`` 生成同样数量的候选，分别在
-    「偏置开启」与「偏置关闭」两种排序下取前 n 注，与该期真实开奖对照。
-    逐期配对 → 返回 (Δ红球均值, Δ蓝球命中率, 配对数)。
+    为什么不能拿「同一批候选池的前 n 注」当两个臂
+    --------------------------------------------
+    V5 的实现是：生成 40 注候选池 → 基线取 ``pool[:n]`` → 实验组按结构得分重排后
+    再取 ``pool[:n]``。两个臂来自同一个池、同一批候选，结构规则只是**改变顺序**；
+    在「每期命中数取均值」的口径下，前 n 个候选的顺序几乎不改变统计量，
+    实测 Δ 恒在 ±0.02 以内（`keep_last` +0.012 / `neighbors_of_last` −0.005 /
+    `odd_target` −0.020），于是所有结构类假说注定「无显著差异」——这不是数据结论，
+    是评估口径的伪影。
+
+    现在的做法（与 ``battle.replay_method`` 的统计口径一致）
+    ------------------------------------------------------
+    两个臂各自**独立采样**、每臂 ``n_tickets`` 注、每期 ``n_tickets × 6`` 个红球位置：
+      · 基线臂：不打分，按采样顺序直接取满 n 注；
+      · 实验臂：采样更多候选（4n），按结构得分降序取前 n 注。
+    每期比较的是「36 个位置上的平均命中率」，配对后差值送 Wilcoxon 符号秩检验。
+
+    诚实边界：两臂随机数不同，存在采样噪声；但噪声在同一 seed 下可复现，
+    且配对检验只看逐期差值，与 ``battle`` 的其它配对比较同一口径。
+
+    返回 ``(Δ红球每注命中, Δ蓝球每注命中率, 配对数, 明细)``。
     """
     import random as _r
 
     from . import engine
 
     d_red: List[float] = []
-    b_on = b_off = 0
+    d_blue: List[float] = []
     n_pair = 0
     for t in range(int(start), len(draws)):
         hist = draws[:t]
         actual = draws[t]
         if not hist or not actual.get("reds"):
             continue
-        rng = _r.Random(int(seed) + t)
+        if isinstance(rules, str):
+            rules = [{"rule": rules}] if rules else []
         try:
             ctx = engine.constraint_ctx(hist)
             models = engine._rebuild_probs("freq", hist) or {}
@@ -591,35 +869,45 @@ def _ab_structural_delta(draws: List[Dict], start: int, rules: List[Dict],
             blue_p = models.get("blue")
             if red_p is None or blue_p is None:
                 continue
-            pool = []
-            for _ in range(max(40, n_tickets * 6)):
-                tk = engine.sample_stat_ticket(np.asarray(red_p, dtype=float),
-                                               np.asarray(blue_p, dtype=float),
-                                               ctx, rng)
-                if tk:
-                    pool.append(tk)
-            if not pool:
-                continue
-            # 基线：原顺序取前 n
-            base_tk = pool[:n_tickets]
-            # 实验：结构规则重排（若规则为空，仅用号码偏置影响采样后的排序）
-            ranked, _ = apply_structure_rules([list(x["reds"]) for x in pool],
-                                              rules, hist)
-            order = {tuple(r): i for i, r in enumerate(ranked)}
-            if red_boost:
-                bs = set(red_boost)
-                exp_tk = sorted(pool, key=lambda x: (-len(bs & set(x["reds"])),
-                                                     order.get(tuple(x["reds"]), 0)))[:n_tickets]
-            else:
-                exp_tk = sorted(pool, key=lambda x: order.get(tuple(x["reds"]), 0))[:n_tickets]
-
-            act_red = set(actual["reds"])
+            red_p = np.asarray(red_p, dtype=float)
+            blue_p = np.asarray(blue_p, dtype=float)
+            act_red = set(int(x) for x in actual["reds"])
             act_blue = actual.get("blue")
-            br = sum(len(set(x["reds"]) & act_red) for x in base_tk) / max(1, len(base_tk))
-            er = sum(len(set(x["reds"]) & act_red) for x in exp_tk) / max(1, len(exp_tk))
-            d_red.append(er - br)
-            b_off += sum(1 for x in base_tk if x.get("blue") == act_blue)
-            b_on += sum(1 for x in exp_tk if x.get("blue") == act_blue)
+
+            def _draw(n: int, rng) -> List[Dict]:
+                out = []
+                for _ in range(n):
+                    tk = engine.sample_stat_ticket(red_p, blue_p, ctx, rng)
+                    if tk:
+                        out.append(tk)
+                return out
+
+            base_pool = _draw(n_tickets, _r.Random(seed + t))
+            exp_pool = _draw(max(n_tickets, 4 * n_tickets), _r.Random(seed + 7919 + t))
+            if not base_pool or not exp_pool:
+                continue
+            base_tk = base_pool[:n_tickets]
+            if rules:
+                ranked, _d = apply_structure_rules([list(x["reds"]) for x in exp_pool], rules, hist)
+                by_key = {tuple(x["reds"]): x for x in exp_pool}
+                chosen = [by_key[tuple(r)] for r in ranked if tuple(r) in by_key][:n_tickets]
+                exp_tk = chosen or exp_pool[:n_tickets]
+            elif red_boost:
+                bs = set(int(x) for x in red_boost)
+                exp_tk = sorted(exp_pool, key=lambda x: -len(bs & set(x["reds"])))[:n_tickets]
+            else:
+                exp_tk = exp_pool[:n_tickets]
+
+            def _red_rate(tks):
+                """每注红球命中数（与 battle 的 ``red_hits_mean`` 同口径）。"""
+                hits = sum(len(set(int(r) for r in x["reds"]) & act_red) for x in tks)
+                return hits / max(1, len(tks))
+
+            d_red.append(_red_rate(exp_tk) - _red_rate(base_tk))
+            d_blue.append(
+                (sum(1 for x in exp_tk if x.get("blue") == act_blue) / max(1, len(exp_tk)))
+                - (sum(1 for x in base_tk if x.get("blue") == act_blue) / max(1, len(base_tk)))
+            )
             n_pair += 1
         except Exception:  # noqa: BLE001
             continue
@@ -627,7 +915,15 @@ def _ab_structural_delta(draws: List[Dict], start: int, rules: List[Dict],
             break
 
     if not n_pair:
-        return 0.0, 0.0, 0
+        return 0.0, 0.0, 0, {}
     import statistics as _st
-    return (_st.fmean(d_red) if d_red else 0.0,
-            (b_on - b_off) / max(1, n_pair * n_tickets), n_pair)
+    dr = _st.fmean(d_red) if d_red else 0.0
+    detail = {}
+    try:
+        from scipy import stats as _sp
+        if len(d_red) >= 20 and any(abs(x) > 1e-12 for x in d_red):
+            w = _sp.wilcoxon(d_red, zero_method="wilcox")
+            detail = {"wilcoxon_stat": float(w.statistic), "wilcoxon_p": float(w.pvalue)}
+    except Exception:  # noqa: BLE001
+        detail = {}
+    return dr, (_st.fmean(d_blue) if d_blue else 0.0), n_pair, detail
