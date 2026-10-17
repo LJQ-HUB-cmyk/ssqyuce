@@ -1407,6 +1407,18 @@ def ml_diagnosis(max_issues: int = Query(800, ge=100, le=3500),
         "ok": bool(diag.get("ok", True)),
         "trusted": bool(diag.get("trusted")),
         "tier": diag.get("tier"),
+        # D-2 修复（tier 语义）：实现者把"多通道结论不一致时取最保守"的判定做在
+        # diagnose_ml_channels 里，并额外给出 channel_tiers / n_channels_trusted /
+        # consistency_zh。API 层原先用白名单 payload，把这几项漏掉了 ——
+        # 前端于是只看到 trusted=False，看不到"为什么"，也无法解释
+        # 「red=monitor 但 blue=signal_found」这种组合。
+        "channel_tiers": diag.get("channel_tiers") or {},
+        "channel_trusted": diag.get("channel_trusted") or {},
+        "n_channels": diag.get("n_channels"),
+        "n_channels_trusted": diag.get("n_channels_trusted"),
+        "consistency_zh": diag.get("consistency_zh") or "",
+        "advisory_only": bool(diag.get("advisory_only")),
+        "advisory_warning_zh": diag.get("advisory_warning_zh") or "",
         "channels": diag.get("channels") or {},
         "params": {"max_issues": int(max_issues), "max_numbers": int(max_numbers),
                    "n_null": int(n_null), "colors": list(colors_t)},
