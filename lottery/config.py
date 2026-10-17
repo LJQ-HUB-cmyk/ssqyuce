@@ -23,8 +23,8 @@ BACKUP_DATA_URL = (os.environ.get("LOTT_BACKUP_DATA_URL") or "").strip() or None
 
 # ---------- 版本信息（前端主页 / API / GitHub 说明统一引用） ----------
 
-APP_VERSION = "2.4.0"          # v8：自适应阶段切分 + 检验口径修正 + 后台任务进度 + 号码格式统一
-APP_BUILD = "2026-10-V8"       # 构建标识（V8 交付批次）
+APP_VERSION = "2.5.0"          # v9：最新预测口径修复 + 诊断整注粘贴 + 规律门槛解释
+APP_BUILD = "2026-10-V9"       # 构建标识（V9 交付批次）
 APP_MILESTONES = {
     "M1": {"status": "done",    "desc": "前端 Tab 工作台 + 规律库扩容 29 条 + 自动挖掘管道 + 任务系统"},
     "M2": {"status": "done",    "desc": "GBDT/RF 概率模型 + 滚动 Brier 加权融合 + 概率校准 + 蓝球独立投票 + ML walk-forward 评估"},
@@ -41,6 +41,7 @@ APP_MILESTONES = {
     "U8": {"status": "done", "desc": "推理型模型输出预算自适应（含预算记忆）+ 设置页模型唯一事实来源 + 观察轮报错聚合 + 上期开奖回执列出上期推荐逐注命中"},
     "U9": {"status": "done", "desc": "历史战绩口径修正：期数取接口实际去重样本（不再是用字面量 N / 各方法相加），样本不足不给最佳方法结论；卡片下移至「上期开奖回执」之后"},
     "V4": {"status": "done", "desc": "诚实口径改造：/api/rigor/randomness + /api/rigor/signal + /api/portfolio/expected-value 三个端点（缺 rigor 模块时优雅降级 503）；前端不再把随机波动当能力展示——所有比率必须带样本量与「样本不足，不构成结论」提示，新增「随机性检验」卡展示最小可检出提升量"},
+    "V9": {"status": "done", "desc": "①修复「刷新后又显示旧预测」的根因：本地残留一条越界期号 2026401（2026-10-15 由已修复的 next_issue() 生成），它在文本与数值排序下都大于同年合法期号，导致 /api/predictions/last 永远返回它。改为按落库时间取候选 + 期号合法性过滤（_valid_issue），并清理脏数据；同时把库内 7 处 ORDER BY issue DESC 全部改为 CAST 数值排序。②「我的号码诊断」改为整注粘贴输入（01 06 12 21 24 31 + 12），不再分蓝/红两个框；解析支持带 + / 不带 + / 逗号 / 前导零。③规则分层语义修正：noise（各阶段未检出）不再是 rejected，改归 monitor——界面上「5 条不可用」实际是「证据不足」，与「已证伪」区分开；并把「为什么没有可用规律」写成可读原因（三道门槛 + 实测的重号率 bootstrap 置信区间）。"},
     "V8": {"status": "done", "desc": "阶段切分与体验修复：①阶段改为数据驱动的自适应切分（默认 block=150 期一段，历史约 23 段；可切回自然年 9 段对照），并对命中数指标改用配对差值 t 检验口径（此前误用二项比例，方差算错导致 p 失真）；实测 family-wise 假阳性 0.045、+0.15 红球/期效应检出力 0.65（自然年口径仅 0.31）②长耗时 AI 闭环/LLM 工坊改为后台任务（/api/rules/closed-loop/async、/api/llm_lab/run/async），前端每 3 秒轮询显示阶段+进度+已用时间，可离开页面 ③全站号码格式统一为 01 06 12 21 24 31 + 12（formatTicket/formatReds/parseRedsInput 单一来源），诊断卡回显统一格式并支持空格/逗号/顿号输入 ④预测/健康接口防前端缓存，服务启动后异步刷新规律快照 ⑤修复「更多→规律时效」入口抽屉未收起"},
     "V7": {"status": "done", "desc": "AI 规律闭环 + 数据对齐：①目标期号改为按真实开奖日历推算（每周二/四/日，BT.expected_issue），数据落后时明确报「缺几期/落后几天」，不再出现 2026401 这类越界期号；抓取改为全量对齐（补回漏抓期）。②本期推荐显示生成时间、数据基准、注数口径；/api/predictions/last 返回 generated_at/data_basis。③新增 lottery/patterns_runtime.py 规律运行时快照（data/patterns_runtime.json），把「阶段时效 + 维度扫描 + 假说库」压缩成低延迟可用清单，engine.predict_next 每期消费：可用规律=阶段持续有效且 A/B 验证通过，其余只监控/否决；默认 shadow 模式（记录影响不改号），LOTT_RULE_APPLY=1 生效。④票级「规律引用」由引擎按真实命中写入，不再由 LLM 自填。⑤/api/rules/{runtime,refresh,closed-loop} 与前端「本期规律使用情况」卡：挖掘→验证→注册→刷新快照→出号，一键闭环"},
     "V6": {"status": "done", "desc": "阶段有效性 + 多维度规律：新增 lottery/regime.py（9 阶段切分 + 逐阶段检验 + BH 校正 + 近 3 期加权 + 持续/新兴/衰减/陈旧/反转/伪规律状态机 + 近 150 期加权检验）、lottery/discovery.py（20 维度族 × 91 组参数的 as-of 快速筛选与阶段画像，单次扫描约数秒）、lottery/llm_lab.py（LLM 规律工坊：全历史阶段序列 + 维度表 + 搜索成本喂给模型，三轮提规律/自我质疑/修订，每条规律强制映射维度表并做 as-of 回放，映射不到判不可验证）；A/B 验证修复（两臂独立采样，结构类假说不再恒为 0 差异；对照组由 uniform 改为实际部署基线）；前端新增「规律时效」工作台（阶段热力图 + 维度扫描 + LLM 工坊 + 检索式核验）"},

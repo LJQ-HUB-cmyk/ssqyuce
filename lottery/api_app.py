@@ -245,6 +245,26 @@ def predict(use_llm: Optional[bool] = None, n_tickets: int = 10,
     return res
 
 
+def _sanitize_issue_order(issues: Sequence[str]) -> List[str]:
+    """期号排序/过滤：剔除越界期号（史料里 seq 应落在当年 1~160）。
+
+    为什么必须做：本地库里残留一条 `2026401` 的预测（2026-10-15 由已修复的
+    `next_issue()` 越界跳号生成）。它**数值上**大于任何 2026 年的合法期号，
+    于是无论按文本排还是按数值排，"最新预测"都会命中它，用户刷新后看到的
+    永远是 15 日那条旧数据（用户反馈第 2 条，两次修复未竟的根因）。
+    """
+    out = []
+    for it in issues or []:
+        s = str(it)
+        if not (len(s) == 7 and s.isdigit()):
+            continue
+        year, seq = int(s[:4]), int(s[4:])
+        if not (2003 <= year <= 2100 and 1 <= seq <= 160):
+            continue
+        out.append(s)
+    return out
+
+
 @app.get("/api/predictions/last")
 def last_predictions():
     """最近一期预测（含**生成时间**与数据基准，V7）。
@@ -254,12 +274,15 @@ def last_predictions():
     """
     from . import backtest as BT
     issue = None
+    # 取候选期号时**先按时间**再按数值：越界/异常期号在两张排序下都可能置顶
+    # （例：2026401 > 2026119），因此以"时间戳最新的一批"为准，再在合法期号里取最大。
     rows = db.get_conn().execute(
-        "SELECT issue FROM predictions ORDER BY issue DESC LIMIT 1").fetchone()
-    tickets = []
-    if rows:
-        issue = rows["issue"]
-        tickets = db.load_predictions(issue)
+        "SELECT issue, MAX(created_at) AS ts FROM predictions GROUP BY issue "
+        "ORDER BY ts DESC, CAST(issue AS INTEGER) DESC LIMIT 12").fetchall()
+    valid = _sanitize_issue_order([r["issue"] for r in rows])
+    issue = max(valid, key=lambda x: int(x)) if valid else (
+        (rows[0]["issue"] if rows else None))
+    tickets = db.load_predictions(issue) if issue else []
     draws = db.load_draws()
     gen_ts = max((t.get("created_at") or 0) for t in tickets) if tickets else None
     meta = {}

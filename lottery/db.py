@@ -263,7 +263,8 @@ def load_draws(limit: Optional[int] = None) -> List[Dict]:
 
 def load_last_draws(n: int) -> List[Dict]:
     rows = get_conn().execute(
-        "SELECT * FROM draws ORDER BY issue DESC LIMIT ?", (int(n),)
+        # 数值排序：文本排序会把越界期号（2026401）排在 2026119 之前
+        "SELECT * FROM draws ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?", (int(n),)
     ).fetchall()
     return [_row_to_draw(r) for r in reversed(rows)]
 
@@ -292,7 +293,8 @@ def save_features(issue: str, payload: dict):
 
 def load_features(issue: Optional[str] = None) -> Optional[Dict]:
     if issue is None:
-        row = get_conn().execute("SELECT payload FROM features ORDER BY issue DESC LIMIT 1").fetchone()
+        row = get_conn().execute(
+            "SELECT payload FROM features ORDER BY CAST(issue AS INTEGER) DESC LIMIT 1").fetchone()
     else:
         row = get_conn().execute("SELECT payload FROM features WHERE issue=?", (issue,)).fetchone()
     return json.loads(row["payload"]) if row else None
@@ -382,18 +384,48 @@ def load_predictions(issue: str) -> List[Dict]:
     return out
 
 
+def _recent_prediction_issues(limit: int = 12) -> List[str]:
+    """按**落库时间**取最近用过的期号（比按期号排序更贴近"哪一期是最新的"）。
+
+    历史 bug 遗留的越界期号（如 2026401）在数值上也大于同年合法期号，
+    纯按期号排会把它当"最新"，这正是"刷新后又是旧数据"的根因。
+    """
+    rows = get_conn().execute(
+        "SELECT issue, MAX(created_at) AS ts FROM predictions GROUP BY issue "
+        "ORDER BY ts DESC, CAST(issue AS INTEGER) DESC LIMIT ?", (int(limit),)).fetchall()
+    return [r["issue"] for r in rows]
+
+
+def _valid_issue(s: str) -> bool:
+    """期号自洽性：7 位数字、年份 2003~2100、当年序号 1~160（历史最多 154）。"""
+    s = str(s or "")
+    if not (len(s) == 7 and s.isdigit()):
+        return False
+    return 2003 <= int(s[:4]) <= 2100 and 1 <= int(s[4:]) <= 160
+
+
 def load_last_predictions() -> List[Dict]:
-    row = get_conn().execute(
-        "SELECT issue FROM predictions ORDER BY issue DESC LIMIT 1"
-    ).fetchone()
-    return load_predictions(row["issue"]) if row else []
+    """最近一期预测：先按落库时间取候选，再在**合法期号**里取最大者。
+
+    全部候选都不合法时（库被历史 bug 污染），退回时间戳最新的那条并如实保留，
+    绝不静默返回空列表让前端以为"没有历史预测"。
+    """
+    cand = _recent_prediction_issues()
+    valid = [i for i in cand if _valid_issue(i)]
+    issue = max(valid, key=lambda x: int(x)) if valid else (cand[0] if cand else None)
+    return load_predictions(issue) if issue else []
 
 
 def recent_prediction_issues(n: int = 20) -> List[str]:
+    """最近 n 个预测期号：合法期号按期号降序，越界期号置尾（不丢弃、不隐藏）。"""
     rows = get_conn().execute(
-        "SELECT DISTINCT issue FROM predictions ORDER BY issue DESC LIMIT ?", (int(n),)
+        "SELECT DISTINCT issue FROM predictions ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?",
+        (int(n),)
     ).fetchall()
-    return [r["issue"] for r in rows]
+    got = [r["issue"] for r in rows]
+    valid = sorted([i for i in got if _valid_issue(i)], key=lambda x: -int(x))
+    invalid = [i for i in got if not _valid_issue(i)]
+    return (valid + invalid)[: int(n)]
 
 
 # ---------- eval ----------
@@ -532,7 +564,8 @@ def cumulative_eval(method: Optional[str] = None, limit: int = 120) -> Dict:
     args: List = []
     if method:
         sql += " WHERE method=?"; args.append(method)
-    sql += " ORDER BY issue DESC, method, seq LIMIT ?"; args.append(int(limit) * 50)
+    sql += " ORDER BY CAST(issue AS INTEGER) DESC, method, seq LIMIT ?"
+    args.append(int(limit) * 50)
     rows = [dict(r) for r in get_conn().execute(sql, args).fetchall()]
     by_method: Dict[str, Dict] = {}
     for r in rows:
@@ -580,7 +613,7 @@ def method_recommendations(limit: Optional[int] = None, min_sample: Optional[int
     rows = [dict(r) for r in get_conn().execute(
         "SELECT issue, method, SUM(reward) reward, SUM(ticket_cost) cost, "
         "AVG(red_hits) red, AVG(blue_hit) blue FROM eval_details "
-        "GROUP BY issue, method ORDER BY issue DESC").fetchall()]
+        "GROUP BY issue, method ORDER BY CAST(issue AS INTEGER) DESC").fetchall()]
     by_issue: Dict[str, Dict[str, Dict]] = {}
     for r in rows:
         by_issue.setdefault(r["issue"], {})[r["method"]] = r

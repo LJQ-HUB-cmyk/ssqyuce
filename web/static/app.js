@@ -733,14 +733,24 @@ function recalcPredictConfig() {
 // ==================== 诊断 ====================
 
 function runDiagnose() {
-  const redsStr = ($("#diagReds")?.value || "").trim();
-  const blueStr = ($("#diagBlue")?.value || "").trim();
-  if (!redsStr || !blueStr) { toast("请输入红球和蓝球"); return; }
-  // 解析口径与复制格式一致：空格/逗号/顿号都接受，号码可带前导零
-  const reds = parseRedsInput(redsStr);
-  const blue = parseInt(blueStr, 10);
+  // 用户反馈：红球、蓝球分成两个输入框不方便 —— 现在直接粘贴整注（与复制的格式一致）。
+  // 兼容两种输入：`01 06 12 21 24 31 + 12`（带 +）与 `01 06 12 21 24 31 12`（纯空格）。
+  const raw = ($("#diagTicket")?.value || "").trim();
+  if (!raw) { toast("请输入整注号码，如 01 06 12 21 24 31 + 12"); return; }
+  // 先按 + 切分：左侧是红球、右侧是蓝球（最贴合复制的 `01 06 ... + 12` 格式）
+  const plus = raw.split("+");
+  let blue = null;
+  let red_raw = raw;
+  if (plus.length >= 2) {
+    red_raw = plus.slice(0, -1).join("+");
+    blue = parseInt(plus[plus.length - 1].trim(), 10);
+  }
+  const reds = parseRedsInput(red_raw);
+  if (blue === null && reds.length > 6) {
+    blue = reds.pop();                                       // 无 + 时末位视为蓝球
+  }
   if (reds.length !== 6 || new Set(reds).size !== 6 || blue < 1 || blue > 16) {
-    toast("红球需6个不重复1-33整数，蓝球需1-16"); return;
+    toast("请按 01 06 12 21 24 31 + 12 格式输入（红球 6 个不重复 1-33，蓝球 1-16）"); return;
   }
   setBusy("#btnDiagnose", "诊断中…");
   $("#diagResult").innerHTML = '<div class="note">⏳ 诊断运行中，请稍候…</div>';

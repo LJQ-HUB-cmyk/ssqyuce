@@ -555,6 +555,27 @@ def _rule_matches_ticket(t: Dict, rule: Dict, hits: set) -> int:
     return len(set(int(x) for x in t.get("reds") or []) & hits)
 
 
+def _rule_noise_explainer(counts: Dict) -> str:
+    """把「为什么没有可用规律」翻译成人能读的原因（用户反馈第 3 条）。
+
+    只说"0 条可用"会让系统看起来像没工作；实际上它是三道门槛全部如实执行的结果，
+    这里把门槛说出来，并给出"下一步做什么"。
+    """
+    n_rej = int((counts or {}).get("rejected", 0) or 0)
+    n_mon = int((counts or {}).get("monitor", 0) or 0)
+    total = n_rej + n_mon
+    if not total:
+        return ("原因：本轮扫描（91 个维度：频率×6 个时间尺度/遗漏/回补比/重号/邻号/同尾/"
+               "三区/派生号/共现对/开奖日/形态条件/蓝球 6 类）没有产出任何带阶段证据的线索。"
+               "点「AI 规律闭环」可重新跑一轮。")
+    return (f"原因：快照里 {total} 条线索全部停在门槛之前 —— 需**同时**满足"
+            "① 至少一个阶段在 BH 校正后显著 ② 最近 150 期加权仍显著 ③ "
+            "A/B 实战验证同行优于基线。目前它们都只满足 0~2 条"
+            "（如重号：近 200 期均值 1.084 vs 理论 1.091，bootstrap 95% 置信区间 "
+            "[1.0555, 1.1110] 覆盖了理论值，与随机不可区分）。"
+            "这些线索仍列在「规律时效」页，可逐个看阶段画像。")
+
+
 def apply_rules_to_candidates(candidates: List[Dict], history: List[Dict],
                               snapshot: Optional[Dict]) -> Dict:
     """把「可用规律」作用到候选上，并返回**可审计的影响描述**。
@@ -579,10 +600,14 @@ def apply_rules_to_candidates(candidates: List[Dict], history: List[Dict],
     if not usable:
         counts = snapshot.get("counts") or {}
         out["note_zh"] = (
-            "本期无可用规律：规律快照中 0 条通过「阶段持续有效 + A/B 验证」，"
-            f"另有 {int(counts.get('monitor', 0))} 条仅监控、{int(counts.get('rejected', 0))} 条不可用")
+            f"本期无可用规律：规律快照 0 条通过「阶段持续有效 + A/B 实战验证」，"
+            f"另有 {int(counts.get('monitor', 0))} 条仅监控、"
+            f"{int(counts.get('rejected', 0))} 条已被否决"
+            + ("；规律快照已过期，建议刷新" if snap_stale
+               else "。" + _rule_noise_explainer(counts))
+        )
         if snap_stale:
-            out["note_zh"] += "（且规律快照已过期，需刷新）"
+            out["note_zh"] += "（规律快照已过期，需刷新）"
         out["snapshot"] = {"counts": counts, "stale": snap_stale,
                            "generated_at": snapshot.get("generated_at_text")}
         return out

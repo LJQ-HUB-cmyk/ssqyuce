@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>双色球智能预测分析系统</title>
-<link rel="stylesheet" href="/static/style.css?v=20261018.1">
+<link rel="stylesheet" href="/static/style.css?v=20261018.2">
 <!-- ECharts CDN + 本地 fallback -->
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"
   onerror="this.src='/static/vendor/echarts.min.js?v=20260817.7'"></script>
@@ -83,8 +83,7 @@
         <div class="card">
           <h2>🔍 我的号码诊断</h2>
           <div class="diagnose-input">
-            <input id="diagReds" placeholder="红球：空格式或逗号皆可，如 01 04 07 12 28 31" maxlength="60">
-            <input id="diagBlue" type="number" min="1" max="16" placeholder="蓝球 1-16">
+            <input id="diagTicket" placeholder="整注粘贴即可，如 01 06 12 21 24 31 + 12" maxlength="60">
             <button id="btnDiagnose" onclick="runDiagnose()">诊断</button>
           </div>
           <div id="diagResult"></div>
@@ -569,7 +568,7 @@
   </aside>
 
   
-      <footer>双色球智能预测分析系统 <span class="badge badge-ver" id="verText">v2.4.0</span>（M1-M5 + U1-U9 + V4~V8 已上线）· 仅供研究参考 · 随机性诚实声明 · 数据源 e.17500.cn</footer>
+      <footer>双色球智能预测分析系统 <span class="badge badge-ver" id="verText">v2.5.0</span>（M1-M5 + U1-U9 + V4~V8 已上线）· 仅供研究参考 · 随机性诚实声明 · 数据源 e.17500.cn</footer>
 </div>
 
 <!-- 号码详情弹窗（全局：任意 Tab 均可触发） -->
@@ -584,6 +583,6 @@
 </div>
 
 <div id="toast"></div>
-<script src="/static/app.js?v=20261018.1"></script>
+<script src="/static/app.js?v=20261018.2"></script>
 </body>
 </html>

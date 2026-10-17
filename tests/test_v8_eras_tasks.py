@@ -231,6 +231,13 @@ def _js_fn(name: str) -> str:
     return m.group(0)
 
 
+def test_index_has_single_ticket_input():
+    """诊断卡只保留一个输入框（整注粘贴），不再分蓝/红两个框。"""
+    idx = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+    assert 'id="diagTicket"' in idx
+    assert 'id="diagReds"' not in idx and 'id="diagBlue"' not in idx
+
+
 def test_js_format_helpers_are_single_source_of_truth():
     """号码格式只允许由 formatTicket/formatReds 产出（防止再出现第二种写法）。"""
     assert "function formatTicket" in APP_JS
@@ -259,10 +266,25 @@ def test_js_format_helpers_output_matches_copy_button_format():
 
 
 def test_js_diagnose_uses_unified_format_and_parser():
-    """「我的号码诊断」必须回显统一格式、并接受空格式输入。"""
-    assert "parseRedsInput(redsStr)" in APP_JS
+    """「我的号码诊断」必须支持整注粘贴并回显统一格式（用户反馈第 1 条）。"""
+    assert 'id="diagTicket"' not in APP_JS           # 输入框在 index.html，不在此
+    assert "parseRedsInput(red_raw)" in APP_JS
+    assert 'raw.split("+")' in APP_JS
     assert "formatTicket(p.reds || reds" in APP_JS
     assert "copyDiagnoseTicket" in APP_JS
+
+
+def test_predictions_latest_ignores_out_of_range_issue():
+    """回归：库里残留的越界期号 2026401（文本/数值排序都最大）会被当"最新预测"。"""
+    from lottery import db
+    assert hasattr(db, "_valid_issue")
+    assert db._valid_issue("2026119") and not db._valid_issue("2026401")
+    assert db._valid_issue("2026666") is False
+    assert db._valid_issue("2026001") is True
+    sql_src = (ROOT / "lottery" / "db.py").read_text(encoding="utf-8")
+    # 「最新一期预测」的取法必须是"时间优先 + 合法期号过滤"
+    assert "MAX(created_at) AS ts" in sql_src
+    assert "_valid_issue" in sql_src
 
 
 def test_js_uses_async_task_endpoints():

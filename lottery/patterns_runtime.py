@@ -51,8 +51,13 @@ MIN_DRAWS_FOR_SNAPSHOT = 500
 
 # 允许进入出号链路的阶段状态。注意 ``emerging`` 只进 monitor：
 # 只有一个阶段显著就拿来改号，等于把「搜索出来的假阳性」直接变成投注。
+# 「阶段未检出（noise）」不应与「已证伪（flipped / A/B 反对）」混为一谈：
+# 前者是"证据不足、值得继续观察"，后者是"有反向证据、应淘汰"。
+# 早期版本把 noise 也归入 rejected，界面上就出现「5 条不可用」这种
+# 看起来像"全被判死"的误导性计数（用户反馈第 3 条）。
 USABLE_STATUSES = ("persistent",)
-MONITOR_STATUSES = ("emerging", "fading", "stale", "reversed", "insufficient")
+MONITOR_STATUSES = ("emerging", "fading", "stale", "reversed", "insufficient", "noise")
+REJECTED_STATUSES = ("flipped",)
 
 
 def _now() -> float:
@@ -112,18 +117,24 @@ def build_snapshot(draws: Sequence[Dict], scan: Optional[Dict] = None,
                        "reason": rep.get("reason_zh"),
                        "effect": rep.get("recent_delta"), "p_adjusted": rep.get("p_adjusted_recent")},
             "usable": bool(usable),
-            "tier": "usable" if usable else ("monitor" if status in MONITOR_STATUSES else "rejected"),
+            "tier": ("usable" if usable
+                     else ("rejected" if (status in REJECTED_STATUSES
+                                          or h.get("status") == "rejected")
+                           else "monitor")),
             "evidence_text": _evidence_text(h, rep),
         })
-    # 2) 维度扫描里「阶段持续有效」的维度——它们是当前数据里唯一有阶段证据的线索
+    # 2) 维度扫描里**任何**有阶段证据的线索（含 noise）都进快照，只是分层不同。
+    #    之前只收 persistent/emerging/fading，一旦假说库为空（重启后被清空），
+    #    快照就是 0 条 —— 界面便退化成"系统什么都没分析"，等于白做一轮扫描。
+    tier_of_scan = {"persistent": "monitor", "emerging": "monitor", "fading": "monitor",
+                    "stale": "monitor", "flipped": "rejected", "reversed": "monitor",
+                    "noise": "monitor"}
     for it in (scan.get("items") or []):
-        conf = "filter"
         st = it.get("status")
-        if st not in ("persistent", "emerging", "fading"):
+        if st not in tier_of_scan:
             continue
         f = it.get("filter") or {}
         q = it.get("quick") or {}
-        tier = "monitor"          # 扫描候选未经 A/B 验证，一律只监控
         rules.append({
             "id": f"scan:{f.get('key')}:{json.dumps(f.get('params') or {}, sort_keys=True)}",
             "source": "discovery", "statement": f"{f.get('name_zh')} {f.get('params')}",
@@ -132,13 +143,18 @@ def build_snapshot(draws: Sequence[Dict], scan: Optional[Dict] = None,
             "regime": {"status": st, "label": it.get("status_zh"),
                        "reason": it.get("reason_zh"), "effect": q.get("delta"),
                        "p_adjusted": q.get("p_adjusted")},
-            "usable": False, "tier": tier,
+            "usable": False, "tier": tier_of_scan[st],
             "evidence_text": f"{f.get('name_zh')} {f.get('params')}：{it.get('status_zh')}；"
                              f"近窗效应 {q.get('delta')}，BH p={q.get('p_adjusted')}",
         })
     counts = {"usable": sum(1 for r in rules if r["tier"] == "usable"),
               "monitor": sum(1 for r in rules if r["tier"] == "monitor"),
-              "rejected": sum(1 for r in rules if r["tier"] == "rejected")}
+              "rejected": sum(1 for r in rules if r["tier"] == "rejected"),
+              "tier_legend": {
+                  "usable": "可用：阶段持续有效 + A/B 验证通过",
+                  "monitor": "仅监控：证据不足（各阶段未检出）或阶段曾显著但未复现",
+                  "rejected": "已否决：方向反转或被 A/B 判负",
+              }}
     return {
         "version": SNAPSHOT_VERSION,
         "generated_at": _now(),
