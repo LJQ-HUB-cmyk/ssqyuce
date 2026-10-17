@@ -65,6 +65,16 @@ _SCHEMA_VERSION_DDL = """CREATE TABLE IF NOT EXISTS schema_version (
     applied_at REAL NOT NULL
 )"""
 
+# 迁移前热备的兜底参数（V10 二次评审 A2）：只读连接 + 有限超时 + 分页拷贝，
+# 避免在库被占用时无限重试导致进程挂死。
+_BACKUP_TIMEOUT = 10.0          # 秒；sqlite3.connect(timeout=...)
+_BACKUP_PAGE_CHUNK = 256        # 每批拷贝页数，减小长时间持锁窗口
+
+
+def _log(msg: str) -> None:
+    """迁移日志（与其他模块 ``[xxx]`` 前缀口径一致）。"""
+    print(f"[migrations] {msg}")
+
 
 # ---------- 版本与备份 ----------
 
@@ -108,24 +118,69 @@ def backup_path_for(conn: sqlite3.Connection, version: int) -> Optional[Path]:
     return path.with_name(f"{path.name}.pre-migrate-v{int(version)}")
 
 
+def has_existing_data(conn: sqlite3.Connection) -> bool:
+    """库内是否已有用户数据（而非刚创建的空库）。
+
+    V10 二次评审 A1 修复背景
+    ------------------------
+    旧实现用 ``current > 0`` 作为"是否需要备份"的判据，但**没有 ``schema_version``
+    表的老库** ``current_version()`` 返回 **0**，于是"最需要备份的老库升级"反而
+    **一行备份都不做**——正好击中"生产库零备份"这个立项理由。
+
+    改为按"有没有既有数据"判断：
+      * 空库（刚 created、无任何用户表数据）→ 不备份（没有可丢的东西）；
+      * **有数据的库（无论有没有 schema_version 表）→ 必须备份**。
+    """
+    # 除迁移自身维护的 schema_version 外，是否还有其它含数据的表
+    names = [r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+    for name in names:
+        if name == "schema_version":
+            continue
+        try:
+            row = conn.execute(f'SELECT 1 FROM "{name}" LIMIT 1').fetchone()
+        except sqlite3.Error:
+            continue
+        if row is not None:
+            return True
+    return False
+
+
 def backup_before_migrate(conn: sqlite3.Connection, version: int) -> Optional[Path]:
     """迁移前一致性热备（``Connection.backup``），返回备份文件路径。
 
     先写 ``.tmp`` 再 ``os.replace``，避免备份过程中留下的半截文件被误当作备份。
+
+    V10 二次评审 A2 修复背景
+    ------------------------
+    旧实现直接用**调用方的** ``conn`` 做 ``Connection.backup()``。当调用方已有未提交
+    事务时，``backup()`` 遇 BUSY 会无限重试 → 进程挂死，且让 SAVEPOINT 嵌套分支
+    永远不可达（变异删掉该分支测试仍全绿 = 零覆盖）。
+
+    改为：**另开一个只读连接**做热备，与调用方事务完全隔离：
+      * 不参与调用方事务，因此不会触发 BUSY 自杀锁；
+      * 也不会把调用方未提交的中间态写进备份。
+    并对 ``backup()`` 设置页数上限与超时兜底，仍失败则抛错（fail-closed）。
     """
     dest = backup_path_for(conn, version)
     if dest is None:
         return None
+    path = db_file_path(conn)
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_name(dest.name + ".tmp")
-    for stale in (tmp,):
-        if stale.exists():
-            stale.unlink()
-    target = sqlite3.connect(str(tmp))
+    if tmp.exists():
+        tmp.unlink()
+
+    # 独立只读连接：与调用方事务解耦，避免 BUSY 无限重试
+    src = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=_BACKUP_TIMEOUT)
     try:
-        conn.backup(target)
+        target = sqlite3.connect(str(tmp), timeout=_BACKUP_TIMEOUT)
+        try:
+            src.backup(target, pages=_BACKUP_PAGE_CHUNK)
+        finally:
+            target.close()
     finally:
-        target.close()
+        src.close()
     os.replace(str(tmp), str(dest))
     return dest
 
@@ -177,8 +232,11 @@ def _run_batch(conn: sqlite3.Connection,
 def apply(conn: sqlite3.Connection, *, backup: bool = True) -> int:
     """执行全部待执行迁移，返回执行后的 schema_version。
 
-    * ``backup=True``（默认）：有待执行迁移且当前版本 > 0 时，先做一致性热备
-      （见 :func:`backup_before_migrate`）；备份失败则**不迁移**。
+    * ``backup=True``（默认）：有待执行迁移且**库内已有数据**时，先做一致性热备
+      （见 :func:`backup_before_migrate`）；备份失败则**不迁移**（fail-closed）。
+      **注意**：判据是"有没有既有数据"，不是"schema_version > 0"。老库（无
+      ``schema_version`` 表、但含真实开奖数据）升级时 ``current == 0``，旧实现
+      因此跳过备份——这是 V10 二次评审 A1 修复的真实缺陷。
     * 幂等：已是最新版本时直接返回，不备份、不写库。
     * 失败：整体回滚（含 DDL），``schema_version`` 不前进，异常原样抛出。
     """
@@ -187,9 +245,13 @@ def apply(conn: sqlite3.Connection, *, backup: bool = True) -> int:
     if not pending:
         return int(current)
 
-    if backup and current > 0:
-        # fail-closed：备份不成功就不迁移，避免"迁移后才发现无路可退"
-        backup_before_migrate(conn, current)
+    if backup:
+        # A1：老库（current==0）同样必须备份——判据改为"库内是否有既有数据"
+        if has_existing_data(conn):
+            # fail-closed：备份不成功就不迁移，避免"迁移后才发现无路可退"
+            backup_before_migrate(conn, current)
+        else:
+            _log("库内无既有数据，跳迁移前备份（空库无可丢内容）")
 
     _run_batch(conn, pending)
     return current_version(conn)

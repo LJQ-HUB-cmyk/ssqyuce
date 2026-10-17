@@ -185,6 +185,8 @@ cmd_backup() {
   find "$BACKUP_DIR" -maxdepth 1 -name '.staging.*' -mtime +1 -exec rm -rf {} + 2>/dev/null || true
 
   # 防并发：上一轮还没跑完就跳过本轮
+  # 锁文件只含 PID、不含数据，但权限统一收紧到 600（备份目录本身已是 700）
+  ( umask 077; : >"$BACKUP_DIR/.ssq-backup.lock" ) 2>/dev/null || true
   exec 9>"$BACKUP_DIR/.ssq-backup.lock"
   if ! flock -n 9; then
     log "上一次备份仍在运行，本轮跳过"
@@ -244,18 +246,33 @@ cmd_backup() {
     echo "restore_note=见 DEPLOY.md 第七节：tar -xzf <归档> -C <目标目录>"
   } >"$staging/MANIFEST.txt"
 
-  # 5) 打包（600：归档内含 llm_config.json 的 API Key）
-  ( cd "$staging" && tar -czf "$archive" . )
-  chmod 600 "$archive"
-  log "备份完成：$archive（$(du -h "$archive" | cut -f1)），排除 ml_models/，缺失=${missing[*]:-无}"
+  # 5) 打包到 .tmp，校验通过后才原子改名（A3）
+  #    旧实现直接写最终文件名：中途被打断会留下"撕裂归档"（实测 142KB vs 正常 200MB+），
+  #    而且它会占住 retention 名额与 latest_archive 的"最新"位置。
+  #    归档内含 llm_config.json 的 API Key，因此 umask 收紧 + chmod 600。
+  local archive_tmp="${archive}.tmp"
+  rm -f "$archive_tmp"
+  ( umask 077; cd "$staging" && tar -czf "$archive_tmp" . ) || {
+    rm -f "$archive_tmp"
+    log "ERROR: 打包失败，已删除半成品，未产生任何归档"
+    return 1
+  }
+  chmod 600 "$archive_tmp"
 
-  # 6) 立刻校验一次（备份不能只看"文件生成了"）
-  if verify_dir "$staging" >/tmp/.ssq-backup-verify.$$ 2>&1; then
+  # 6) 立刻校验一次（备份不能只看"文件生成了"）；失败必须非零退出并保留现场（A4）
+  local verify_out="/var/log/ssq-backup-verify.$(date +%Y%m%d-%H%M%S).log"
+  if verify_dir "$staging" >"$verify_out" 2>&1; then
+    mv -f "$archive_tmp" "$archive"
+    chmod 600 "$archive"
+    log "备份完成：$archive（$(du -h "$archive" | cut -f1)），排除 ml_models/，缺失=${missing[*]:-无}"
     log "备份自检通过：期数=$draws，全部 *.json 均可 json.load"
+    rm -f "$verify_out"
   else
-    log "ERROR: 备份自检失败，详见 /tmp/.ssq-backup-verify.$$"
+    # A4：旧实现只 log 一句、脚本仍 exit 0，且排错现场被当场 rm
+    rm -f "$archive_tmp"
+    log "ERROR: 备份自检失败（未生成归档）；排错详情保留在 $verify_out"
+    return 1
   fi
-  rm -f /tmp/.ssq-backup-verify.$$
 
   # 7) 保留最近 RETENTION 份
   local old
