@@ -812,3 +812,587 @@ def replay_summary(results: Sequence[Dict]) -> List[Dict]:
             "roi": r.get("roi", 0.0),
         })
     return out
+
+
+# ==========================================================================
+# V10-09：LLM 出号**独立 A/B 对照臂**（非规律库路径）
+# ==========================================================================
+#
+# 为什么不是 `replay_method`
+# -------------------------
+# R3 G2 明确：LLM 不可历史回放（对 3215 期各调一次外部模型既不feasible也不可复现，
+# 见模块 docstring 的 ``NON_REPLAYABLE_METHODS["llm"]``）。所以 LLM 这一臂的唯一
+# 证据来源是**真实已发生**的在线预测记录 —— ``eval_details`` 表里逐注落库的
+# ``(issue, method, seq, red_hits, blue_hit, ...)``。本模块新增的函数只读这张表，
+# 一行都不生成、一行都不凭空构造：**没有记录就是没有记录**（诚实边界）。
+#
+# 为什么 LLM 永不进规律库/候选池（R3 G1）
+# --------------------------------------
+# 方案原条款「LLM 候选须 experiments.status == "passed" 才能进候选池」是死锁：
+#   * hypothesis.evaluate_prereg() 要有支持才升 validated；
+#   * patterns_runtime 要 regime == persistent 才 usable；
+#   * battle.replay_method 明确 llm 不可回放 → A/B 永远无法"通过"。
+# 三者叠加 → passed 集合恒为空 → LLM 永远出不了号（"AI 空转"只是换了地方重装）。
+# 裁决：LLM 出号走**独立对照臂**，门槛降为「不劣于基线」，允许长期停在 eligible。
+#
+# 设计上的一致性要求（可被测试守住）
+# --------------------------------
+# 本节的函数**只**读 ``eval_details``：不读 experiments / prereg / usable / 假说库。
+# 因此无论假说库是空的、全 failed、还是根本不存在，对照臂的结论都不受影响
+# —— 这就是"防死锁"在代码层面的落地方式（``test_v10_llm_arm.py`` T7–T9 守）。
+#
+# 统计口径（为什么以「期」为独立性单位）
+# ------------------------------------
+# 一期内同一臂的多注共用**同一注开奖**，注与注之间强相关（命中数同向波动）。
+# 把 N 注当成 N 个独立样本会把标准误缩小约 sqrt(N) 倍、凭空造出显著性。
+# 因此：逐注配对只用于**描述**（``per_ticket`` 明细），而**显著性检验的输入是
+# 每期的平均值序列**（``strategy_hits`` / ``baseline_hits``），N 期就是 N 个
+# 独立观测。这与 ``compare_methods`` 的逐期口径一致。
+
+# 结论四档（R3 G2：「允许永远 eligible 且默认关」）
+LLM_ARM_VERDICT_IMPROVED = "improved"
+LLM_ARM_VERDICT_NOT_WORSE = "not_worse"
+LLM_ARM_VERDICT_INSUFFICIENT = "insufficient_sample"
+LLM_ARM_VERDICT_WORSE = "worse"
+
+LLM_ARM_VERDICT_ZH: Dict[str, str] = {
+    LLM_ARM_VERDICT_IMPROVED: "显著优于基线",
+    LLM_ARM_VERDICT_NOT_WORSE: "不劣于基线（无显著差异）",
+    LLM_ARM_VERDICT_INSUFFICIENT: "样本不足",
+    LLM_ARM_VERDICT_WORSE: "显著劣于基线",
+}
+
+# 哪些档位允许该臂继续参战（eligible）
+LLM_ARM_ELIGIBLE_VERDICTS = frozenset({
+    LLM_ARM_VERDICT_IMPROVED,
+    LLM_ARM_VERDICT_NOT_WORSE,
+    LLM_ARM_VERDICT_INSUFFICIENT,     # ← 关键：样本不足不得判死，否则又是死锁
+})
+
+# 可作为基线的方法族（llm 自己不能当基线）
+LLM_ARM_BASELINE_FAMILIES = ("stat", "ml", "blend", "uniform")
+
+
+def _is_llm_method(method: object) -> bool:
+    return str(method or "").strip().lower().startswith("llm:")
+
+
+def _pairable_arms(rows: Sequence[Dict]) -> Dict[str, Dict[str, List[Dict]]]:
+    """把 eval_details 行整理成 ``{arm: {issue: [row, ...]}}``（按 seq 升序）。
+
+    ``arm`` 是方法名字符串本身（例如 ``llm:agent-router/deepseek-v4-flash``）。
+    只保留合法行（issue 非空、有 red_hits）；确定性排序保证可复现。
+    """
+    out: Dict[str, Dict[str, List[Dict]]] = {}
+    for r in rows or []:
+        method = str(r.get("method") or "").strip()
+        issue = str(r.get("issue") or "").strip()
+        if not method or not issue or r.get("red_hits") is None:
+            continue
+        out.setdefault(method, {}).setdefault(issue, []).append(dict(r))
+    for per_issue in out.values():
+        for issue_rows in per_issue.values():
+            issue_rows.sort(key=lambda x: int(x.get("seq") or 0))
+    return out
+
+
+def _paired_issue_block(arm_rows: Dict[str, List[Dict]],
+                        base_rows: Dict[str, List[Dict]],
+                        max_tickets: Optional[int] = None) -> Dict:
+    """按「同期 + 同 n_tickets + 逐注配对」抽出两臂的可配对期。
+
+    配对规则（一条都不放宽，放宽了就不是配对设计）：
+      1. **同期**：两臂都必须在同一 ``issue`` 有记录；
+      2. **同 n_tickets**：该期内两臂注数必须相等（否则不是同一规模的口径）；
+      3. **逐注配对**：按 ``seq`` 一一对应（第 k 注对第 k 注），配对数 = min(注数)。
+
+    返回 ``{"issues", "red_s", "red_b", "blue_s", "blue_b", "per_ticket",
+    "n_pairs", "n_issues", "dropped_ticket_mismatch", "ticket_mismatch_detail",
+    "ticket_counts"}``。其中 ``red_s``/``red_b`` 是**逐期均值**序列（检验输入），
+    ``per_ticket`` 是注级差值明细（仅描述，注间相关不可当独立样本）。
+    """
+    common = sorted(set(arm_rows) & set(base_rows),
+                    key=lambda x: (len(x), x))       # 数值期号优先；异常期号兜底
+    out: Dict = {
+        "issues": [], "red_s": [], "red_b": [], "blue_s": [], "blue_b": [],
+        "per_ticket": [], "n_pairs": 0, "n_issues": 0,
+        "dropped_ticket_mismatch": 0, "ticket_mismatch_detail": [],
+        "ticket_counts": [],
+    }
+    for issue in common:
+        a = arm_rows[issue]
+        b = base_rows[issue]
+        k = min(len(a), len(b))
+        if len(a) != len(b):
+            out["dropped_ticket_mismatch"] += 1
+            out["ticket_mismatch_detail"].append(
+                {"issue": issue, "arm_tickets": len(a), "baseline_tickets": len(b)})
+            continue
+        if max_tickets is not None and len(a) > int(max_tickets):
+            continue
+        if k <= 0:
+            continue
+        a_red = [float(x["red_hits"]) for x in a[:k]]
+        b_red = [float(x["red_hits"]) for x in b[:k]]
+        a_blu = [float(x.get("blue_hit") or 0) for x in a[:k]]
+        b_blu = [float(x.get("blue_hit") or 0) for x in b[:k]]
+        out["issues"].append(issue)
+        out["red_s"].append(float(np.mean(a_red)))
+        out["red_b"].append(float(np.mean(b_red)))
+        out["blue_s"].append(float(np.mean(a_blu)))
+        out["blue_b"].append(float(np.mean(b_blu)))
+        out["ticket_counts"].append(k)
+        for kk in range(k):
+            out["per_ticket"].append({
+                "issue": issue, "seq": kk + 1,
+                "arm_red": a_red[kk], "baseline_red": b_red[kk],
+                "d_red": a_red[kk] - b_red[kk],
+                "arm_blue": a_blu[kk], "baseline_blue": b_blu[kk],
+                "d_blue": a_blu[kk] - b_blu[kk],
+            })
+        out["n_pairs"] += k
+    out["n_issues"] = len(out["issues"])
+    return out
+
+
+def _two_sided(summary: Dict, n_trials: int = 1, alpha: float = 0.05) -> Dict:
+    """把 ``rigor.strategy_significance`` 的结果改成 **A/B 对照需要的双侧口径**。
+
+    为什么不直接用 ``rigor.strategy_significance`` 的 ``adjusted_p``：
+    它的 ``p_value`` 是**单侧**的，方向由观测差值的符号决定
+    （``p_two/2 if delta>0 else 1-p_two/2``）——这是为「策略 vs 理论基线」这种
+    **预先只有一个研究方向**的场景设计的：策略比基线好才值得报。
+    但对照臂是双向的：LLM **显著更差**同样是一个必须被检出的结论。
+    实测：策略每期比基线少 1.9 个红球时，``adjusted_p`` 返回 **1.0**
+    （完美地"不显著"），而 ``p_two_sided`` 是 1.4e-08。
+    若不修正，``worse`` 这一档在本任务里**永远不可能被触发**（假绿）。
+
+    因此：以 ``p_two_sided`` 为未校正 p，按 ``n_trials`` 做 Bonferroni 校正。
+    单侧值原样保留在 ``p_one_sided`` 里，便于与既有报表对照。
+    """
+    if not summary:
+        return {"p_uncorrected": None, "p_adjusted": None,
+                "p_one_sided": None, "n_trials": int(max(1, n_trials)),
+                "adjust_method": "none", "sign_test": None, "evidence": None}
+    # ⚠️ 必须先尊重 rigor 的样本量保护：``n < 3`` 时它**故意**把
+    # ``p_uncorrected`` / ``adjusted_p`` 置 None（"宁可返回 insufficient-data，
+    # 也不要把退化的 p=1 当成已检验过的真实结果"）。但同一情形下 ``p_two_sided``
+    # 仍可能给出 0.0（每期差值恒为常数的解析分支）——若这里照着 p_two_sided 走，
+    # 就会把「2 期、差值恰好都是 +3」判成 improved。实测踩过：这是把 rigor 的
+    # 保护绕过去，必须显式拦掉。
+    if str(summary.get("verdict") or "") == "insufficient-data":
+        return {"p_uncorrected": None, "p_adjusted": None,
+                "p_one_sided": None, "n_trials": int(max(1, n_trials)),
+                "adjust_method": "none", "sign_test": summary.get("sign_test"),
+                "evidence": summary.get("verdict"),
+                "note": "rigor 判定 insufficient-data（有效样本 < 3），拒绝给出显著性"}
+    p_two = summary.get("p_two_sided")
+    if p_two is None:
+        p_two = summary.get("p_uncorrected")
+    m = max(1, int(n_trials))
+    if p_two is None:
+        p_adj = None
+    else:
+        p_adj = min(1.0, float(p_two) * m) if m > 1 else float(p_two)
+    return {
+        "p_uncorrected": (None if p_two is None else float(p_two)),
+        "p_adjusted": (None if p_adj is None else float(p_adj)),
+        "p_one_sided": summary.get("p_uncorrected"),
+        "n_trials": m,
+        "adjust_method": "bonferroni" if m > 1 else "none",
+        "sign_test": summary.get("sign_test"),
+        "evidence": summary.get("verdict"),
+    }
+
+
+def _llm_arm_verdict(block: Dict, test: Dict, *, min_issues: int,
+                     alpha: float) -> Dict:
+    """把配对块 + 检验结果翻成四档结论（R3 G2 的判决表）。
+
+    判据（顺序即优先级）：
+      1. ``n_issues < min_issues``            → ``insufficient_sample``（**eligible**）
+      2. 校正后 p < alpha 且 delta_red > 0    → ``improved``（eligible）
+      3. 校正后 p < alpha 且 delta_red <= 0   → ``worse``（**不** eligible）
+      4. 其余                                 → ``not_worse``（eligible）
+
+    注意第 1、4 档都保持 ``eligible=True`` 但 ``enabled_default=False``：
+    出号到底用不用 LLM 由 ``methods.resolve_channels().llm_can_pick`` 单独决定
+    （默认 False）。**对照臂只负责「有没有资格继续参战」，绝不负责「启不启用」**
+    —— 把这两件事混在一起，就是死锁与"AI 空转"的根源。
+    """
+    n_issues = int(block.get("n_issues") or 0)
+    delta_red = test.get("delta")
+    p_adj = test.get("adjusted_p")
+    p_raw = test.get("p_uncorrected")
+
+    if n_issues < int(min_issues):
+        verdict = LLM_ARM_VERDICT_INSUFFICIENT
+        reason = (f"可配对期数 {n_issues} < 门槛 {int(min_issues)}："
+                  f"不给出优劣结论；对照臂保持 eligible（长期停在 eligible 是允许的稳态），"
+                  f"但默认不启用。")
+    elif p_adj is None:
+        verdict = LLM_ARM_VERDICT_INSUFFICIENT
+        reason = (f"{n_issues} 期配对但检验未能算出 p 值（{test.get('verdict')}）："
+                  f"不给出优劣结论，保持 eligible 且默认不启用。")
+    elif float(p_adj) < float(alpha):
+        if delta_red is not None and float(delta_red) > 0:
+            verdict = LLM_ARM_VERDICT_IMPROVED
+            reason = (f"{n_issues} 期配对，校正后 p={float(p_adj):.4g} < {alpha} 且方向上行为"
+                      f" +{float(delta_red):.4f} 红球/注：需要**独立样本复现**后才能谈优势，"
+                      f"且仍默认不启用。")
+        else:
+            verdict = LLM_ARM_VERDICT_WORSE
+            reason = (f"{n_issues} 期配对，校正后 p={float(p_adj):.4g} < {alpha} 且方向下行："
+                      f"LLM 对照臂显著劣于基线，撤销 eligible。")
+    else:
+        verdict = LLM_ARM_VERDICT_NOT_WORSE
+        reason = (f"{n_issues} 期配对，校正后 p={float(p_adj):.4g} ≥ {alpha}："
+                  f"差异与随机波动不可区分（在真随机世界里这是**预期**结果）→ "
+                  f"按「不劣于基线」门槛保持 eligible，但默认不启用。")
+
+    eligible = verdict in LLM_ARM_ELIGIBLE_VERDICTS
+
+    # 诚实性：主判决只看红球，但若**蓝球**另有显著差异，必须写进 reason。
+    # 否则会出现「蓝球 20/20 期都中、红球无差异」时 reason 只说"与随机波动不可
+    # 区分"——那等于把看到的事实藏起来，比没有结论更糟。
+    blue = (test or {}).get("blue") or {}
+    blue_p = blue.get("p_adjusted")
+    blue_delta = blue.get("delta")
+    if blue_p is not None and float(blue_p) < float(alpha):
+        direction = "更高" if (blue_delta or 0) > 0 else "更低"
+        reason += (f" 另：**蓝球**差异显著（校正后 p={float(blue_p):.4g}，"
+                   f"LLM 蓝球命中率{direction} {abs(float(blue_delta or 0.0)):.4f}），"
+                   f"但本判决以红球为主口径，蓝球不参与 verdict——请单独解读蓝球证据。")
+
+    return {
+        "verdict": verdict,
+        "verdict_zh": LLM_ARM_VERDICT_ZH.get(verdict, verdict),
+        "eligible": bool(eligible),
+        # 关键：本函数**从不**启用出号；启用与否是 resolve_channels().llm_can_pick
+        "enabled_default": False,
+        "enable_gate": "methods.resolve_channels().llm_can_pick",
+        "reason_zh": reason,
+        "p_value": p_raw,
+        "p_adjusted": p_adj,
+    }
+
+
+def llm_arm_report(rows: Optional[Sequence[Dict]] = None, *,
+                   baseline_families: Sequence[str] = LLM_ARM_BASELINE_FAMILIES,
+                   min_issues: Optional[int] = None,
+                   alpha: Optional[float] = None,
+                   limit_issues: Optional[int] = None,
+                   n_trials: Optional[int] = None,
+                   max_tickets: Optional[int] = None,
+                   comparison: Optional[str] = None) -> Dict:
+    """LLM 出号**独立对照臂**评估（V10-09；R3 G1/G2）。
+
+    **只用真实已发生的 ``eval_details``**（在线预测逐注落库后与真实开奖核对的记录），
+    不调用 ``replay_method``（llm 不可回放，见 ``NON_REPLAYABLE_METHODS``），
+    也不读 experiments / prereg / 假说库 —— 因此假说库为空或全 failed 都**不影响**
+    本结论（这是"防死锁"的代码层保证）。
+
+    统计口径
+    --------
+    * **同期**：两臂必须在同一 ``issue`` 有记录；
+    * **同 n_tickets**：该期内两臂注数相等（不同注数的期直接剔除并计数）；
+    * **逐注配对**：按 ``seq`` 一一对应，配对数 = 该期注数；
+    * **检验**：以**逐期均值序列**为输入（注间相关，不能当独立样本），走
+      ``rigor.strategy_significance(strategy_hits, baseline_hits, n_trials=...)``
+      —— 配对 t 检验 + 符号检验，并按 ``n_trials``（实际做了多少次比较）做
+      Bonferroni 校正；红球为主口径，蓝球并列给出。
+
+    参数
+    ----
+    rows: 预先取好的 eval_details 行（测试/复盘用）；``None`` 时读
+          ``db.load_eval_details(limit_issues)``。
+    baseline_families: 参与比较的基线族（默认 stat/ml/blend/uniform）。
+    min_issues: 配对期数门槛（默认 ``config.METHOD_RECOMMENDATION_MIN_ISSUES``，
+          即 60；低于门槛一律 ``insufficient_sample``，但**保持 eligible**）。
+    alpha: 显著性水平（默认 ``config.METHOD_RECOMMENDATION_ALPHA``）。
+    limit_issues: 只取最近 N 期（仅当 ``rows is None`` 时生效）。
+    n_trials: 显式指定多重比较次数；缺省 = 实际做过的比较数（≥1）。
+    max_tickets: 只使用注数 ≤ 该值的期（避免个别的超大复式期把均值稀释）。
+    comparison: 指定主口径比较（``"llm:x|stat:freq"``）；缺省自动挑证据最多的一个。
+
+    返回
+    ----
+    dict（顶层即"主口径"一条结论，字段名与任务书一致）：
+      * ``arm`` / ``baseline_arm``：两臂方法名
+      * ``n_issues`` / ``n_pairs``：配对**期数** / 配对**注数**
+      * ``delta_red`` / ``delta_blue``：逐期均值差（正 = LLM 更好）
+      * ``p_value`` / ``p_adjusted``：未校正 / 校正后 p
+      * ``verdict``（improved/not_worse/insufficient_sample/worse）
+      * ``eligible`` / ``enabled_default`` / ``enable_gate`` / ``reason_zh``
+      * ``comparisons``：所有比较的明细；``family_level``：族级汇总（描述）
+      * ``by_arm``：两臂各自的描述统计（期数/注数/红球均值/蓝球率/ROI 等）
+      * ``data_source`` / ``n_rows`` / ``n_issues_data``：数据基准（可审计）
+      * ``no_deadlock_note_zh``：说明本结论与 experiments/prereg 完全无关
+    """
+    min_n = int(min_issues if min_issues is not None
+                else getattr(config, "METHOD_RECOMMENDATION_MIN_ISSUES", 60))
+    a = float(alpha if alpha is not None
+              else getattr(config, "METHOD_RECOMMENDATION_ALPHA", 0.05))
+
+    if rows is None:
+        from . import db
+        rows = db.load_eval_details(limit_issues=limit_issues)
+        data_source = "db.eval_details"
+    else:
+        data_source = "caller_rows"
+    rows = [dict(r) for r in (rows or [])]
+
+    arms = _pairable_arms(rows)
+    llm_methods = sorted(m for m in arms if _is_llm_method(m))
+    base_fams = tuple(str(f).strip().lower() for f in (baseline_families or ()))
+    base_methods = sorted(m for m in arms
+                          if not _is_llm_method(m)
+                          and EV.method_family(m) in base_fams)
+
+    out: Dict = {
+        "arm": None, "baseline_arm": None,
+        "n_issues": 0, "n_pairs": 0,
+        "delta_red": None, "delta_blue": None,
+        "p_value": None, "p_adjusted": None,
+        "alpha": a, "min_issues": min_n,
+        "n_trials": 0,
+        "verdict": LLM_ARM_VERDICT_INSUFFICIENT,
+        "verdict_zh": LLM_ARM_VERDICT_ZH[LLM_ARM_VERDICT_INSUFFICIENT],
+        "eligible": True,
+        "enabled_default": False,
+        "enable_gate": "methods.resolve_channels().llm_can_pick",
+        "reason_zh": "",
+        "comparisons": [], "family_level": None, "by_arm": {},
+        "data_source": data_source, "n_rows": len(rows),
+        "n_issues_data": len({str(r.get("issue")) for r in rows if r.get("issue")}),
+        "llm_methods": llm_methods, "baseline_methods": base_methods,
+        "no_deadlock_note_zh": (
+            "本结论只读 eval_details（真实在线预测的逐注核对记录），"
+            "完全不依赖 experiments.status / prereg_status / patterns_runtime 的 usable："
+            "假说库为空或全部 failed 都不影响对照臂能否给出结论。"),
+        "note_zh": "",
+    }
+    if not llm_methods or not base_methods:
+        out["reason_zh"] = (
+            "缺少可配对的两臂记录："
+            f"llm 方法 {len(llm_methods)} 个、基线方法 {len(base_methods)} 个。"
+            "样本不足不判死——对照臂保持 eligible，等待真实预测累积；默认不启用。")
+        out["note_zh"] = (
+            "LLM 不可历史回放（replay_method 明确不支持），其证据只能来自真实累积的"
+            "在线预测记录；因此没有记录时唯一诚实的结论是「样本不足」。")
+        return out
+
+    # ---- 逐个比较（llm 方法 × 基线方法） ----
+    raw_cmps: List[Dict] = []
+    for lm in llm_methods:
+        for bm in base_methods:
+            block = _paired_issue_block(arms[lm], arms[bm], max_tickets=max_tickets)
+            raw_cmps.append({"llm_method": lm, "baseline_method": bm, "block": block})
+
+    tested = [c for c in raw_cmps if c["block"]["n_issues"] > 0]
+    n_tested = len(tested)
+    n_trials_eff = max(1, int(n_trials) if n_trials is not None else n_tested)
+
+    cmps: List[Dict] = []
+    for c in raw_cmps:
+        block = c["block"]
+        rec: Dict = {
+            "comparison": f"{c['llm_method']}|{c['baseline_method']}",
+            "llm_method": c["llm_method"],
+            "baseline_method": c["baseline_method"],
+            "baseline_family": EV.method_family(c["baseline_method"]),
+            "n_issues": block["n_issues"], "n_pairs": block["n_pairs"],
+            "issues": block["issues"],
+            "ticket_counts": block["ticket_counts"],
+            "dropped_ticket_mismatch": block["dropped_ticket_mismatch"],
+            "ticket_mismatch_detail": block["ticket_mismatch_detail"],
+            "delta_red": None, "delta_blue": None,
+            "p_value": None, "p_adjusted": None,
+            "red_test": None, "blue_test": None,
+            "verdict": LLM_ARM_VERDICT_INSUFFICIENT,
+            "verdict_zh": LLM_ARM_VERDICT_ZH[LLM_ARM_VERDICT_INSUFFICIENT],
+            "eligible": True, "enabled_default": False,
+            "reason_zh": "",
+        }
+        if block["n_issues"] > 0:
+            red_t = rigor.strategy_significance(block["red_s"], block["red_b"],
+                                                n_trials=n_trials_eff, alpha=a)
+            blue_t = rigor.strategy_significance(block["blue_s"], block["blue_b"],
+                                                 n_trials=n_trials_eff, alpha=a)
+            # A/B 是双向的：用双侧 p（见 _two_sided 的说明）
+            rec["red_test"] = {**red_t, "two_sided": _two_sided(red_t, n_trials_eff, a)}
+            rec["blue_test"] = {**blue_t, "two_sided": _two_sided(blue_t, n_trials_eff, a)}
+            rec["delta_red"] = red_t.get("delta")
+            rec["delta_blue"] = blue_t.get("delta")
+            rec["p_value"] = rec["red_test"]["two_sided"]["p_uncorrected"]
+            rec["p_adjusted"] = rec["red_test"]["two_sided"]["p_adjusted"]
+            rec["per_ticket_head"] = block["per_ticket"][:20]
+            # 注级差值（描述口径，注间相关 → 只作参考，不作检验输入）
+            if block["per_ticket"]:
+                rec["delta_red_per_ticket"] = float(
+                    np.mean([p["d_red"] for p in block["per_ticket"]]))
+                rec["delta_blue_per_ticket"] = float(
+                    np.mean([p["d_blue"] for p in block["per_ticket"]]))
+        # 判决必须吃**双侧**口径：把 two_sided 的 p 提到顶层（rigor 原有的
+        # 单侧值仍在 red_test["p_uncorrected"] / ["p_one_sided"] 里可查）。
+        v_test: Dict = {}
+        if rec["red_test"]:
+            ts = rec["red_test"].get("two_sided") or {}
+            # 键名与 _llm_arm_verdict 的读取契约一致（adjusted_p/p_uncorrected）
+            bts = (rec["blue_test"] or {}).get("two_sided") or {}
+            v_test = {"delta": rec["red_test"].get("delta"),
+                      "p_uncorrected": ts.get("p_uncorrected"),
+                      "adjusted_p": ts.get("p_adjusted"),
+                      "verdict": rec["red_test"].get("verdict"),
+                      "blue": {"delta": (rec["blue_test"] or {}).get("delta"),
+                               "p_adjusted": bts.get("p_adjusted")}}
+        v = _llm_arm_verdict(block, v_test, min_issues=min_n, alpha=a)
+        rec.update({k: v[k] for k in ("verdict", "verdict_zh", "eligible",
+                                      "enabled_default", "reason_zh")})
+        cmps.append(rec)
+
+    # ---- 主口径：优先 comparisons 证据最多的；并列时取 p 更小者；再并列取名字序 ----
+    pool = [c for c in cmps if c["n_issues"] > 0] or cmps
+    if comparison:
+        picked = next((c for c in cmps if c["comparison"] == comparison), None)
+        if picked is None:
+            picked = pool[0] if pool else None
+    else:
+        picked = sorted(pool, key=lambda c: (-c["n_issues"], -c["n_pairs"],
+                                             c["p_adjusted"] if c["p_adjusted"] is not None else 1.0,
+                                             c["comparison"]))[0] if pool else None
+
+    # ---- 族级汇总（描述口径：所有 llm:* 合并 vs 各基线族合并） ----
+    llm_pool: Dict[str, List[Dict]] = {}
+    for lm in llm_methods:
+        for issue, issue_rows in arms[lm].items():
+            llm_pool.setdefault(issue, []).extend(issue_rows)
+    for issue in llm_pool:
+        llm_pool[issue].sort(key=lambda x: int(x.get("seq") or 0))
+    fam_level: Dict = {}
+    for fam in ("stat", "ml", "blend", "uniform"):
+        fam_methods = [m for m in arms if not _is_llm_method(m)
+                       and EV.method_family(m) == fam]
+        if not fam_methods:
+            continue
+        fam_pool: Dict[str, List[Dict]] = {}
+        for m in fam_methods:
+            for issue, issue_rows in arms[m].items():
+                fam_pool.setdefault(issue, []).extend(issue_rows)
+        for issue in fam_pool:
+            fam_pool[issue].sort(key=lambda x: int(x.get("seq") or 0))
+        blk = _paired_issue_block(llm_pool, fam_pool, max_tickets=max_tickets)
+        item: Dict = {"family": fam, "n_issues": blk["n_issues"],
+                      "n_pairs": blk["n_pairs"],
+                      "delta_red": None, "delta_blue": None,
+                      "p_value": None, "p_adjusted": None,
+                      "dropped_ticket_mismatch": blk["dropped_ticket_mismatch"],
+                      "verdict": LLM_ARM_VERDICT_INSUFFICIENT,
+                      "verdict_zh": LLM_ARM_VERDICT_ZH[LLM_ARM_VERDICT_INSUFFICIENT]}
+        if blk["n_issues"] > 0:
+            rt = rigor.strategy_significance(blk["red_s"], blk["red_b"],
+                                             n_trials=n_trials_eff, alpha=a)
+            bt = rigor.strategy_significance(blk["blue_s"], blk["blue_b"],
+                                             n_trials=n_trials_eff, alpha=a)
+            ts = _two_sided(rt, n_trials_eff, a)
+            _bts = _two_sided(bt, n_trials_eff, a)
+            _fam_v = _llm_arm_verdict(
+                blk, {"delta": rt.get("delta"),
+                      "p_uncorrected": ts["p_uncorrected"],
+                      "adjusted_p": ts["p_adjusted"],
+                      "verdict": rt.get("verdict"),
+                      "blue": {"delta": bt.get("delta"),
+                               "p_adjusted": _bts.get("p_adjusted")}},
+                min_issues=min_n, alpha=a)
+            item.update({"delta_red": rt.get("delta"), "delta_blue": bt.get("delta"),
+                         "p_value": ts["p_uncorrected"],
+                         "p_adjusted": ts["p_adjusted"],
+                         "verdict": _fam_v["verdict"],
+                         "verdict_zh": _fam_v["verdict_zh"]})
+        fam_level[fam] = item
+    out["family_level"] = fam_level
+
+    # ---- 两臂描述统计 ----
+    def _arm_stats(pool: Dict[str, List[Dict]]) -> Dict:
+        all_rows = [r for issue_rows in pool.values() for r in issue_rows]
+        n_t = len(all_rows)
+        reds = [float(r["red_hits"]) for r in all_rows]
+        blues = [float(r.get("blue_hit") or 0) for r in all_rows]
+        costs = [float(r.get("ticket_cost") or 2.0) for r in all_rows]
+        rewards = [float(r.get("reward") or 0.0) for r in all_rows]
+        cost = float(sum(costs))
+        rew = float(sum(rewards))
+        return {
+            "n_issues": len(pool), "n_tickets": n_t,
+            "red_hits_mean": float(np.mean(reds)) if reds else None,
+            "blue_hit_rate": float(np.mean(blues)) if blues else None,
+            "reward_total": rew, "cost_total": cost,
+            "roi": ((rew - cost) / cost) if cost > 0 else None,
+        }
+
+    for lm in llm_methods:
+        out["by_arm"][lm] = {**_arm_stats(arms[lm]), "family": "llm"}
+    for bm in base_methods:
+        out["by_arm"][bm] = {**_arm_stats(arms[bm]), "family": EV.method_family(bm)}
+
+    out["comparisons"] = sorted(
+        cmps, key=lambda c: (-c["n_issues"], -c["n_pairs"], c["comparison"]))
+    out["n_trials"] = int(n_trials_eff)
+    out["n_comparisons_tested"] = int(n_tested)
+
+    if picked is None:
+        out["reason_zh"] = (
+            "没有可比较的 (llm, 基线) 方法对（记录里只有一臂）：样本不足，"
+            "对照臂保持 eligible 且默认不启用。")
+        return out
+
+    out.update({
+        "arm": picked["llm_method"],
+        "baseline_arm": picked["baseline_method"],
+        "n_issues": picked["n_issues"],
+        "n_pairs": picked["n_pairs"],
+        "issues": picked["issues"],
+        "ticket_counts": picked["ticket_counts"],
+        "delta_red": picked["delta_red"],
+        "delta_blue": picked["delta_blue"],
+        "p_value": picked["p_value"],
+        "p_adjusted": picked["p_adjusted"],
+        "verdict": picked["verdict"],
+        "verdict_zh": picked["verdict_zh"],
+        "eligible": picked["eligible"],
+        "enabled_default": False,
+        "reason_zh": picked["reason_zh"],
+        "red_test": picked["red_test"],
+        "blue_test": picked["blue_test"],
+        "dropped_ticket_mismatch": picked["dropped_ticket_mismatch"],
+        "ticket_mismatch_detail": picked["ticket_mismatch_detail"],
+    })
+    out["note_zh"] = (
+        f"口径：同期 + 同 n_tickets + 逐注配对；检验用逐期均值序列"
+        f"（注间相关，不作独立样本）+ rigor.strategy_significance，"
+        f"n_trials={n_trials_eff} 作 Bonferroni 校正。红球为主口径、蓝球并列。"
+        f"主口径取证据最多的比较 {picked['comparison']}；"
+        f"其余 {len(cmps) - 1} 个比较见 comparisons。"
+        "LLM 不可历史回放，本报告只用真实 online 记录；"
+        "eligible ≠ 启用：启用由 resolve_channels().llm_can_pick 决定（默认关）。")
+    return out
+
+
+def llm_arm_brief(report: Dict) -> Dict:
+    """把 ``llm_arm_report`` 压成一行可展示的摘要（供 API/前端复用）。"""
+    r = report or {}
+    return {
+        "arm": r.get("arm"),
+        "baseline_arm": r.get("baseline_arm"),
+        "n_issues": r.get("n_issues", 0),
+        "n_pairs": r.get("n_pairs", 0),
+        "delta_red": r.get("delta_red"),
+        "delta_blue": r.get("delta_blue"),
+        "p_value": r.get("p_value"),
+        "p_adjusted": r.get("p_adjusted"),
+        "verdict": r.get("verdict"),
+        "verdict_zh": r.get("verdict_zh"),
+        "eligible": bool(r.get("eligible")),
+        "enabled_default": bool(r.get("enabled_default", False)),
+        "reason_zh": r.get("reason_zh"),
+    }

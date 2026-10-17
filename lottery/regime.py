@@ -64,6 +64,7 @@ __all__ = [
     "ERA_DEFS",
     "build_eras",
     "build_adaptive_eras",
+    "build_anchored_eras",
     "eras_for",
     "split_series",
     "era_significance",
@@ -71,6 +72,7 @@ __all__ = [
     "regime_status",
     "weighted_recent",
     "family_adjust",
+    "family_adjust_locked",
     "stage_snapshot",
     "summarize",
 ]
@@ -98,31 +100,141 @@ MIN_ERA_N = 60
 # 状态机用的 alpha（阶段 p 值需先过 family_adjust）
 ALPHA = 0.05
 
-# ---------- 阶段切分模式（V8） ----------
+# ---------- 阶段切分模式（V8 / V10-07） ----------
 # "adaptive"：按固定期数（ERA_BLOCK）等分 —— 默认。理由见 build_adaptive_eras()。
 # "calendar"：旧的按自然年切 9 段，保留以兼容历史对比与老报告。
 ERA_MODE = os.environ.get("LOTT_ERA_MODE", "adaptive")
 ERA_BLOCK = int(os.environ.get("LOTT_ERA_BLOCK", "150"))
 
+# ---------- V10-07：阶段边界锚定化 ----------
+# 旧实现（adaptive / era_schema=1）从**最新一期往过去**切，于是每加一期所有段边界都平移，
+# 历史段的 p 值随之变化 —— 用户两次登录会看到「同一个 2023 年段」的 p 值不同。
+# 这是**当下就存在的不可复现性**（R2 §3.3.4 / S2），比"没有 CUSUM"严重得多。
+#
+# 锚定切分（era_schema=2）：从数据**第一期**（下标 0）起，每 ERA_BLOCK 期一段，
+# 于是第 k 段的边界只由「锚点 + k×块大小」决定，**新数据只追加新段、绝不移动历史段边界**。
+# 末段允许不足一个完整块（complete=False），其**起点**仍锚定，只有终点随新数据前移。
+#
+# ERA_ANCHOR_MODE 取值：
+#   "anchored"（默认）→ build_anchored_eras()
+#   "legacy"          → _legacy_adaptive_eras()（旧的从末尾往前切，仅作对照/复现历史结论）
+ERA_ANCHOR_MODE = os.environ.get("LOTT_ERA_ANCHOR_MODE", "anchored").strip().lower()
+ERA_SCHEMA = 2            # 锚定口径的 schema 标记；旧 adaptive / calendar 为 1
 
-def build_adaptive_eras(draws: Sequence[Dict], block: Optional[int] = None,
+# ---------- V10-07：多重性口径 ----------
+# 阶段数会随数据增长而增加。若校正分母取「当前总段数」，那么**加一期导致段数变化 →
+# 历史段的校正后 p 值也会变**，等于把刚修掉的不可复现性从 p_value 挪到 p_adjusted 上。
+#
+# 本项目的选择：**锚定边界 + 分母锁定为固定上限**（"locked" 口径，默认）：
+#   * 每段 p_adjusted = min(1, p_value × ERA_FAMILY_M)，只依赖该段自身的 p 与常数，
+#     **不依赖其它段、不依赖当前段数** → 历史段校正后 p 值永久不变。
+#   * 代价：Bonferroni 式固定分母比"按当前段数做 BH"更保守（BH 的 m/j>1 放松没有了）。
+#     在 MDE≈0.20 的现状下两者结论都是"没有显著段"，实际损失为 0；
+#     将来若真有接近 0.05 的段，locked 口径的结论会比 BH 更保守 —— 这是**已知且接受**的代价。
+#   * ERA_FAMILY_M 是**预留上限**（不是当前段数）：150 期/段 × 32 段 = 4800 期 ≈ 2035 年。
+#     数据超过上限时报告里会带 m_adj_overflow=True 显式报警（需升版本上调上限，
+#     而不是静默扩大分母 —— 静默扩分母正是本任务要消灭的那类漂移）。
+ERA_FAMILY_M = int(os.environ.get("LOTT_ERA_FAMILY_M", "32"))
+# 校正口径："locked"（默认，固定分母）/ "bh"（旧：按当前段数 BH，历史段会漂移）
+ERA_ADJ_MODE = os.environ.get("LOTT_ERA_ADJ_MODE", "locked").strip().lower()
+
+
+def _era_label(short: str, y0: Optional[int], y1: Optional[int]) -> str:
+    """段名口径：``P3 2013-2014`` / ``P7 2023``（新旧实现共用，避免两套命名）。"""
+    if y0 is None:
+        return short
+    return f"{short} {y0}-{y1}" if y0 != y1 else f"{short} {y0}"
+
+
+def _era_entry(draws: Sequence[Dict], k: int, a: int, b: int, block: int,
+               schema: int, complete: bool) -> Dict:
+    """构造一个阶段条目。
+
+    字段名与 V6 起的返回结构**完全兼容**（只新增、不删除、不改名），
+    因为 ``patterns_runtime`` / ``discovery`` / ``api_app`` / 前端都按这些 key 取值。
+    """
+    seg = draws[a:b]
+    y0 = _year(seg[0].get("issue", "")) if seg else None
+    y1 = _year(seg[-1].get("issue", "")) if seg else None
+    short = f"P{k}"
+    return {
+        "name": _era_label(short, y0, y1),
+        "short": short, "start_year": y0, "end_year": y1,
+        "start": a, "end": b, "n": b - a,
+        "first_issue": seg[0].get("issue") if seg else None,
+        "last_issue": seg[-1].get("issue") if seg else None,
+        # ---- V10-07 新增字段（旧消费方按 key 取值，多出字段不影响）----
+        "anchor": a,                                            # 锚定位置 = block_index × block
+        "block_index": k - 1,                                   # 0 基段序号
+        "block_size": block,                                    # 完整块大小
+        "anchor_issue": seg[0].get("issue") if seg else None,   # 该段第一期期号（跨运行可比对的身份）
+        "complete": bool(complete),                             # False = 末段不足一个完整块
+        "era_schema": schema,                                   # 2=锚定口径；1=旧 adaptive/calendar
+    }
+
+
+def build_anchored_eras(draws: Sequence[Dict], block: Optional[int] = None,
                         min_samples: int = 300) -> List[Dict]:
-    """**数据驱动的阶段切分**：不按自然年切，而按「固定期数」等分。
+    """**锚定式阶段切分（V10-07，默认口径）**：从第一期起每 ``block`` 期一段。
 
-    为什么要改（用户反馈第 3 条）：按自然年切 9 段时，近年被切成 2023/2024/2025/2026
-    四段，每段仅 118~151 期。单段样本小 → 单段最小可检出效应高达 ~0.22 个红球/期，
-    而真实效应量级只有 0.02~0.05 —— **不是没有规律，是切法让检验力不够**。
-    把「阶段边界」与「日历」解耦后，每段样本可稳定控制住，检测力提升一个量级。
+    为什么必须是锚定式
+    ------------------
+    旧实现 ``_legacy_adaptive_eras`` 从**最新一期往前**切，所以每加一期，**所有**历史段的
+    边界都整体平移。真实数据实测（3515 期 vs 3500 期，``block=150``）：23 段**无一例外**都漂了
+    15 期 —— P1 由 (0,200) 变 (0,215)、P2 由 (200,350) 变 (215,365)…于是历史段的 p 值跟着变，
+    同一个「2023 年段」在两次登录里给出两个不同的 p 值 = **不可复现的结论**。
 
-    算法（纯确定性、可复现）：
-      1. 取最近 ``max(min_samples, ...)`` 期作为分析窗口（默认全部可用历史，但少于
-         ``min_samples`` 时整段作为单阶段，不下结论）；
-      2. 从最新一期向前，每 ``block`` 期（默认 60）切一段，剩余不足 ``block/2`` 的
-         并入上一段；
-      3. 编号从旧到新（``P1`` 最早，``Pk`` 最新），并标注该段覆盖的年份区间与期号，
-         方便与前端的自然年视图对照。
+    锚定后（锚点 = 下标 0，块大小 = ``block``）::
 
-    返回与 ``build_eras`` 同构的列表，可直接传给 ``era_significance`` / ``regime_status``。
+        第 k 段 = [k×block, (k+1)×block)      k = 0, 1, 2, …   （末段可短）
+
+    段边界**只由起点与 k 决定**，与"现在有多少期数据"无关。于是：
+
+    * 历史段一旦形成，其 ``start``/``end``/``n``/``first_issue``/``last_issue`` **永不改变**；
+    * 新数据只会 (a) 让末段继续变长，或 (b) 越过块边界后**追加**一个全新段；
+    * 同一份数据重复计算 → 逐字段完全相同（纯确定性，无随机、无时间依赖、无环境依赖）。
+
+    末段处理
+    --------
+    最后一期不足一个完整块时，该段**保留**为独立条目并标注 ``complete=False``、``n`` 为实际
+    期数。它的 ``start`` 仍锚定在 ``k×block``，只有 ``end`` 随新数据前移；一旦该块补满
+    （到 ``(k+1)×block`` 期）即冻结成完整段，此后不再变化。这也意味着：**只有末段会变**，
+    且"变"仅限其长度，不涉及任何历史段。
+
+    参数 ``min_samples`` 仅为签名兼容旧调用保留（旧实现用它决定是否退化为整段）；
+    锚定切分不需要它 —— 段的统计意义由 ``regime_report`` 的 ``min_era_n`` 门槛负责。
+    """
+    draws = list(draws or [])
+    n = len(draws)
+    if n == 0:
+        return []
+    block = max(20, int(block if block is not None else ERA_BLOCK))
+    out: List[Dict] = []
+    k = 1
+    a = 0
+    while a < n:
+        b = min(a + block, n)
+        out.append(_era_entry(draws, k, a, b, block,
+                              schema=ERA_SCHEMA, complete=(b - a) == block))
+        a = b
+        k += 1
+    return out
+
+
+def _legacy_adaptive_eras(draws: Sequence[Dict], block: Optional[int] = None,
+                          min_samples: int = 300) -> List[Dict]:
+    """**旧实现（V8，era_schema=1，仅作对照 / 复现历史结论）**：从最新一期往前切 ``block`` 期。
+
+    ⚠️ 已知缺陷（V10-07 修掉的就是它）：因为从**末尾**往过去数，每新增一期 ``end`` 就变成 n，
+    于是**每一段的下标都会整体漂移**，历史段的 p 值随之改变 —— 同一份历史在两次运行里给出
+    不同结论。**默认路径不再经过本函数**；保留它是因为：
+      (a) 让"锚定 vs 旧实现"的差异可以被测试直接断言（反向用例必须红）；
+      (b) 需要复现 V6~V9 时期已发布结论时有一个显式入口（``ERA_ANCHOR_MODE=legacy``）。
+
+    旧 docstring 保留如下（其中的算法描述就是缺陷来源）：
+
+    * 取最近 ``max(min_samples, ...)`` 期作为分析窗口；从最新一期向前每 ``block`` 期切一段，
+      剩余不足一段的并入最早段；编号从旧到新（``P1`` 最早）。
     """
     draws = list(draws or [])
     n = len(draws)
@@ -157,17 +269,35 @@ def build_adaptive_eras(draws: Sequence[Dict], block: Optional[int] = None,
         bounds[0] = (start_at, bounds[0][1])
     out: List[Dict] = []
     for i, (a, b) in enumerate(bounds, 1):
-        seg = draws[a:b]
-        y0 = _year(seg[0].get("issue", "")) if seg else None
-        y1 = _year(seg[-1].get("issue", "")) if seg else None
-        out.append({
-            "name": f"P{i}" + (f" {y0}-{y1}" if y0 != y1 else f" {y0}"),
-            "short": f"P{i}", "start_year": y0, "end_year": y1,
-            "start": a, "end": b, "n": b - a,
-            "first_issue": seg[0].get("issue") if seg else None,
-            "last_issue": seg[-1].get("issue") if seg else None,
-        })
+        out.append(_era_entry(draws, i, a, b, block, schema=1, complete=True))
     return out
+
+
+def build_adaptive_eras(draws: Sequence[Dict], block: Optional[int] = None,
+                        min_samples: int = 300,
+                        anchor_mode: Optional[str] = None) -> List[Dict]:
+    """**数据驱动的阶段切分**（V6 起的唯一入口）：按「固定期数」等分，而非自然年。
+
+    为什么要按固定期数切（用户反馈第 3 条）：按自然年切 9 段时，近年被切成
+    2023/2024/2025/2026 四段，每段仅 118~151 期。单段样本小 → 单段最小可检出效应高达
+    ~0.22 个红球/期，而真实效应量级只有 0.02~0.05 —— **不是没有规律，是切法让检验力不够**。
+    把「阶段边界」与「日历」解耦后，每段样本可稳定控制住，检测力提升一个量级。
+
+    切分口径由 ``ERA_ANCHOR_MODE`` 决定（**默认 anchored**）：
+
+    * ``"anchored"``（默认，V10-07）：``build_anchored_eras`` —— 从**第一期**起每 ``block``
+      期一段，历史段边界永不改变（修掉"每加一期所有段都平移"的不可复现缺陷）；
+    * ``"legacy"``：``_legacy_adaptive_eras`` —— 旧的从**最新一期往前**切，会漂移。
+      仅用于对照测试与复现历史结论，**不得**作为生产默认。
+
+    ``anchor_mode`` 参数可按调用覆盖全局配置（测试用）；不传则读 ``ERA_ANCHOR_MODE``。
+    返回结构与旧版**兼容**（``name/start/end/n/first_issue/last_issue`` 不变），新增
+    ``anchor/anchor_issue/block_index/block_size/complete/era_schema``。
+    """
+    mode = (anchor_mode or ERA_ANCHOR_MODE or "anchored").strip().lower()
+    if mode == "legacy":
+        return _legacy_adaptive_eras(draws, block=block, min_samples=min_samples)
+    return build_anchored_eras(draws, block=block, min_samples=min_samples)
 
 
 def _era_of(year: int) -> Optional[str]:
@@ -213,12 +343,17 @@ def build_eras(draws: Sequence[Dict]) -> List[Dict]:
 
 
 def eras_for(draws: Sequence[Dict], mode: Optional[str] = None,
-             block: Optional[int] = None) -> List[Dict]:
-    """按当前口径取阶段列表（``adaptive`` 默认 / ``calendar`` 兼容旧视图）。"""
+             block: Optional[int] = None,
+             anchor_mode: Optional[str] = None) -> List[Dict]:
+    """按当前口径取阶段列表（``adaptive`` 默认 / ``calendar`` 兼容旧视图）。
+
+    ``adaptive`` 内部再按 ``ERA_ANCHOR_MODE``（默认 ``anchored``）决定切分实现；
+    ``anchor_mode`` 可按调用覆盖（测试与对照用）。
+    """
     m = mode or ERA_MODE
     if m == "calendar":
         return build_eras(draws)
-    return build_adaptive_eras(draws, block=block or ERA_BLOCK)
+    return build_adaptive_eras(draws, block=block or ERA_BLOCK, anchor_mode=anchor_mode)
 
 
 def split_series(series: Sequence[float], eras: Sequence[Dict]) -> List[List[float]]:
@@ -373,6 +508,37 @@ def family_adjust(p_values: Sequence[Optional[float]]) -> List[Optional[float]]:
     return out
 
 
+def family_adjust_locked(p_values: Sequence[Optional[float]],
+                         m_total: Optional[int] = None) -> List[Optional[float]]:
+    """**固定分母** Bonferroni 校正（V10-07，阶段族的默认口径）：``p_adj = min(1, p × M)``。
+
+    与 ``family_adjust``（BH，分母 = 当前参与校正的个数）的区别是**可复现性**：
+
+    * ``family_adjust`` 的分母随族大小增长；而且 BH 的单调化 ``min_{j>=i}(p_j·m/j)`` 会把
+      同族**其它** p 值耦合进来 —— 新增一段（或末段 p 值变化）就会改变历史段校正后的 p。
+    * ``family_adjust_locked`` 每段的 adjusted p **只依赖该段自己的 p 和常数 M**，
+      与其它段、与当前段数**完全无关** → 历史段的 p_adjusted 永久不变。
+
+    这正是"边界锚定"要保住的性质：若只锚定边界却让分母随段数增长，不可复现性只是从
+    ``p_value`` 挪到了 ``p_adjusted`` 上，用户看到的数字依旧会变。
+
+    代价（必须明说）：Bonferroni 比同段数下的 BH 更保守（丢掉了 BH 的 ``m/j>1`` 放松）。
+    在 MDE≈0.20 的现状下两者结论都是"没有任何段显著"，实际损失为 0；将来若出现临界段，
+    locked 口径更容易说"不显著" —— 这是**主动选择的保守**，不是错误。
+
+    ``m_total`` 缺省取 ``ERA_FAMILY_M``（预留上限，非当前段数）。``None`` p 值原样返回 None。
+    """
+    m = int(m_total if m_total is not None else ERA_FAMILY_M)
+    m = max(1, m)
+    out: List[Optional[float]] = []
+    for p in p_values:
+        if p is None or not math.isfinite(float(p)):
+            out.append(None)
+        else:
+            out.append(float(min(1.0, float(p) * m)))
+    return out
+
+
 def regime_status(eras: Sequence[Dict], p_adjusted: Sequence[Optional[float]],
                   deltas: Sequence[Optional[float]], last_significant_index: Optional[int],
                   n_total: int, min_n: int = MIN_ERA_N) -> Dict:
@@ -380,12 +546,18 @@ def regime_status(eras: Sequence[Dict], p_adjusted: Sequence[Optional[float]],
 
     参数
     ----
-    eras: ``build_eras`` 的结果（顺序即时间顺序）。
+    eras: ``build_eras`` / ``build_anchored_eras`` 的结果（顺序即时间顺序）。
     p_adjusted / deltas: 与 eras 等长的阶段 p 值与效应（delta = 观测 - 期望）。
     last_significant_index: 最近一次「显著」所在阶段下标（None = 从未显著）。
     n_total: 总样本期数。
 
-    返回 ``{status, label_zh, recent_delta, direction, reason_zh, decided_at}``。
+    **V10-07：末段可能是不完整的块**（``complete=False``，锚定切分下末期不足一个块），
+    其 ``n`` 小于 ``min_era_n`` 时不会被单独检验（``p_adjusted`` 为 None）。此时状态机以
+    **最近一个被判定过的段**作为"当前阶段"，而不是机械地用末段 —— 否则"当前块还没攒够样本"
+    会被误报成"正在衰减（fading）"，把"数据不足"说成"证据消失"，这是本仓库明令禁止的措辞错位。
+    末段未被判定时，reason 里会显式写明"末段仅 X 期，尚不足以判定"。
+
+    返回 ``{status, label_zh, recent_delta, direction, reason_zh, earliest_era, latest_era}``。
     """
     k = min(len(eras), len(p_adjusted), len(deltas))
     if n_total < min_n or k == 0:
@@ -404,7 +576,7 @@ def regime_status(eras: Sequence[Dict], p_adjusted: Sequence[Optional[float]],
         # 从未在任何阶段达到校正后显著。
         # 注意：这并不是「规律错了」，只是「证据不足」——绝不当成已证伪而下架。
         status, label = "noise", "未检出（各阶段均不显著）"
-        reason = (f"{k} 个阶段、{n_total} 期：没有任何阶段在 BH 校正后显著；"
+        reason = (f"{k} 个阶段、{n_total} 期：没有任何阶段在多重校正后显著；"
                   f"近三期平均效应 {recent_delta:+.4f}" if recent_delta is not None
                   else f"{k} 个阶段、{n_total} 期：没有任何阶段显著")
         return {"status": status, "label_zh": label, "recent_delta": recent_delta,
@@ -414,16 +586,24 @@ def regime_status(eras: Sequence[Dict], p_adjusted: Sequence[Optional[float]],
     first_sig, last_sig = sig[0], sig[-1]
     sign_first = np.sign(deltas[first_sig] or 0.0)
     sign_last = np.sign(deltas[last_sig] or 0.0)
-    last_era = eras[-1]
-    latest_is_sig = (last_sig == k - 1)
-    prev_is_sig = (k - 2) in sig if k >= 2 else False
+    # V10-07：末段可能是不完整的块（n < min_era_n 而未判定）。此时"当前阶段"取
+    # **最近一个被判定过**的段，避免把"当期数据还没攒够"误报成"证据消失"。
+    judged = [i for i in range(k) if p_adjusted[i] is not None]
+    j = judged[-1] if judged else k - 1
+    last_era = eras[j]
+    latest_is_sig = (last_sig == j)
+    prev_is_sig = (j - 1) in sig if j >= 1 else False
+    tail_note = ""
+    if j < k - 1:
+        tail_note = (f"；末段 {eras[k - 1]['name']} 仅 {eras[k - 1]['n']} 期"
+                     f"（不足一个完整块），尚不足以判定")
 
     if sign_first != 0 and sign_last != 0 and sign_first != sign_last:
         return {"status": "flipped", "label_zh": "方向反转（疑似伪规律）",
                 "recent_delta": recent_delta, "direction": direction,
                 "reason_zh": (f"{eras[first_sig]['name']} 显著为正/负，"
                               f"{eras[last_sig]['name']} 显著反向 —— 两个方向都显著，"
-                              "说明至少一侧是搜索出来的假阳性，禁止用于出号"),
+                              "说明至少一侧是搜索出来的假阳性，禁止用于出号" + tail_note),
                 "earliest_era": eras[first_sig]["name"], "latest_era": eras[last_sig]["name"]}
 
     # 顺序很重要：只有最近阶段显著且此前从未显著 → 新兴线索。
@@ -431,27 +611,27 @@ def regime_status(eras: Sequence[Dict], p_adjusted: Sequence[Optional[float]],
     # 看起来是强信号，但 2024/2025/2026 全部回归 0 —— 是 25 年才出一次的噪声。
     # 「阶段显著」≠「当前有效」，所以禁止进入出号策略。
     # 必须先于 persistent 判定，否则「首次且唯一显著在最近阶段」会被误报为「持续有效」。
-    if first_sig == last_sig == k - 1:
+    if first_sig == last_sig == j:
         return {"status": "emerging", "label_zh": "新兴线索（仅最近阶段显著，尚未确认）",
                 "recent_delta": recent_delta, "direction": direction,
                 "reason_zh": (f"仅 {eras[last_sig]['name']} 显著（{eras[last_sig]['n']} 期，"
                               f"校正后 p={p_adjusted[last_sig]:.3g}），此前各阶段均不显著；"
                               "按搜索次数推算这类单阶段显著本就是预期假阳性，"
-                              "必须等后续阶段复现后再谈"),
+                              "必须等后续阶段复现后再谈" + tail_note),
                 "earliest_era": eras[first_sig]["name"], "latest_era": eras[last_sig]["name"]}
 
     if latest_is_sig:
         return {"status": "persistent", "label_zh": "持续有效（最近阶段显著）",
                 "recent_delta": recent_delta, "direction": direction,
                 "reason_zh": (f"最近阶段 {last_era['name']} 校正后 p 仍显著，"
-                              f"首次显著于 {eras[first_sig]['name']}；仍需 A/B 实战确认"),
+                              f"首次显著于 {eras[first_sig]['name']}；仍需 A/B 实战确认" + tail_note),
                 "earliest_era": eras[first_sig]["name"], "latest_era": last_era["name"]}
 
     if prev_is_sig:
         return {"status": "fading", "label_zh": "正在衰减（上一阶段有效，最近阶段失效）",
                 "recent_delta": recent_delta, "direction": direction,
-                "reason_zh": (f"{eras[k - 2]['name']} 显著，但 {last_era['name']} 已不显著 "
-                              f"（{last_era['n']} 期）；只能降权观察，不得作为主依据"),
+                "reason_zh": (f"{eras[j - 1]['name']} 显著，但 {last_era['name']} 已不显著 "
+                              f"（{last_era['n']} 期）；只能降权观察，不得作为主依据" + tail_note),
                 "earliest_era": eras[first_sig]["name"], "latest_era": last_era["name"]}
 
     draws_since = int(n_total - int(eras[last_sig]["end"]))
@@ -484,7 +664,10 @@ def regime_report(series: Sequence[float], draws: Sequence[Dict],
                   min_era_n: int = MIN_ERA_N,
                   pad: int = 0,
                   era_mode: Optional[str] = None,
-                  block: Optional[int] = None) -> Dict:
+                  block: Optional[int] = None,
+                  n_dims: int = 1,
+                  adj_mode: Optional[str] = None,
+                  anchor_mode: Optional[str] = None) -> Dict:
     """一个候选规律的完整阶段画像 → 状态机判决。
 
     ``series`` 与 ``draws`` 等长，每期一个观测：
@@ -493,12 +676,31 @@ def regime_report(series: Sequence[float], draws: Sequence[Dict],
 
     返回::
 
-        {label, n_total, eras: [{name, n, mean, delta, p_value, p_adjusted, mde, ...}],
-         recent: {...}, status, label_zh, reason_zh, earliest_era, latest_era,
-         raw_p_values, m_adj, note_zh}
+        {label, n_total, era_mode, era_block, era_schema, eras: [{era, n, p_value,
+         p_adjusted, delta, mean, mde, ...}], recent: {...}, status, label_zh,
+         reason_zh, earliest_era, latest_era, m_adj, m_adj_denom, m_adj_total,
+         m_adj_locked, m_adj_overflow, adj_mode, n_sig_eras, note_zh}
 
-    只做检验、不落盘。``p_adjusted`` 已在本规律内部做 BH；跨族搜索的额外搜索成本
-    由调用方（``discovery``）用家族级校正处理。
+    只做检验、不落盘。跨族搜索的额外搜索成本由调用方（``discovery``）用家族级校正处理。
+
+    **多重性口径（V10-07，见 ``family_adjust_locked``）**
+    ------------------------------------------------
+    ``adj_mode`` 缺省取 ``ERA_ADJ_MODE``，默认 ``"locked"``：
+
+    * ``"locked"``：``p_adjusted = min(1, p_value × m_adj_denom)``，``m_adj_denom`` 缺省为
+      常数 ``ERA_FAMILY_M``（预留上限，非当前段数）。**每段的校正后 p 只依赖它自己**，
+      所以"加一期 → 段数变化"不会改动任何历史段的 ``p_adjusted``，
+      与"边界锚定"配套，一起把可复现性做到底。
+    * ``"bh"``：旧的按当前段数做 BH（``family_adjust``）。分母随段数增长，且 BH 的单调化
+      会把别的段的 p 耦合进来 → **历史段的 p_adjusted 会随新数据变化**。只用于复现旧结论。
+
+    两者对比的代价：locked（Bonferroni 式）比同段数的 BH 更保守，是**主动选择的保守**；
+    换来的是"历史段 p 值永不变"这一可复现性硬保证。
+
+    ``n_dims``：本规律属于多少个"维度×参数"族（``discovery`` 扫描的维度数，缺省 1）。
+    返回的 ``m_adj_total = 阶段数 × n_dims`` 是"段 × 维度"的联合搜索规模，
+    供 UI 并列展示（段级校正只覆盖"段"这一维，跨维度成本由调用方另行处理）。
+    它**只作展示/审计**，不参与 p_adjusted 计算（否则分母又会随段数漂移）。
 
     ``pad``：序列前 ``pad`` 期是占位值（as-of 回放无法评估的最早期），
     这些期**整段跳过**——既不进任何阶段检验，也不进近期窗口。
@@ -508,7 +710,8 @@ def regime_report(series: Sequence[float], draws: Sequence[Dict],
     if len(series) != len(draws):
         raise ValueError(f"series 长度 {len(series)} 与 draws 长度 {len(draws)} 不一致")
     mode = era_mode or ERA_MODE
-    eras = eras_for(draws, mode=mode, block=block)
+    adj_m = (adj_mode or ERA_ADJ_MODE or "locked").strip().lower()
+    eras = eras_for(draws, mode=mode, block=block, anchor_mode=anchor_mode)
     chunks = split_series(series, eras)
     p_chunks: Optional[List[List[float]]] = None
     if p0 is not None:
@@ -520,12 +723,21 @@ def regime_report(series: Sequence[float], draws: Sequence[Dict],
     for i, e in enumerate(eras):
         if e["n"] < min_era_n:
             raw.append({"era": e["name"], "n": e["n"], "p_value": None,
+                        "complete": e.get("complete", True),
+                        "anchor_issue": e.get("anchor_issue"),
                         "note_zh": f"{e['n']} 期 < 单阶段门槛 {min_era_n}，不单独判定"})
             continue
-        raw.append({"era": e["name"], **era_significance(
-            chunks[i], p_chunks[i] if p_chunks else None)})
+        raw.append({"era": e["name"], "complete": e.get("complete", True),
+                    "anchor_issue": e.get("anchor_issue"),
+                    **era_significance(chunks[i], p_chunks[i] if p_chunks else None)})
     p_vals = [r.get("p_value") for r in raw]
-    adj = family_adjust(p_vals)
+    m_tested = sum(1 for p in p_vals if p is not None)
+    if adj_m == "bh":
+        adj = family_adjust(p_vals)
+        m_denom = m_tested
+    else:
+        adj = family_adjust_locked(p_vals, ERA_FAMILY_M)
+        m_denom = ERA_FAMILY_M
     for r, a in zip(raw, adj):
         r["p_adjusted"] = a
     if pad and len(series) > pad:
@@ -540,30 +752,46 @@ def regime_report(series: Sequence[float], draws: Sequence[Dict],
     eff_series = series[int(pad):] if pad and int(pad) < len(series) else series
     eff_p0 = (p0[int(pad):] if (p0 is not None and pad and int(pad) < len(p0)) else p0)
     recent = weighted_recent(eff_series, eff_p0, window=recent_window, alpha=ALPHA)
-    # 近期加权检验也参与校正：与阶段 p 值一起再校正一次（搜索成本真实存在）
-    all_adj = family_adjust(p_vals + [recent.get("p_value")])
-    if all_adj and all_adj[-1] is not None:
-        recent["p_adjusted"] = all_adj[-1]
+    # 近期加权窗口同样参与校正（搜索成本真实存在）。locked 口径下它用 "段族上限 + 1"
+    # 作分母 —— 只依赖常数与该窗口自身 p，不会因段数变化而漂移。
+    if adj_m == "bh":
+        all_adj = family_adjust(p_vals + [recent.get("p_value")])
+        recent["p_adjusted"] = all_adj[-1] if all_adj and all_adj[-1] is not None else None
     else:
-        recent["p_adjusted"] = None
+        recent_adj = family_adjust_locked([recent.get("p_value")], ERA_FAMILY_M + 1)
+        recent["p_adjusted"] = recent_adj[0] if recent_adj else None
     n_sig = sum(1 for a in adj if a is not None and a < ALPHA)
+    n_eras = len(eras)
     out = {
         "label": label,
         "era_mode": mode,
+        "era_anchor_mode": ((anchor_mode or ERA_ANCHOR_MODE or "anchored").strip().lower()
+                            if mode == "adaptive" else mode),
+        "era_schema": eras[0].get("era_schema", 1) if eras else 1,
         "era_block": (block or ERA_BLOCK) if mode == "adaptive" else None,
         "n_total": len(draws),
-        "m_adj": sum(1 for p in p_vals if p is not None),
+        "adj_mode": adj_m,
+        "m_adj": m_tested,
+        "m_adj_denom": m_denom,
+        "m_adj_total": n_eras * max(1, int(n_dims)),
+        "m_adj_n_dims": max(1, int(n_dims)),
+        "m_adj_locked": (adj_m != "bh"),
+        "m_adj_overflow": bool(adj_m != "bh" and m_tested > ERA_FAMILY_M),
         "n_sig_eras": n_sig,
         "eras": raw,
         "recent": recent,
         "last_significant_era": eras[last_sig]["name"] if last_sig is not None else None,
         **st,
     }
+    adj_label = "多重校正（固定分母" + str(m_denom) + "）" if adj_m != "bh" else "BH 校正"
     out["note_zh"] = (
-        f"{len(eras)} 个阶段中 {n_sig} 个在 BH 校正后显著；"
+        f"{n_eras} 个阶段中 {n_sig} 个在{adj_label}后显著；"
         f"最近加权窗口 {recent.get('n')} 期效应 {recent.get('delta')}"
         + (f"，校正后 p={recent.get('p_adjusted'):.4g}" if recent.get("p_adjusted") is not None else "")
     )
+    if out["m_adj_overflow"]:
+        out["note_zh"] += (f"；⚠️ 已测段数 {m_tested} > 预留上限 {ERA_FAMILY_M}，"
+                           "需升版本上调 ERA_FAMILY_M（不得静默扩大分母）")
     return out
 
 
