@@ -23,8 +23,8 @@ BACKUP_DATA_URL = (os.environ.get("LOTT_BACKUP_DATA_URL") or "").strip() or None
 
 # ---------- 版本信息（前端主页 / API / GitHub 说明统一引用） ----------
 
-APP_VERSION = "2.5.0"          # v9：最新预测口径修复 + 诊断整注粘贴 + 规律门槛解释
-APP_BUILD = "2026-10-V9"       # 构建标识（V9 交付批次）
+APP_VERSION = "3.0.0"          # v10：契约冻结 + 前置注册 + 票单分布 + 通道/报表 + 离线回放 + ML 诊断
+APP_BUILD = "2026-10-V10"      # 构建标识（V10 交付批次）
 APP_MILESTONES = {
     "M1": {"status": "done",    "desc": "前端 Tab 工作台 + 规律库扩容 29 条 + 自动挖掘管道 + 任务系统"},
     "M2": {"status": "done",    "desc": "GBDT/RF 概率模型 + 滚动 Brier 加权融合 + 概率校准 + 蓝球独立投票 + ML walk-forward 评估"},

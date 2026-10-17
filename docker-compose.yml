@@ -32,6 +32,19 @@ services:
       - LOTT_LLM_EXTRA_BODY=${LOTT_LLM_EXTRA_BODY:-}
       - LOTT_LLM_EXTRA_BODY_MAP=${LOTT_LLM_EXTRA_BODY_MAP:-}
       - LOTT_N_TICKETS=${LOTT_N_TICKETS:-10}
+      # ---- V10：方法开关必须透传，否则「按文档改 .env 不生效」----
+      # compose 只注入此处列出的变量；此前 LOTT_METHODS 等从未列出，
+      # 导致用户改 .env 后容器内仍用代码默认（V10 前默认还是"全部启用"）。
+      - LOTT_METHODS=${LOTT_METHODS:-}
+      - LOTT_METHOD_MODE=${LOTT_METHOD_MODE:-production}
+      - LOTT_LLM_ONLY_OUTPUT=${LOTT_LLM_ONLY_OUTPUT:-0}
+      - LOTT_LLM_DISABLED=${LOTT_LLM_DISABLED:-0}
+      - LOTT_COVERAGE_OBJECTIVE=${LOTT_COVERAGE_OBJECTIVE:-ev_conserving}
+      - LOTT_COVERAGE_R=${LOTT_COVERAGE_R:-3}
+      - LOTT_BET_MODE=${LOTT_BET_MODE:-single}
+      - LOTT_BLUE_MODE=${LOTT_BLUE_MODE:-model}
+      - LOTT_ML_ENABLED=${LOTT_ML_ENABLED:-1}
+      - LOTT_ML_CAL_CV=${LOTT_ML_CAL_CV:-2}
       - LOTT_LLM_EVAL_ISSUES=${LOTT_LLM_EVAL_ISSUES:-60}
       - LOTT_LLM_EVAL_TICKETS=${LOTT_LLM_EVAL_TICKETS:-5}
       - LOTT_LLM_EVAL_SEED=${LOTT_LLM_EVAL_SEED:-42}
