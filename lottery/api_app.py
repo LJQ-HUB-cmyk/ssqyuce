@@ -1829,11 +1829,31 @@ def _boot_refresh_rules_snapshot():
     import time as _t
     _t.sleep(20)                     # 让启动回测/预测先跑完，避免抢 IO
     try:
-        from . import patterns_runtime
+        from . import hypothesis, patterns_runtime
         _d = db.load_draws()
-        if _d:
-            r = patterns_runtime.refresh(_d)
-            print("[rules] 启动后规律快照刷新:", (r.get("snapshot") or {}).get("counts"))
+        if not _d:
+            return
+        # 假说库是运行时状态，重启/误清后会变成空库；空库会让规律链路"看起来
+        # 什么都没分析"。启动时补一次统计挖掘（纯确定性、无 LLM、秒级），
+        # 把重号/邻号/隔期/奇偶/三区这几类基线规律重新拉起来。
+        try:
+            _reg = hypothesis.load_registry()
+            if not _reg.get("hypotheses"):
+                _mined = hypothesis.mine_hypotheses({}, _d, use_llm=False)
+                _reg_res = hypothesis.register_hypotheses(_mined.get("hypotheses") or [])
+                print("[rules] 假说库为空，已补跑统计挖掘:", _reg_res.get("registered"))
+                evolution_annotate = None
+                try:
+                    from . import evolution as _evo
+                    evolution_annotate = _evo.annotate_hypotheses(_d)
+                except Exception:  # noqa: BLE001
+                    evolution_annotate = None
+                if evolution_annotate is not None:
+                    print("[rules] 阶段标注:", evolution_annotate.get("annotated"))
+        except Exception as e:  # noqa: BLE001
+            print("[rules] 补跑统计挖掘失败（不影响出号）:", e)
+        r = patterns_runtime.refresh(_d)
+        print("[rules] 启动后规律快照刷新:", (r.get("snapshot") or {}).get("counts"))
     except Exception as e:  # noqa: BLE001
         print("[rules] 启动后规律快照刷新失败（不影响出号）:", e)
 
