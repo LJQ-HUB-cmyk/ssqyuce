@@ -2134,7 +2134,30 @@ async function runMlDiagnosis(force) {
   if (btn) { btn.disabled = true; }
   try {
     const url = "/api/ml/diagnosis" + (force ? "?force=true&max_numbers=3&n_null=20" : "");
-    renderMlDiagnosis(await api(url));
+    let rep = await api(url);
+    // D-3：重参数（默认档）后端改成了「立即返回 202 + task_id，后台算」，
+    // 因为一次诊断要重训红/蓝两通道 × 多号码 × n_null 次零分布（实测 39~90s），
+    // 同步请求会先被网关超时掐断。这里轮询任务直到完成。
+    if (rep && rep.pending && rep.task_id) {
+      if (body) body.innerHTML = '<div class="note">🤖 ML 诊断后台计算中（首次约 40~90 秒，'
+        + '之后走缓存秒回）…</div>';
+      const deadline = Date.now() + 300000;
+      while (Date.now() < deadline) {
+        await new Promise((res) => setTimeout(res, 3000));
+        const t = await api("/api/tasks/" + encodeURIComponent(rep.task_id));
+        if (t && (t.status === "completed" || t.status === "failed")) {
+          if (t.status !== "completed") throw new Error(t.message || "后台诊断失败");
+          // 任务完成后结果已写盘缓存，再请求一次端点即可拿到结构化结果
+          rep = await api(url);
+          break;
+        }
+        const pct = t && typeof t.progress === "number" ? Math.round(t.progress * 100) : null;
+        if (body && pct !== null) {
+          body.innerHTML = '<div class="note">🤖 ML 诊断后台计算中… ' + pct + '%</div>';
+        }
+      }
+    }
+    renderMlDiagnosis(rep);
   } catch(e) {
     if (tag) tag.textContent = "失败";
     if (body) body.innerHTML = '<div class="note">ML 诊断失败：' + escHtml(e.message) + "</div>";

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import hmac
+import os
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -1387,31 +1388,141 @@ def ml_diagnosis(max_issues: int = Query(800, ge=100, le=3500),
     # 缓存键必须含**数据集指纹**：只按参数缓存的话，开奖数据更新后 10 分钟内
     # 仍会返回上一批数据算出的 trustworthy 结论（缓存把结论"钉死"在旧样本上）。
     dataset_fp = f"{len(draws)}:{db.max_issue()}"
-    cache_key = (colors_t, int(max_issues), int(max_numbers), int(n_null), dataset_fp)
+    cache_key = [list(colors_t), int(max_issues), int(max_numbers), int(n_null), dataset_fp]
     now = _time.time()
-    cached = _ML_DIAG_CACHE.get("result")
-    if (not force and cached and cached.get("key") == cache_key
-            and now - float(cached.get("at") or 0) < _ML_DIAG_TTL):
+    # ---- D-3：缓存落盘持久化 + 后台刷新 ----
+    # 实测一次诊断：默认参数(3号码/800期/B=20) 39.0s，standard(B=79) 56.1s。
+    # 每次零复制都要重训 VotingClassifier(RF+HistGB)，是纯 CPU 重活；
+    # 进程内 dict 缓存重启即失效 → 重启后第一次打开页面要空等几十秒，
+    # 且同步 HTTP 很可能先被网关超时掐断。改为：
+    #   ① 缓存写盘（重启后仍可用）；② 命中未过期 → 直接返回；
+    #   ③ 过期 → 先返回旧结论（标 stale）+ 后台线程刷新；
+    #   ④ 从未算过 → 立即返回 202 + task_id，前端轮询 /api/tasks/{id}。
+    cached = _load_ml_diag_cache()
+    if (not force and cached and list(cached.get("key") or []) == cache_key):
+        age = now - float(cached.get("at") or 0)
+        if age < _ML_DIAG_TTL:
+            out = dict(cached["value"])
+            out["cached"] = True
+            out["cache_age_s"] = round(age, 1)
+            return _jsonable(out)
+        if not _ML_DIAG_JOB.get("running"):
+            _kick_ml_diag_bg(draws, colors_t, int(max_issues), int(max_numbers),
+                             int(n_null), cache_key)
         out = dict(cached["value"])
         out["cached"] = True
-        out["cache_age_s"] = round(now - float(cached["at"]), 1)
+        out["stale"] = True
+        out["cache_age_s"] = round(age, 1)
+        out["refreshing"] = bool(_ML_DIAG_JOB.get("running"))
         return _jsonable(out)
+    # 轻量参数（实测 ~7s）仍同步返回，让单测/CLI/小规模页面无需改造成轮询
+    light = (int(n_null) <= 20 and int(max_numbers) <= 2 and int(max_issues) <= 400)
+    if light and not force:
+        try:
+            diag = ml_model.diagnose_ml_channels(
+                draws, colors=colors_t, max_issues=int(max_issues),
+                max_numbers=int(max_numbers), n_null=int(n_null))
+        except Exception as exc:                      # noqa: BLE001 - 诊断失败不 500
+            return JSONResponse({"ok": False, "error": f"ML 诊断失败: {exc}"},
+                                status_code=200)
+        payload = _ml_diag_payload(diag, draws, cache_key, colors_t,
+                                   max_issues, max_numbers, n_null)
+        _save_ml_diag_cache({"key": cache_key, "at": now, "value": payload})
+        return _jsonable(payload)
+    # 从未算过 / force：交给后台任务，立即返回
+    if force or not _ML_DIAG_JOB.get("running"):
+        tid = _kick_ml_diag_bg(draws, colors_t, int(max_issues), int(max_numbers),
+                               int(n_null), cache_key)
+        if tid:
+            return JSONResponse({"ok": True, "pending": True, "task_id": tid,
+                                 "note_zh": "诊断在后台计算（单次约 40~90 秒），"
+                                            "请轮询 /api/tasks/{task_id} 获取结果"},
+                                status_code=202, background=None)
+
+
+# ML 诊断结果缓存（进程内，TTL 见下）。诊断一次 10~30s，页面刷新不该反复重算。
+_ML_DIAG_TTL = 600.0
+_ML_DIAG_CACHE: Dict[str, Any] = {}
+# D-3：后台诊断任务的进程内状态（防重复触发）
+_ML_DIAG_JOB: Dict[str, Any] = {"running": False, "task_id": None}
+
+
+def _ml_diag_cache_path():
+    """诊断缓存的落盘位置（与其它 runtime 状态同目录）。"""
+    return config.DATA_DIR / "ml_diag_cache.json"
+
+
+def _load_ml_diag_cache() -> Optional[Dict]:
+    """读持久化缓存；进程内已有则优先用进程内的（更新更近）。
+
+    为什么落盘（D-3）：一次诊断 40~90 秒，进程内 dict 重启即失效，
+    会让"每次重启后第一次打开 ML 诊断卡"都要空等几十秒。
+    """
+    mem = _ML_DIAG_CACHE.get("result")
+    if mem:
+        return mem
     try:
-        diag = ml_model.diagnose_ml_channels(
+        path = _ml_diag_cache_path()
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and "key" in data:
+            _ML_DIAG_CACHE["result"] = data
+            return data
+    except (ValueError, OSError):
+        return None
+    return None
+
+
+def _save_ml_diag_cache(entry: Dict) -> None:
+    """原子写盘（tmp + replace），失败只告警不影响返回。"""
+    try:
+        _ML_DIAG_CACHE["result"] = entry
+        path = _ml_diag_cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(entry, ensure_ascii=False, default=str), encoding="utf-8")
+        os.replace(str(tmp), str(path))
+    except (ValueError, OSError) as exc:  # noqa: BLE001
+        print(f"[api] ML 诊断缓存写盘失败（不影响本次结果）: {exc}")
+
+
+def _kick_ml_diag_bg(draws, colors_t, max_issues, max_numbers, n_null,
+                     cache_key) -> Optional[str]:
+    """把一次 ML 诊断丢进后台线程并登记 db 任务（D-3）。
+
+    返回 task_id；已有任务在跑时返回 None（避免重复占用 CPU）。
+    """
+    if _ML_DIAG_JOB.get("running"):
+        return None
+    from . import ml_model
+
+    def _work(progress):
+        return ml_model.diagnose_ml_channels(
             draws, colors=colors_t, max_issues=int(max_issues),
             max_numbers=int(max_numbers), n_null=int(n_null))
-    except Exception as exc:                          # noqa: BLE001 - 诊断失败不 500
-        return JSONResponse({"ok": False, "error": f"ML 诊断失败: {exc}"}, status_code=200)
 
-    payload = {
+    def _on_done(result):
+        _ML_DIAG_JOB["running"] = False
+        _ML_DIAG_JOB["task_id"] = None
+        if isinstance(result, dict) and result.get("ok", True):
+            payload = _ml_diag_payload(result, draws, cache_key, colors_t,
+                                       max_issues, max_numbers, n_null)
+            _save_ml_diag_cache({"key": cache_key, "at": time.time(), "value": payload})
+
+    tid = _bg_run("ml_diagnosis", _work, on_done=_on_done)
+    _ML_DIAG_JOB["running"] = True
+    _ML_DIAG_JOB["task_id"] = tid
+    return tid
+
+
+def _ml_diag_payload(diag: Dict, draws, cache_key, colors_t,
+                     max_issues, max_numbers, n_null) -> Dict:
+    """把 diagnose_ml_channels 的结果整理成对外 payload（唯一构造点）。"""
+    return {
         "ok": bool(diag.get("ok", True)),
         "trusted": bool(diag.get("trusted")),
         "tier": diag.get("tier"),
-        # D-2 修复（tier 语义）：实现者把"多通道结论不一致时取最保守"的判定做在
-        # diagnose_ml_channels 里，并额外给出 channel_tiers / n_channels_trusted /
-        # consistency_zh。API 层原先用白名单 payload，把这几项漏掉了 ——
-        # 前端于是只看到 trusted=False，看不到"为什么"，也无法解释
-        # 「red=monitor 但 blue=signal_found」这种组合。
         "channel_tiers": diag.get("channel_tiers") or {},
         "channel_trusted": diag.get("channel_trusted") or {},
         "n_channels": diag.get("n_channels"),
@@ -1423,23 +1534,16 @@ def ml_diagnosis(max_issues: int = Query(800, ge=100, le=3500),
         "params": {"max_issues": int(max_issues), "max_numbers": int(max_numbers),
                    "n_null": int(n_null), "colors": list(colors_t)},
         "n_draws": len(draws),
-        "dataset_fingerprint": dataset_fp,
+        "dataset_fingerprint": f"{len(draws)}:{db.max_issue()}",
         "cached": False,
         "honesty_zh": ("ML 通道的可信度用**真实开奖数据**上的置换重要性检验判定。"
                        "在纯随机数据（双色球即是）上 trusted=False 是**诚实且预期**的"
                        "结论：它说明模型没有学到可泛化的信号，不是故障、不是 bug，"
                        "也不代表模型代码有错。样本不足时「不显著」同样不能当作"
                        "「信号不存在」的证据。"),
-        "note_zh": ("诊断只在少量号码上做（默认 3 个/通道）以控制耗时；"
-                    "要提高功效需扩大 max_numbers / max_issues，代价是分钟级耗时。"),
+        "note_zh": ("诊断只在少量号码上做以控制耗时；提高功效需扩大 max_numbers / "
+                    "max_issues 与 n_null（standard 档 B>=79），代价是分钟级耗时。"),
     }
-    _ML_DIAG_CACHE["result"] = {"key": cache_key, "at": now, "value": payload}
-    return _jsonable(payload)
-
-
-# ML 诊断结果缓存（进程内，TTL 见下）。诊断一次 10~30s，页面刷新不该反复重算。
-_ML_DIAG_TTL = 600.0
-_ML_DIAG_CACHE: Dict[str, Any] = {}
 
 
 @app.get("/api/llm/arm")
