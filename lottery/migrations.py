@@ -54,9 +54,43 @@ def _ensure_legacy_columns(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
+def _ensure_replay_results(conn: sqlite3.Connection) -> None:
+    """V10-05：离线回放分表（``docs/V10_IMPROVEMENT_PLAN.md`` §2.1.5 冻结 DDL）。
+
+    要点（S2 B4）：
+      * 主键是 ``(method, mode, issue)``——**必须含 mode**。同一 method 会同时以
+        ``mode='replay'``（离线回放）与 ``mode='research_arm'``（LLM 研究对照臂）
+        写入；若主键只有 ``(method, issue)``，``INSERT OR REPLACE`` 会让两者互相
+        覆盖，直接毁掉对方那行。
+      * ``issue`` 用 **TEXT**，与 ``draws.issue`` / ``eval_details.issue`` 一致
+        （跨表按 issue 关联时不会因类型亲和性产生 ``0001`` vs ``1`` 的错配）。
+      * forward-only：只有 ``CREATE TABLE IF NOT EXISTS`` / ``CREATE INDEX``，
+        无 DROP / RENAME / 改类型（``db.get_conn()`` 首次连库即自动落地，
+        容器启动后没有回滚路径）。
+      * 本表与真实交战样本 ``eval_details`` **物理分表**：两套样本口径/样本量不同，
+        **禁止相加**（见 ``lottery/replay.py: samples_side_by_side``）。
+    """
+    conn.execute("""CREATE TABLE IF NOT EXISTS replay_results (
+        method        TEXT    NOT NULL,
+        mode          TEXT    NOT NULL DEFAULT 'replay',
+        issue         TEXT    NOT NULL,
+        n_tickets     INTEGER NOT NULL DEFAULT 0,
+        red_hits      INTEGER NOT NULL DEFAULT 0,
+        best_red_hit  INTEGER NOT NULL DEFAULT 0,
+        blue_hit      INTEGER NOT NULL DEFAULT 0,
+        prize         INTEGER NOT NULL DEFAULT 0,
+        channels_fp   TEXT    NOT NULL DEFAULT '',
+        created_at    REAL    NOT NULL,
+        PRIMARY KEY (method, mode, issue)
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_replay_issue ON replay_results(issue)")
+
+
 MIGRATIONS: List[Tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "reconcile audit table", _ensure_reconcile_runs),
     (2, "legacy provenance columns", _ensure_legacy_columns),
+    # V10-05（§2.1.5 编号冻结：这是第 3 号，V10 期间不再新增第 4 号）
+    (3, "v10 replay results", _ensure_replay_results),
 ]
 
 _SCHEMA_VERSION_DDL = """CREATE TABLE IF NOT EXISTS schema_version (

@@ -265,3 +265,21 @@ def online_check() -> Dict:
                            "的命中率会把差异平均掉。方法战绩请看 by_family 分列。"),
         })
     return {"newly_checked": checked, "summary": summary, "rows": rows[-30:]}
+
+
+# ---------- V10-05：两套样本并排（仅追加；不改上面任何既有签名） ----------
+
+def samples_side_by_side(mode: str = "replay") -> Dict:
+    """真实交战样本（``eval_details``）与离线回放样本（``replay_results``）**并排**。
+
+    报表侧的稳定入口（实现与测试在 ``lottery/replay.py``，此处懒导入以避免
+    ``evaluate`` ↔ ``replay`` 的循环 import）。
+
+    **为什么只并排、不合并**：真实交战样本只有 30 注量级（MDE ≈ ±32%），离线回放
+    是几千注量级的 walk-forward 样本；两者样本量、口径、独立性都不同，相加得到的
+    "总命中率"没有公共分母，会把"回放很准"错误地记到"真实预测"头上。
+    返回体两块各自带 ``source`` / ``n_issues`` / ``n_tickets`` / ``mde``，
+    **不含**任何跨来源合计字段，且 ``mixable=False``。
+    """
+    from . import replay as R
+    return R.samples_side_by_side(mode=mode)
