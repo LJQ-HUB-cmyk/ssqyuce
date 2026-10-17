@@ -1307,6 +1307,452 @@ def portfolio_expected_value(tickets: List[Dict],
     }
 
 
+# ===========================================================================
+# V10-03 票单分布（解析计算，**不是模拟**）
+# ===========================================================================
+#
+# 为什么放在 engine.py 而不是 rigor.py：rigor.py 刻意不 import engine（避免
+# ``battle → engine → rigor → engine`` 循环），而票单层语义（奖金假设、注数、
+# blue_coverage_plan）本来就都住在 engine.py。见 docs/V10 §3.4 落点变更说明。
+#
+# ---------- 数学（全部闭式；测试用 C(33,6)=1,107,568 全枚举交叉验证） ----------
+#
+# 单注红球命中数 K ~ Hypergeometric(N=33, K=6, n=6)：
+#     E[K]   = 6*6/33 = 12/11                = 1.0909090909…
+#     Var(K) = 729/968                       = 0.7530991736…   (sd ≈ 0.867813)
+# 第 i、j 两注的红球交集大小为 A_ij，则
+#     Cov(K_i, K_j) = (27/176)*A_ij - 81/484
+# 因此整组命中总数 T = Σ_i K_i：
+#     Var[T]    = n*σ₁² + (27/88)*Σ_{i<j}A_ij - (81/242)*C(n,2)
+#     var_ratio = Var[T]/(n*σ₁²)
+#               = 1 + (n-1)*(11/54)*(Ā - 12/11),   Ā = Σ_{i<j}A_ij / C(n,2)
+#
+# ---------- 三个必须记住的边界 ----------
+# 1. **var_ratio 恒 ≥ 0，下界恰为 0**：n=11 且每个红号恰出现 2 次时 Var[T]=0。
+#    它**不是**普通"方差比"，而是协方差结构的线性泛函；UI 必须同时给出
+#    var_T 与 nσ₁² 两个正数，不能只显示 var_ratio。
+# 2. Ā 的中性值是 **12/11 ≈ 1.0909**（此时 var_ratio=1），**不是 0**；
+#    Ā=0 只在 n ≤ 5（5 注互不相交）时可行，6 注起需要 36 个号 > 33。
+# 3. 改变票单分布**不改变期望**（EV 恒为 n × 单注 EV），只改变
+#    （a）命中总数方差、（b）「至少一注命中 ≥r 红」的概率。任何把目标写成
+#    「提高期望」的实现都是错的。
+
+RED_PER_TICKET = 6
+SIGMA1_SQ = 729.0 / 968.0                       # 单注红球命中数方差
+E_HITS_PER_TICKET = RED_PER_TICKET * RED_PER_TICKET / float(R_MAX)   # 12/11
+VAR_RATIO_SLOPE = 11.0 / 54.0                   # 闭式斜率 (n-1)*(11/54)
+REDUNDANCY_NEUTRAL = 12.0 / 11.0                # Ā 中性值：var_ratio == 1
+REDUNDANCY_MAX = float(RED_PER_TICKET)          # Ā 的上界（两注完全相同）
+EV_RATIO_SIXTH = (5.0 / B_MAX) / TICKET_COST    # 0.15625（仅六等奖，与 n 无关）
+
+# 奖金假设表（一/二等奖为浮动奖，只能给"假设常量"，必须随结果一起展示）
+PRIZE_ASSUMPTION_TABLE_A = {
+    "label": "V4 假设表 A",
+    "first": 5_000_000.0,          # 一等奖浮动奖假设（V4_ACCURACY_DIAGNOSIS.md:177-187）
+    "second": 150_000.0,           # 二等奖浮动奖假设
+    "note": "一/二等奖为浮动奖，此处为假设常量（V4 口径），非真实金额",
+}
+PRIZE_ASSUMPTION_TABLE_B = {
+    "label": "V4 假设表 B（= engine.JACKPOT_ASSUMPTION）",
+    "first": float(JACKPOT_ASSUMPTION["first"]),
+    "second": float(JACKPOT_ASSUMPTION["second"]),
+    "note": "一/二等奖为浮动奖，此处为历史均值近似假设常量，非真实金额",
+}
+
+_POPCOUNT_LUT: Optional[np.ndarray] = None
+_ALL_RED_MASKS: Optional[np.ndarray] = None
+_EXACT_TAIL_CACHE: Dict = {}
+_EXACT_TAIL_CACHE_MAX = 64
+
+
+def _popcount_lut() -> np.ndarray:
+    global _POPCOUNT_LUT
+    if _POPCOUNT_LUT is None:
+        _POPCOUNT_LUT = np.array([bin(i).count("1") for i in range(2048)], dtype=np.uint8)
+    return _POPCOUNT_LUT
+
+
+def _popcount33(x: np.ndarray) -> np.ndarray:
+    """33 位掩码的 popcount（拆 3 段 11 位查表，避免建 2^33 表）。"""
+    lut = _popcount_lut()
+    return (lut[x & 2047] + lut[(x >> 11) & 2047] + lut[(x >> 22) & 2047]).astype(np.int8)
+
+
+def _red_mask(reds) -> int:
+    m = 0
+    for r in reds:
+        m |= 1 << (int(r) - 1)
+    return m
+
+
+def _all_red_masks() -> np.ndarray:
+    """C(33,6) 全部可能开奖红球组合的位掩码（1,107,568 项 ≈ 8.9MB，惰性构建一次）。"""
+    global _ALL_RED_MASKS
+    if _ALL_RED_MASKS is None:
+        import itertools
+        combos = np.array(list(itertools.combinations(range(R_MAX), RED_PER_TICKET)), dtype=np.int64)
+        masks = np.bitwise_or.reduce(np.left_shift(np.int64(1), combos), axis=1)
+        _ALL_RED_MASKS = masks.astype(np.uint64)
+    return _ALL_RED_MASKS
+
+
+def _validate_tickets(tickets) -> List[Dict]:
+    """规范化为 ``[{"reds": [...6 个升序唯一红号...], "blue": int}]``；非法输入抛 ValueError。"""
+    out: List[Dict] = []
+    for idx, t in enumerate(tickets or []):
+        reds = t.get("reds") if isinstance(t, dict) else None
+        if not isinstance(reds, (list, tuple)) or len(reds) != RED_PER_TICKET:
+            raise ValueError(f"第 {idx} 注 reds 必须是 {RED_PER_TICKET} 个红号，实际 {reds!r}")
+        try:
+            rs = sorted(int(x) for x in reds)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"第 {idx} 注 reds 含非整数：{reds!r}") from exc
+        if len(set(rs)) != RED_PER_TICKET:
+            raise ValueError(f"第 {idx} 注红号有重复：{rs}")
+        if rs[0] < 1 or rs[-1] > R_MAX:
+            raise ValueError(f"第 {idx} 注红号越界（应在 1..{R_MAX}）：{rs}")
+        blue = t.get("blue") if isinstance(t, dict) else None
+        try:
+            b = int(blue) if blue is not None else 0
+        except (TypeError, ValueError):
+            b = 0
+        out.append({"reds": rs, "blue": b})
+    return out
+
+
+def _pairwise_stats(reds_list: List[List[int]]) -> Dict:
+    """两两交集统计：ΣA_ij、Ā、并集覆盖、冗余度。O(n²)，热路径可用。"""
+    n = len(reds_list)
+    sets = [set(r) for r in reds_list]
+    union: set = set()
+    for s in sets:
+        union |= s
+    sum_a = 0
+    for i in range(n):
+        si = sets[i]
+        for j in range(i + 1, n):
+            sum_a += len(si & sets[j])
+    n_pairs = n * (n - 1) // 2
+    abar = (sum_a / n_pairs) if n_pairs else 0.0
+    return {
+        "n": n,
+        "sum_a": int(sum_a),
+        "n_pairs": int(n_pairs),
+        "abar": float(abar),
+        "union_coverage": int(len(union)),
+    }
+
+
+def _variance_from_abar(n: int, abar: float) -> float:
+    """Var[T] = n·σ₁² + (27/88)·ΣA − (81/242)·C(n,2)。"""
+    sum_a = abar * (n * (n - 1) // 2)
+    return (n * SIGMA1_SQ + (27.0 / 88.0) * sum_a
+            - (81.0 / 242.0) * (n * (n - 1) // 2))
+
+
+def _var_ratio(n: int, abar: float) -> float:
+    """var_ratio = 1 + (n−1)·(11/54)·(Ā − 12/11)；恒 ≥ 0（下界 0）。"""
+    if n <= 0:
+        return 0.0
+    return 1.0 + (n - 1) * VAR_RATIO_SLOPE * (abar - REDUNDANCY_NEUTRAL)
+
+
+def _variance_stats(n: int, sum_a: int) -> Dict[str, float]:
+    """用**有理数精确**算 ``Var[T]`` 与 ``var_ratio``，再转 float。
+
+    为什么不用浮点闭式：两个边界值会在浮点下"擦伤"——n=11（每号恰 2 次）时
+    ``Var[T]`` 恰为 0，但闭式 ``1+(n−1)(11/54)(Ā−12/11)`` 算出来是 2.2e-16；
+    Ā=12/11 时 var_ratio 恰为 1，闭式是 1.0000000000000002。测试要求
+    ±1e-9 甚至精确 0/1，所以这里走 ``fractions.Fraction``（n≤33，开销可忽略）。
+    """
+    from fractions import Fraction
+    n = int(n)
+    if n <= 0:
+        return {"var_T": 0.0, "var_ratio": 0.0, "n_sigma1_sq": 0.0}
+    s1 = Fraction(729, 968)
+    pairs = n * (n - 1) // 2
+    var_exact = n * s1 + Fraction(27, 88) * int(sum_a) - Fraction(81, 242) * pairs
+    n_sig_exact = n * s1
+    ratio_exact = var_exact / n_sig_exact
+    # 交叉核对闭式（1+(n−1)(11/54)(Ā−12/11)）与协方差式一致
+    abar_exact = Fraction(int(sum_a), pairs) if pairs else Fraction(0)
+    closed = 1 + Fraction(n - 1) * Fraction(11, 54) * (abar_exact - Fraction(12, 11))
+    if abs(float(closed) - float(ratio_exact)) > 1e-9:      # pragma: no cover - 纯防御
+        raise AssertionError(f"var_ratio 闭式与协方差式不一致：{closed} vs {ratio_exact}")
+    return {
+        "var_T": float(var_exact),
+        "var_ratio": float(ratio_exact),
+        "n_sigma1_sq": float(n_sig_exact),
+    }
+
+
+def _prob_at_least_r_single(r: int) -> float:
+    """单注命中 ≥r 红球的超几何概率。"""
+    from math import comb
+    total = comb(R_MAX, RED_PER_TICKET)
+    return sum(comb(RED_PER_TICKET, k) * comb(R_MAX - RED_PER_TICKET, RED_PER_TICKET - k)
+               for k in range(int(r), RED_PER_TICKET + 1)) / total
+
+
+def _poisson_binomial_at_least_one(ps) -> float:
+    """泊松二项：**独立**事件下 P(至少一个发生) = 1 − Π(1−p_i)。
+
+    仅当把 n 注的红球命中数当成相互独立时才成立。真实票单里票间是相关的
+    （两注相同时完全相关 → 真值是 p 而不是 1−(1−p)^n；两注不相交时是负相关），
+    所以它只能当**热路径近似**用，精确值走 :func:`ticket_distribution` 的全枚举。
+    """
+    q = 1.0
+    for p in ps:
+        q *= (1.0 - float(p))
+    return 1.0 - q
+
+
+def _iid_tail_probs(tickets: List[Dict], r_values) -> Dict[int, float]:
+    """独立（iid）近似下的 P(≥1 注命中 ≥r 红)，每注边际概率相同。"""
+    n = len(tickets)
+    out: Dict[int, float] = {}
+    for rv in r_values:
+        p1 = _prob_at_least_r_single(rv)
+        # 每注边际概率相同 → 泊松二项退化为 1−(1−p)^n
+        out[int(rv)] = _poisson_binomial_at_least_one([p1] * n)
+    return out
+
+
+def _exact_red_tail(tickets: List[Dict]) -> Dict:
+    """全枚举 C(33,6) 求精确 P(≥1 注命中 ≥r 红) 与 Var[T]；按票组哈希缓存。
+
+    复杂度 O(C(33,6)·n)（n=10 约 0.1~0.2s），只在评估/报表/测试用；
+    ``predict_next`` 的热路径不要调用它（用 ``with_distribution_exact=False``）。
+    """
+    key = tuple(sorted(tuple(int(x) for x in t["reds"]) for t in tickets))
+    cached = _EXACT_TAIL_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if not key:
+        cached = {"p_ge": {r: 0.0 for r in (1, 2, 3, 4, 5, 6)}, "mean_T": 0.0,
+                  "var_T": 0.0, "n_draws": 0}
+    else:
+        masks_all = _all_red_masks()
+        max_hits = np.zeros(masks_all.shape[0], dtype=np.int8)
+        total_hits = np.zeros(masks_all.shape[0], dtype=np.int16)
+        for reds in key:
+            h = _popcount33(masks_all & np.uint64(_red_mask(reds)))
+            np.maximum(max_hits, h, out=max_hits)
+            total_hits += h
+        cached = {
+            "p_ge": {r: float((max_hits >= r).mean()) for r in (1, 2, 3, 4, 5, 6)},
+            "mean_T": float(total_hits.mean()),
+            "var_T": float(total_hits.var()),
+            "n_draws": int(masks_all.shape[0]),
+        }
+    if len(_EXACT_TAIL_CACHE) >= _EXACT_TAIL_CACHE_MAX:
+        _EXACT_TAIL_CACHE.clear()
+    _EXACT_TAIL_CACHE[key] = cached
+    return cached
+
+
+def p_at_least_r_mc(tickets: List[Dict], r: int = 4, n_draws: int = 200_000,
+                    seed: int = 0) -> Dict:
+    """固定种子蒙特卡洛：估计 P(≥1 注命中 ≥r 红)，用于**交叉校验**解析值。
+
+    返回 ``{"p": float, "r": int, "n_draws": int, "seed": int, "stderr": float}``。
+    stderr 为标准误 ``sqrt(p(1−p)/n)``——拿它和解析值比较时才有意义：
+    固定种子下结果可复现，但**不是**精确值。
+    """
+    ts = _validate_tickets(tickets)
+    r = int(r)
+    n_draws = int(n_draws)
+    if n_draws <= 0 or not ts:
+        return {"p": 0.0, "r": r, "n_draws": max(0, n_draws), "seed": int(seed), "stderr": 0.0}
+    rng = np.random.default_rng(int(seed))
+    tmasks = [np.uint64(_red_mask(t["reds"])) for t in ts]
+    chunk = 100_000
+    hit_any = 0
+    done = 0
+    while done < n_draws:
+        c = min(chunk, n_draws - done)
+        # 均匀随机取 6 个不同红号：对 33 个均匀 key 取最小的 6 个 ⇒ 均匀 6-子集
+        keys = rng.random((c, R_MAX))
+        picks = np.argpartition(keys, RED_PER_TICKET, axis=1)[:, :RED_PER_TICKET]
+        draw_masks = np.bitwise_or.reduce(
+            np.left_shift(np.int64(1), picks.astype(np.int64)), axis=1).astype(np.uint64)
+        max_hits = np.zeros(c, dtype=np.int8)
+        for tm in tmasks:
+            h = _popcount33(draw_masks & tm)
+            np.maximum(max_hits, h, out=max_hits)
+        hit_any += int((max_hits >= r).sum())
+        done += c
+    p = hit_any / float(n_draws)
+    return {"p": float(p), "r": r, "n_draws": n_draws, "seed": int(seed),
+            "stderr": float((p * (1.0 - p) / n_draws) ** 0.5)}
+
+
+def _single_ticket_ev(jackpot: Optional[Dict] = None, *, sixth: str = "published") -> Dict:
+    """单注期望奖金（元）与各奖级贡献。
+
+    ``sixth="published"``：V4 文档口径 —— 六等奖按「蓝球命中」的**边际**概率 ×¥5
+    计（0.0625×5 = ¥0.3125），与高奖级存在重复计数；这是项目自 V4 起对外发表、
+    docs/V10 §3.4.5 冻结的 `ev_ratio_full ≈ 0.45675` 的来源（一等 ¥5,000,000 /
+    二等 ¥150,000 时单注 ¥0.9135）。
+    ``sixth="strict"``：按 ``evaluate.prize_level`` 的**互斥**奖级严格计算
+    （六等奖只含「蓝球命中且红球 ≤2」）；同一假设下为 ¥0.8954（0.4477），
+    与上面差 ~2% —— 两者都给出，让口径可核对而不是二选一。
+    """
+    from math import comb
+    jp = dict(PRIZE_ASSUMPTION_TABLE_A)
+    if isinstance(jackpot, dict):
+        for k in ("first", "second"):
+            if k in jackpot:
+                jp[k] = float(jackpot[k])
+        if jackpot.get("label"):
+            jp["label"] = str(jackpot["label"])
+    total = comb(R_MAX, RED_PER_TICKET)
+
+    def p_r(r: int) -> float:
+        return comb(RED_PER_TICKET, r) * comb(R_MAX - RED_PER_TICKET, RED_PER_TICKET - r) / total
+
+    pb = 1.0 / B_MAX
+    cash = dict(PRIZE_CASH_FIXED)
+    cash[1] = float(jp["first"])
+    cash[2] = float(jp["second"])
+    by_level = {
+        1: p_r(6) * pb,
+        2: p_r(6) * (1 - pb),
+        3: p_r(5) * pb,
+        4: p_r(5) * (1 - pb) + p_r(4) * pb,
+        5: p_r(4) * (1 - pb) + p_r(3) * pb,
+    }
+    if sixth == "strict":
+        by_level[6] = (p_r(0) + p_r(1) + p_r(2)) * pb          # 互斥：蓝球命中且红球 ≤2
+    else:
+        by_level[6] = pb                                        # V4 发表口径：蓝球边际概率
+    contrib = {lvl: by_level[lvl] * cash.get(lvl, 0.0) for lvl in range(1, 7)}
+    ev = float(sum(contrib.values()))
+    return {
+        "ev_yuan": ev,
+        "ev_ratio": ev / TICKET_COST,
+        "by_level_prob": {k: float(v) for k, v in by_level.items()},
+        "by_level_contrib_yuan": {k: float(v) for k, v in contrib.items()},
+        "prize_cash": {int(k): float(v) for k, v in cash.items()},
+        "prize_assumption": (f"{jp['label']}: 一等 ¥{jp['first']:,.0f} / 二等 ¥{jp['second']:,.0f}"
+                             f"（{'V4 六等奖按蓝球边际概率' if sixth != 'strict' else '严格互斥奖级'}）"),
+        "prize_assumption_detail": jp,
+    }
+
+
+def ticket_distribution(tickets: List[Dict], *,
+                        with_distribution_exact: bool = True,
+                        r_values=(3, 4, 5),
+                        jackpot: Optional[Dict] = None,
+                        mc_draws: int = 0,
+                        mc_seed: int = 0) -> Dict:
+    """**票单分布**：一组注单的解析统计（期望 / 尾部概率 / 方差结构 / EV 口径）。
+
+    这是「票单分布」卡的唯一数据来源（V10-10 前端消费），也是目标函数的度量工具。
+
+    返回（全部为原生 ``float``/``int``，可直接 ``json.dumps``）：
+
+    ==================  ===========================================================
+    ``n``               注数
+    ``union_coverage``  并集覆盖的红号个数（≤33）
+    ``redundancy``      冗余度 Ā = Σ_{i<j}A_ij / C(n,2)，**中性值 12/11 ≈ 1.0909**
+    ``redundancy_neutral``  中性值常量（=12/11，供前端并排展示）
+    ``expected_hits``   命中总数期望 = n·12/11（与选号无关，是恒等式）
+    ``var_T``           命中总数方差（解析，见模块注释）
+    ``n_sigma1_sq``     n·σ₁²（与 var_T 一起看：var_ratio 只是二者的商）
+    ``var_ratio``       var_T / (n·σ₁²) = 1+(n−1)(11/54)(Ā−12/11)；**恒 ≥ 0，下界 0**
+    ``p_at_least_r``    P(≥1 注命中 ≥r 红)，键 "3"/"4"/"5"
+    ``p_at_least_r_method``  ``"exact_enum"``（C(33,6) 全枚举）或 ``"iid_approx"``
+    ``p_at_least_r_iid``     泊松二项（独立假设）近似值，与上面并排以便看见相关性误差
+    ``p_any_blue``      P(≥1 注命中蓝球) = 不同蓝球数/16（blue_coverage_plan 闭式最优）
+    ``ev_ratio_sixth``  仅六等奖的返奖比 = (5/16)/2 = **0.15625**（与 n 无关）
+    ``ev_ratio_full``   整注（一~六等奖全计）返奖比 ≈ **0.45673**，**必须连
+                        ``prize_assumption`` 一起展示**
+    ``prize_assumption``  奖金假设表（一/二等奖是浮动奖，只能给假设常量）
+    ``ev_ratio_full_strict``  同上但按互斥奖级严格算（≈0.4477），口径对照用
+    ==================  ===========================================================
+
+    ``with_distribution_exact=True``（默认）：``p_at_least_r`` 走 C(33,6) 全枚举，
+    精确值，按票组哈希缓存（首次 n=10 约 0.1~0.2s）。这是本函数**唯一诚实**的口径
+    ——泊松二项忽略票间相关（5 注全同时会把 0.0049 估成 0.0243，高估 5 倍）。
+    ``False``：用 iid 近似（``p_at_least_r_method="iid_approx"`），热路径用；
+    结果里同时给出精确/近似两列，调用方不得把近似值当结论。
+
+    ``mc_draws>0``：额外用固定种子蒙特卡洛交叉校验，结果放 ``p_at_least_r_mc``。
+    """
+    ts = _validate_tickets(tickets)
+    r_values = tuple(int(x) for x in r_values)
+    n = len(ts)
+    pair = _pairwise_stats([t["reds"] for t in ts])
+    abar = pair["abar"]
+    vstats = _variance_stats(n, pair["sum_a"])
+    var_t = vstats["var_T"]
+    n_sig = vstats["n_sigma1_sq"]
+    ratio = vstats["var_ratio"]
+    # var_ratio 恒 ≥ 0（n=11 且每个红号恰 2 次时恰为 0）；精确有理数下不应出现负值
+    if ratio < 0.0:                                          # pragma: no cover - 纯防御
+        raise AssertionError(f"var_ratio 不应为负（解析式下界 0）：{ratio}")
+
+    iid_tail = _iid_tail_probs(ts, r_values) if n else {r: 0.0 for r in r_values}
+    if with_distribution_exact and n:
+        exact = _exact_red_tail(ts)
+        tail = {r: float(exact["p_ge"].get(r, 0.0)) for r in r_values}
+        method = "exact_enum"
+        enum_var_t = float(exact["var_T"])
+    else:
+        tail = dict(iid_tail)
+        method = "iid_approx"
+        enum_var_t = None
+
+    blues = [int(t["blue"]) for t in ts if 1 <= int(t["blue"]) <= B_MAX]
+    distinct_blue = len(set(blues))
+    p_any_blue = min(distinct_blue, B_MAX) / float(B_MAX)
+
+    ev_pub = _single_ticket_ev(jackpot, sixth="published")
+    ev_strict = _single_ticket_ev(jackpot, sixth="strict")
+    ev_b = _single_ticket_ev(dict(PRIZE_ASSUMPTION_TABLE_B), sixth="published")
+
+    out = {
+        "n": int(n),
+        "union_coverage": int(pair["union_coverage"]),
+        "redundancy": float(abar),
+        "redundancy_neutral": float(REDUNDANCY_NEUTRAL),
+        "redundancy_sum": float(pair["sum_a"]),
+        "redundancy_max": float(REDUNDANCY_MAX),
+        "expected_hits": float(n * E_HITS_PER_TICKET),
+        "sigma1_sq": float(SIGMA1_SQ),
+        "n_sigma1_sq": float(n_sig),
+        "var_T": float(var_t),
+        "var_ratio": float(ratio),
+        "var_ratio_note": ("var_T/(nσ₁²) 恒 ≥ 0；下界 0 在 n=11 且每个红号恰出现 2 次时取到，"
+                           "中性点 Ā=12/11 时 var_ratio=1。改变分布不改变期望。"),
+        "p_at_least_r": {str(r): float(v) for r, v in tail.items()},
+        "p_at_least_r_method": method,
+        "p_at_least_r_iid": {str(r): float(v) for r, v in iid_tail.items()},
+        "p_any_blue": float(p_any_blue),
+        "blue_coverage_count": int(distinct_blue),
+        "ev_ratio_sixth": float(EV_RATIO_SIXTH),
+        "ev_ratio_full": float(ev_pub["ev_ratio"]),
+        "ev_reward_yuan": float(ev_pub["ev_yuan"]),
+        "prize_assumption": ev_pub["prize_assumption"],
+        "prize_cash": ev_pub["prize_cash"],
+        "ev_ratio_full_strict": float(ev_strict["ev_ratio"]),
+        "ev_ratio_full_table_b": float(ev_b["ev_ratio"]),
+        "ev_ratio_full_note": ("ev_ratio_sixth 只是六等奖口径（0.15625），整注口径见 "
+                               "ev_ratio_full；一/二等奖为浮动奖，必须连 prize_assumption 一起展示"),
+    }
+    if mc_draws:
+        mc = {str(r): float(p_at_least_r_mc(ts, r=r, n_draws=mc_draws, seed=mc_seed)["p"])
+              for r in r_values}
+        out["p_at_least_r_mc"] = mc
+        out["p_at_least_r_mc_detail"] = {k: v for k, v in
+                                         p_at_least_r_mc(ts, r=r_values[0] if r_values else 4,
+                                                         n_draws=mc_draws, seed=mc_seed).items()}
+    if enum_var_t is not None:
+        out["var_T_exact_enum"] = float(enum_var_t)
+    return out
+
+
 def _expand_blue_compound(base_reds: List[int], blue_probs: np.ndarray,
                           k: int, rng: random.Random,
                           red_blend: Optional[np.ndarray] = None,
@@ -1381,65 +1827,241 @@ def _expand_dan_tuo(dan: List[int], blue: int, n_tickets: int,
     return out
 
 
-# ---------- U4 组合覆盖优化 ----------
+# ---------- U4 组合覆盖优化（V10-03：可插拔目标 + 蓝球职责边界） ----------
+#
+# 冻结契约（V10-03 §3.4.3）：
+#
+#   **蓝球由 blue_coverage_plan 唯一负责（闭式最优 P(≥1蓝)=min(n,16)/16），
+#   目标函数只作用于红球子问题。**
+#
+# 这条契约来自一个真实缺陷：V4 的 ``coverage_optimize`` 在选完红球后用
+# ``plan`` 强制改写蓝球，而目标函数里却仍含 ``distinct_blue`` 项 —— 优化器
+# 在为一个**马上会被覆盖掉的属性**爬坡（零梯度 + 把蓝球噪声注入红球选择）。
+# 现在：``blue_probs is not None``（plan 生效）时，**任何目标都不含蓝球项**，
+# 并在 ``coverage_optimize_compare()`` 的 ``objective_meta.gradient_blue_degenerate``
+# 里如实回报 True；只有 plan 不生效（蓝球保持候选池原值）时，蓝球才是真实
+# 自由度，才允许进入目标。
+#
+# 四种目标（config.COVERAGE_OBJECTIVE / 别名表 config.COVERAGE_OBJECTIVE_ALIASES）：
+#
+#   ev_conserving（默认，别名 expected_value / ev）
+#       EV 守恒 —— 同注数下 EV 恒为 n×单注EV，与票单结构**无关**，所以目标里
+#       **没有也不允许有 EV 项**；只比较红球结构：并集覆盖 − 冗余度 Ā。
+#       这是唯一诚实的目标：它优化的东西（覆盖/方差结构）真实存在，
+#       但**不宣称**提高期望收益。
+#   pmax_high
+#       直接最大化 P(≥1 注命中 ≥r 红)。**不得**用「最小化冗余度」或「最大化
+#       并集覆盖」当代理：n=10 时铺开反而比 iid 低约 2.6%（票间负相关）。
+#       搜索期用固定种子「公共随机数」MC 估计（噪声 <1%），结果须用
+#       ``ticket_distribution()`` 给出精确值与 ``var_ratio``（方差代价）。
+#   coverage
+#       旧口径（V4）：红球并集 + 1.5×蓝球覆盖数，保留向后兼容。
+#   custom_weight
+#       用户偏好加权（P2-3 承接）：权重来自 config.COVERAGE_OBJECTIVE_WEIGHTS
+#       或调用参数；项：pmax_high / union / neg_redundancy / blue_coverage。
+#
+# **任何模式都不许把目标写成「提高期望」。**
 
-def _ticket_objective(tickets: List[Dict], objective: str, r: int) -> float:
-    """覆盖优化的目标函数（V4：从「红球覆盖数」扩展为「奖金期望」）。
+COVERAGE_OBJECTIVES = ("ev_conserving", "pmax_high", "coverage", "custom_weight")
 
-    objective="expected_value"（默认）：整组注单的期望奖金（元）+ 蓝球覆盖奖金。
-        诚实说明：**同注数下期望奖金与选号无关**（每注红球命中都服从同一个超几何
-        分布），所以这一项近似常数；真正拉开差距的是蓝球去重带来的
-        「至少中 1 个蓝球」概率提升（min(n,16)/16 vs 1-(15/16)^n）。因此目标函数
-        里蓝球覆盖的权重必须显式存在，否则优化器没有可爬的梯度。
-    objective="coverage"：旧口径，红球并集大小 + 蓝球覆盖数权重（体感覆盖）。
+# custom_weight 的默认权重（可由 config.COVERAGE_OBJECTIVE_WEIGHTS 或调用参数覆盖）
+DEFAULT_CUSTOM_WEIGHTS = {
+    "pmax_high": 1.0,        # P(≥1 注 ≥r 红) 估计值（0..1）
+    "union": 0.5,            # 并集覆盖 / 33（0..1）
+    "neg_redundancy": 0.5,   # 1 − Ā/6（0..1，1 = 完全不重叠）
+    "blue_coverage": 0.0,    # 蓝球覆盖度 / 16（仅在 plan 未接管蓝球时有效）
+}
+
+# 搜索期 P(≥1注≥r红) 的公共随机数 MC 样本量（越大越准、越慢；2000 档的
+# 标准误 ≈ sqrt(p(1-p)/2000) ≈ 0.003，够排序用，最终值一律用精确枚举复核）
+_PMAX_SEARCH_DRAWS = 2000
+
+
+def _normalize_coverage_objective(objective: Optional[str]) -> str:
+    """把目标名（含 V10-00a 别名表）规范化为 4 个合法值之一，未知值回退 ev_conserving。"""
+    if not objective:
+        return "ev_conserving"
+    key = str(objective).strip().lower()
+    aliases = getattr(config, "COVERAGE_OBJECTIVE_ALIASES", {}) or {}
+    resolved = aliases.get(key, key)
+    return resolved if resolved in COVERAGE_OBJECTIVES else "ev_conserving"
+
+
+def _custom_objective_weights(weights: Optional[Dict] = None) -> Dict[str, float]:
+    """合并「默认 ← config.COVERAGE_OBJECTIVE_WEIGHTS ← 调用参数」的权重表。"""
+    merged = dict(DEFAULT_CUSTOM_WEIGHTS)
+    for src in (getattr(config, "COVERAGE_OBJECTIVE_WEIGHTS", None), weights):
+        if not isinstance(src, dict):
+            continue
+        for k, v in src.items():
+            if k not in merged:
+                continue
+            try:
+                merged[k] = float(v)
+            except (TypeError, ValueError):
+                continue
+    return merged
+
+
+class _PmaxEstimator:
+    """搜索期的 P(≥1注≥r红) 估计器：固定种子「公共随机数」+ 逐注命中布尔向量缓存。
+
+    为什么不用解析式：真实概率需要对 C(33,6)=1,107,568 种开奖全枚举（约 0.1~0.3s），
+    模拟退火每步都要算，放不进搜索；而泊松二项忽略票间相关（5 注全同时高估 5 倍）。
+    折中：搜索用同一批随机开奖（common random numbers，方差小、候选间可比），
+    最终展示值仍由 ``ticket_distribution(with_distribution_exact=True)`` 精确给出。
+    """
+
+    def __init__(self, r: int = 4, n_draws: int = _PMAX_SEARCH_DRAWS, seed: int = 0):
+        self.r = int(r)
+        rng = np.random.default_rng(int(seed))
+        keys = rng.random((int(n_draws), R_MAX))
+        picks = np.argpartition(keys, RED_PER_TICKET, axis=1)[:, :RED_PER_TICKET]
+        self.draw_masks = np.bitwise_or.reduce(
+            np.left_shift(np.int64(1), picks.astype(np.int64)), axis=1).astype(np.uint64)
+        self._cache: Dict[tuple, np.ndarray] = {}
+
+    def _hit_ge(self, reds) -> np.ndarray:
+        key = tuple(int(x) for x in reds)
+        arr = self._cache.get(key)
+        if arr is None:
+            arr = _popcount33(self.draw_masks & np.uint64(_red_mask(key))) >= self.r
+            self._cache[key] = arr
+        return arr
+
+    def p(self, tickets: List[Dict]) -> float:
+        if not tickets:
+            return 0.0
+        any_hit = np.zeros(self.draw_masks.shape[0], dtype=bool)
+        for t in tickets:
+            any_hit |= self._hit_ge(t["reds"])
+        return float(any_hit.mean())
+
+
+def _ticket_objective(tickets: List[Dict], objective: str = "ev_conserving", r: int = 3,
+                      *, estimator: Optional[_PmaxEstimator] = None,
+                      weights: Optional[Dict] = None,
+                      blue_owned_by_plan: bool = False) -> float:
+    """覆盖优化目标函数（V10-03 可插拔；语义见本节顶部冻结契约）。
+
+    参数
+    ----
+    objective : 4 个合法值（别名经 config.COVERAGE_OBJECTIVE_ALIASES 归一）。
+    r         : 「命中 ≥r 红」的 r，只有 pmax_high / custom_weight 用到。
+    estimator : pmax_high / custom_weight 用的 MC 估计器；缺省时退回精确枚举
+                （单次约 0.1~0.3s，仅在直接调用本函数时发生，搜索里必须传）。
+    blue_owned_by_plan : True 表示蓝球马上会被 blue_coverage_plan 改写
+                → **目标里绝不能含蓝球项**（否则就是零梯度项）。
+
+    注意：**没有任何模式包含 EV/奖金项**。同注数下 EV 恒等（n×单注 EV），
+    把它写进目标只会给优化器注入常数噪声，还会诱导「优化能提高期望」的错误叙事。
     """
     if not tickets:
         return 0.0
-    n = len(tickets)
-    distinct_blue = len({int(t["blue"]) for t in tickets})
-    if objective == "coverage":
-        union: set = set()
-        for t in tickets:
-            union.update(t["reds"])
-        return float(len(union)) + 1.5 * distinct_blue
-    # expected_value：以奖金期望为主项，蓝球覆盖概率作为可优化项加权进入
-    ev = portfolio_expected_value(tickets)["expected_reward"]
-    # 蓝球覆盖的体感价值：六等奖 ¥5 × 覆盖率提升；用 ¥5×distinct/16 表达
-    cover_bonus = 5.0 * (distinct_blue / float(B_MAX))
-    return float(ev) + cover_bonus * n / max(1, n)
+    obj = _normalize_coverage_objective(objective)
+    reds_list = [[int(x) for x in t["reds"]] for t in tickets]
+    pair = _pairwise_stats(reds_list)
+    union = pair["union_coverage"]
+    abar = pair["abar"]
+    distinct_blue = len({int(t.get("blue", 0)) for t in tickets
+                         if 1 <= int(t.get("blue", 0)) <= B_MAX})
+    # 蓝球项只在「蓝球不被 plan 接管」时才是真实自由度
+    blue_term = 0.0 if blue_owned_by_plan else (distinct_blue / float(B_MAX))
+
+    if obj == "coverage":
+        # 旧口径：红球并集 + 1.5×蓝球覆盖数；蓝球被 plan 接管时该项删除（零梯度修复）
+        return float(union) + (0.0 if blue_owned_by_plan else 1.5 * distinct_blue)
+
+    if obj == "ev_conserving":
+        # EV 恒等 → 只比结构：并集覆盖越大越好、冗余度 Ā 越小越好
+        score = float(union) - float(abar)
+        if not blue_owned_by_plan:
+            score += 1.5 * distinct_blue      # 蓝球未被 plan 接管时，覆盖数是真实可优化量
+        return float(score)
+
+    if obj == "pmax_high":
+        if estimator is not None:
+            return float(estimator.p(tickets))
+        return float(_exact_red_tail(_validate_tickets(tickets))["p_ge"].get(int(r), 0.0))
+
+    # custom_weight：归一化项的加权和（不含量纲混杂；不含 EV）
+    w = _custom_objective_weights(weights)
+    p_high = (estimator.p(tickets) if estimator is not None
+              else float(_exact_red_tail(_validate_tickets(tickets))["p_ge"].get(int(r), 0.0)))
+    terms = {
+        "pmax_high": p_high,
+        "union": union / float(R_MAX),
+        "neg_redundancy": 1.0 - (abar / REDUNDANCY_MAX if REDUNDANCY_MAX > 0 else 0.0),
+        "blue_coverage": blue_term,
+    }
+    return float(sum(w.get(k, 0.0) * v for k, v in terms.items()))
+
+
+def _objective_meta(objective: str, r: int, *, blue_owned_by_plan: bool,
+                    estimator: Optional[_PmaxEstimator] = None) -> Dict:
+    """目标函数的自述元数据（供 compare / 前端说明「这个目标在优化什么、不优化什么」）。"""
+    obj = _normalize_coverage_objective(objective)
+    return {
+        "objective": obj,
+        "objective_input": objective,
+        "r": int(r),
+        "optimizes_red_structure": obj in ("ev_conserving", "pmax_high", "coverage", "custom_weight"),
+        "optimizes_ev": False,          # 恒 False：任何模式都不允许把目标写成「提高期望」
+        "ev_identity_note": "同注数下 EV 恒为 n×单注 EV，与票单结构无关；本目标不含 EV 项",
+        "blue_owned_by_plan": bool(blue_owned_by_plan),
+        # 蓝球被 plan 接管 ⇒ 目标里的蓝球项对最终输出零梯度，故已从目标中删除
+        "gradient_blue_degenerate": bool(blue_owned_by_plan),
+        "pmax_estimator": ("mc_common_random_numbers" if (estimator is not None
+                                                          and obj in ("pmax_high", "custom_weight"))
+                           else None),
+        "note_zh": ("蓝球由 blue_coverage_plan 闭式负责；目标只作用于红球子问题。"
+                    "pmax_high 的方差代价须用 ticket_distribution()['var_ratio'] 一并展示。"),
+    }
 
 
 def coverage_optimize(pool: List[Dict], n_tickets: int, r: int = 3,
                       n_blues: int = 4,
                       trials: int = 3000, rng: Optional[random.Random] = None,
                       objective: str = "expected_value",
-                      blue_probs: Optional[np.ndarray] = None) -> List[Dict]:
-    """U4 覆盖优化器：从候选池选 n_tickets 注，最大化红球“至少命中 r 个”覆盖 +
-    蓝球覆盖。贪心初始化 + 模拟退火精修。
+                      blue_probs: Optional[np.ndarray] = None,
+                      objective_weights: Optional[Dict] = None) -> List[Dict]:
+    """U4 覆盖优化器：从候选池选 n_tickets 注（贪心初始化 + 模拟退火精修）。
 
-    objective（V4 新增）：
-      - "expected_value"（默认）：目标 = 奖金期望 + 蓝球覆盖奖金（见
-        _ticket_objective）。与 "coverage" 的区别在于它把**奖金口径**作为主项，
-        而不是把「红球并集大小」这种与中奖无直接关系的量当目标。
+    objective（V10-03 可插拔，别名经 config.COVERAGE_OBJECTIVE_ALIASES 归一）：
+      - "ev_conserving" / 旧名 "expected_value"（默认）：EV 守恒 —— 目标里**没有
+        EV 项**（EV 恒等），只比红球结构（并集覆盖 − 冗余度 Ā）。
+      - "pmax_high"：直接最大化 P(≥1 注命中 ≥r 红)；搜索期用公共随机数 MC 估计，
+        结果须配 ``ticket_distribution()`` 的精确概率与 ``var_ratio`` 展示方差代价。
       - "coverage"：旧口径（红球并集 + 蓝球覆盖数），保留向后兼容。
+      - "custom_weight"：用户偏好加权（``objective_weights`` 或
+        config.COVERAGE_OBJECTIVE_WEIGHTS）。
 
-    blue_probs：可选蓝球概率分布；给定时会把选中注的蓝球**按覆盖计划重排**
-    （blue_coverage_plan），保证 n <= 16 时蓝球互不相同——这是唯一在数学上
-    真实可得的改进。不给定时沿用候选池自带的蓝球。
+    **蓝球职责边界（冻结）**：``blue_probs`` 给定时，蓝球由
+    :func:`blue_coverage_plan` 闭式决定并在最后统一改写；因此此时**任何目标里都
+    不含蓝球项**（含蓝球项就是零梯度，只会往红球选择里注入蓝球噪声）。
+    ``blue_probs`` 未给定时蓝球保持候选池原值，此时蓝球覆盖数才是真实自由度。
 
-    双色球独立随机，无法让期望命中率超数学极限。**同注数下期望奖金恒等**，
-    本优化器改变的是「中奖频率的分布」，不是期望收益。诚实口径见
-    blue_coverage_plan 的 docstring。
+    诚实边界：本优化器改变的是**中奖频率的分布**（覆盖结构 / 方差），
+    **不改变期望收益**；任何把目标写成「提高期望」的实现都是错的。
     """
     rng = rng if rng is not None else random.Random()
     pool = [dict(t) for t in pool]
-    if objective not in ("coverage", "expected_value"):
-        objective = "expected_value"
+    obj = _normalize_coverage_objective(objective)
     if n_tickets <= 0 or not pool:
         return []
 
-    # 蓝球覆盖计划前置：先把蓝球按概率降序铺满（n<=16 时互不相同），再配对红球
+    # 蓝球覆盖计划前置：先把蓝球按概率降序铺满（n<=16 时互不相同）
     plan = blue_coverage_plan(n_tickets, blue_probs) if blue_probs is not None else None
+    blue_owned = plan is not None
+    estimator = None
+    if obj in ("pmax_high", "custom_weight"):
+        estimator = _PmaxEstimator(r=r, n_draws=_PMAX_SEARCH_DRAWS,
+                                   seed=rng.getrandbits(31))
+
+    def _score(sel: List[Dict]) -> float:
+        return _ticket_objective(sel, obj, r, estimator=estimator,
+                                 weights=objective_weights,
+                                 blue_owned_by_plan=blue_owned)
 
     if len(pool) <= n_tickets:
         out = pool[:n_tickets]
@@ -1448,6 +2070,10 @@ def coverage_optimize(pool: List[Dict], n_tickets: int, r: int = 3,
                 t["blue"] = int(b)
         return out
 
+    # 目标退化（候选池里所有注的红球完全相同）→ 任何选择目标值相同，退火无意义
+    distinct_red_sets = {tuple(sorted(int(x) for x in t["reds"])) for t in pool}
+    objective_degenerate = len(distinct_red_sets) == 1
+
     # 贪心：逐步加入使目标函数增益最大的一注
     selected: List[Dict] = []
     remaining = list(pool)
@@ -1455,20 +2081,20 @@ def coverage_optimize(pool: List[Dict], n_tickets: int, r: int = 3,
     while len(selected) < n_tickets and remaining:
         best, best_gain = None, None
         for t in remaining:
-            sc = _ticket_objective(selected + [t], objective, r)
+            sc = _score(selected + [t])
             gain = sc - cur
             if best_gain is None or gain > best_gain:
                 best, best_gain = t, gain
         remaining.remove(best)
         selected.append(best)
-        cur = _ticket_objective(selected, objective, r)
+        cur = _score(selected)
 
-    # 模拟退火：交换单注
+    # 模拟退火：交换单注（目标退化时跳过——判据是「极差为 0」，不是拍一个迭代数）
     current = list(selected)
     cur_score = cur
     best_sel = list(current)
     best_score = cur_score
-    for it in range(trials):
+    for it in range(0 if objective_degenerate else trials):
         if not remaining:
             remaining = [t for t in pool if t not in current]
         if not remaining:
@@ -1478,7 +2104,7 @@ def coverage_optimize(pool: List[Dict], n_tickets: int, r: int = 3,
         old_t = current[i]
         new_t = remaining[j]
         current[i] = new_t
-        nb_score = _ticket_objective(current, objective, r)
+        nb_score = _score(current)
         delta = nb_score - cur_score
         # 接受更优；等分时以随温度衰减的概率接受（探索），随迭代降温
         if delta > 0 or rng.random() < (0.5 / (1 + it ** 0.6)):
@@ -1501,21 +2127,47 @@ def coverage_optimize_compare(pool: List[Dict], n_tickets: int, r: int = 3,
                               n_blues: int = 4, trials: int = 3000,
                               rng: Optional[random.Random] = None,
                               objective: str = "expected_value",
-                              blue_probs: Optional[np.ndarray] = None) -> Dict:
+                              blue_probs: Optional[np.ndarray] = None,
+                              objective_weights: Optional[Dict] = None) -> Dict:
     """覆盖优化前后对比（V4）：返回优化前的朴素基线指标与优化后的指标。
 
     优化前基线 = 候选池按置信度降序取前 n 注（不做任何覆盖优化）。
-    返回 {"before": {...}, "after": {...}, "improvement": {...}}，
-    其中指标为 portfolio_expected_value 的关键字段。
+    返回 ``{"before": {...}, "after": {...}, "improvement": {...}, "objective": ...,
+    "objective_effective": ..., "objective_meta": {...}}``。
+
+    V10-03 新增 ``objective_meta``：
+      * ``gradient_blue_degenerate=True`` —— 蓝球被 plan 接管、目标里已无蓝球项；
+      * ``var_ratio_before`` / ``var_ratio_after`` —— 方差代价（pmax_high 必须展示）；
+      * ``p_at_least_r_before/after`` —— 「至少一注命中 ≥r 红」，pmax_high 时用精确枚举。
+    ``objective`` 字段保持调用方传入的原值（V4 兼容），规范化后的值放
+    ``objective_effective``。
     """
     rng = rng if rng is not None else random.Random()
     pool = [dict(t) for t in pool]
+    obj = _normalize_coverage_objective(objective)
     before = sorted(pool, key=lambda x: -float(x.get("confidence", 0.0)))[:n_tickets]
     after = coverage_optimize(pool, n_tickets, r=r, n_blues=n_blues,
-                              trials=trials, rng=rng, objective=objective,
-                              blue_probs=blue_probs)
+                              trials=trials, rng=rng, objective=obj,
+                              blue_probs=blue_probs,
+                              objective_weights=objective_weights)
     b = portfolio_expected_value(before)
     a = portfolio_expected_value(after)
+    plan_used = blue_probs is not None
+    exact = obj == "pmax_high"
+    dist_b = ticket_distribution(before, with_distribution_exact=exact, r_values=(r,))
+    dist_a = ticket_distribution(after, with_distribution_exact=exact, r_values=(r,))
+    meta = _objective_meta(obj, r, blue_owned_by_plan=plan_used)
+    meta.update({
+        "var_ratio_before": float(dist_b["var_ratio"]),
+        "var_ratio_after": float(dist_a["var_ratio"]),
+        "redundancy_before": float(dist_b["redundancy"]),
+        "redundancy_after": float(dist_a["redundancy"]),
+        "union_coverage_before": int(dist_b["union_coverage"]),
+        "union_coverage_after": int(dist_a["union_coverage"]),
+        f"p_at_least_{int(r)}_before": float(dist_b["p_at_least_r"][str(int(r))]),
+        f"p_at_least_{int(r)}_after": float(dist_a["p_at_least_r"][str(int(r))]),
+        "p_at_least_r_method": dist_a["p_at_least_r_method"],
+    })
     return {
         "before": b,
         "after": a,
@@ -1529,6 +2181,8 @@ def coverage_optimize_compare(pool: List[Dict], n_tickets: int, r: int = 3,
             "ev_ratio": a["ev_ratio"] - b["ev_ratio"],
         },
         "objective": objective,
+        "objective_effective": obj,
+        "objective_meta": meta,
         "jackpot_assumption": a["jackpot_assumption"],
     }
 
@@ -1785,6 +2439,14 @@ def predict_next(draws: List[Dict], use_llm: Optional[bool] = None,
     _blue_hit_prob = _portfolio_blue_hit_prob([t["blue"] for t in picked])
     _blue_hit_naive = (1.0 - (1.0 - 1.0 / B_MAX) ** len(picked)) if picked else 0.0
     _portfolio_ev = portfolio_expected_value(picked) if picked else None
+    # V10-03：票单分布元数据（coverage 模式）。用 iid 近似保证热路径开销恒定
+    # （精确枚举 C(33,6) 留给评估/报表/测试；需要时传 with_distribution_exact=True）。
+    _coverage_dist = None
+    if coverage and picked:
+        try:
+            _coverage_dist = ticket_distribution(picked, with_distribution_exact=False)
+        except (ValueError, TypeError):
+            _coverage_dist = None
     result = {
         "issue": issue,
         "requested_tickets": n_tickets,
@@ -1802,6 +2464,7 @@ def predict_next(draws: List[Dict], use_llm: Optional[bool] = None,
         "bet_mode": bet_mode,
         "coverage_mode": coverage,
         "coverage_objective": config.COVERAGE_OBJECTIVE if coverage else None,
+        "coverage_distribution": _coverage_dist,
         "blue_covered": n_distinct_blue,
         "blue_coverage_rate": round(n_distinct_blue / B_MAX, 4),
         "blue_hit_prob": round(_blue_hit_prob, 6),
