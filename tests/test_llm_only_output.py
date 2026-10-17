@@ -44,10 +44,10 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("LOTT_DB", str(tmp_path / "test.db"))
     monkeypatch.setenv("LOTT_ML_ENABLED", "0")
     from lottery import config, db
-    config.DATA_DIR = tmp_path / "data"
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path / "data")
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    config.DB_PATH = tmp_path / "test.db"
-    config.ADAPTIVE_STATE_FILE = tmp_path / "adaptive_state.json"
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "test.db")
+    monkeypatch.setattr(config, "ADAPTIVE_STATE_FILE", tmp_path / "adaptive_state.json")
     monkeypatch.setattr(config, "METHODS_RAW", "")
     monkeypatch.setattr(config, "METHOD_MODE", "production")
     monkeypatch.setattr(config, "METHODS_SPEC", {"mode": "all", "tokens": set()})

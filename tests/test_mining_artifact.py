@@ -6,9 +6,9 @@ def test_mining_artifact_round_trip(tmp_path, monkeypatch):
     monkeypatch.setenv("LOTT_DB", str(tmp_path / "ssq.db"))
     from lottery import config, db, mining
 
-    config.BASE = tmp_path
-    config.DATA_DIR = tmp_path / "data"
-    config.DB_PATH = tmp_path / "ssq.db"
+    monkeypatch.setattr(config, "BASE", tmp_path)
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path / "data")
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "ssq.db")
     db.close()
     db.get_conn()
     result = {

@@ -10,7 +10,8 @@
 - **资源需求极低**：1 vCPU / 512MB–1GB 内存 / 1GB 磁盘即可（LLM 推理走远端 API，本地无 GPU 负担）；
 - **长期运行**：`restart: unless-stopped` 开机自启 + 崩溃自动拉起；日志自动轮转；
 - **自动闭环**：开奖日（周二/四/日）21:35（Asia/Shanghai）自动「抓取 → 在线对照 → 生成下期预测」；无下期预测时启动即自动生成；
-- **数据持久化**：`./data` 目录挂载卷，数据库 + 原始快照都在里面，备份 = 拷贝该目录。
+- **数据持久化**：`./data` 目录挂载卷，数据库 + 原始快照都在里面；备份见第七节
+  （`ssq_backup.sh` 对 `ssq.db` 做 SQLite 在线一致性热备，**不要**直接 `cp` 正在写的库）。
 
 ## 一、VPS 准备
 
@@ -166,13 +167,16 @@ git commit -m "chore: publish local mining artifact"
 
 ```bash
 cd /root/DSH/应用/ssqyuce
-# 务必先备份（跨批次升级会执行不可逆的 SQLite schema 迁移，见 lottery/migrations.py）
-cp data/ssq.db /tmp/ssq.db.bak.$(date +%Y%m%d_%H%M%S)
+# 先做一次全量备份（V10-00c 起是已安装的真实脚本，见第七节；不再用 cp 裸拷正在写的库）
+/usr/local/bin/ssq-backup backup
+# 附加保险：迁移前 lottery/migrations.py 会自动热备到 data/ssq.db.pre-migrate-v<当前版本>
 docker compose up -d --build
 docker compose logs --tail 80 lottery
 # 预热约 2~2.5 分钟；轮询到 healthy 再验证
 until [ "$(docker inspect --format='{{.State.Health.Status}}' ssq-predictor)" = healthy ]; do sleep 10; done
 curl -fsS http://127.0.0.1:18000/api/info
+# 核对库结构版本（V10-00d 起 /api/health 暴露 schema_version / schema_latest）
+curl -fsS http://127.0.0.1:18000/api/health | python3 -m json.tool | grep -E 'schema_|issues'
 ```
 
 ### 运行时状态不在 git 里
@@ -197,22 +201,88 @@ curl -fsS http://127.0.0.1:18000/api/info
 | 手动刷数据 | `docker compose exec lottery python -m lottery.cli fetch` |
 | 手动生成预测 | `docker compose exec lottery python -m lottery.cli predict` |
 | 重启服务 | `docker compose restart` |
-| 升级版本 | 见第六节「本机升级」（**先备份 `data/ssq.db`**，再 `docker compose up -d --build`） |
+| 升级版本 | 见第六节「本机升级」（**先跑 `/usr/local/bin/ssq-backup backup`**，再 `docker compose up -d --build`） |
 | 服务器重启 | 无需操作，`restart: unless-stopped` 自动拉起 |
+| 备份 | 见下方「备份（已安装并做过恢复演练）」 |
 
-### 备份（**当前唯一安全网，务必配置**）
+### 备份（已安装并做过恢复演练，V10-00c）
 
-本机是唯一节点，`data/` 是全项目唯一数据副本：
+> 历史状态提醒：V10-00c 之前本节只是「待配置示例」，实测 `/etc/cron.d/ssq-backup`、
+> `/backup/` **都不存在**，`data/*.bak*` 也没有 —— 生产库曾处于**零备份**状态
+> （见 `docs/reviews/R4_RELEASE_REVIEW.md` P0-C）。以下命令均为**已实装**的真实命令。
+
+本机是唯一节点，`data/` 是全项目唯一数据副本。备份由
+`scripts/ssq_backup.sh`（符号链接 `/usr/local/bin/ssq-backup`）完成：
+
+* `data/ssq.db`：用 Python `sqlite3.Connection.backup()` 做**在线一致性热备**
+  （**不是 `cp`**：`cp` 一个正在写的库会得到撕裂副本，`.backup()` 走 SQLite 在线备份 API）；
+* `data/` 下其余运行时状态：`hypotheses.json`、`adaptive_state.json`、`llm_budget.json`、
+  `llm_config.json`（**含 API Key，归档与文件权限 600**）、`methods_config.json`、
+  `llm_claims.json`、`patterns_runtime.json`、`raw/`（以及任何新增的 `*.json`）；
+* **明确排除 `data/ml_models/`**（265MB，可由训练重建；`MANIFEST.txt` 里写明）。
+
+已安装的 cron（**每日 03:17**，保留最近 **14** 份）：
 
 ```bash
-# /etc/cron.d/ssq-backup （注意路径按实际项目目录，这里是本机实际路径）
-0 3 * * * root tar -czf /backup/ssq_$(date +\%F).tar.gz -C /root/DSH/应用/ssqyuce data && find /backup -name 'ssq_*.tar.gz' -mtime +14 -delete
+# /etc/cron.d/ssq-backup（已实装，权限 644，owner root）
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+MAILTO=""
+17 3 * * * root /usr/local/bin/ssq-backup backup >>/var/log/ssq-backup.cron.log 2>&1
 ```
 
-恢复：`docker compose down && tar -xzf /backup/ssq_xxx.tar.gz -C /root/DSH/应用/ssqyuce && docker compose up -d`。
+日常操作：
 
-> ⚠️ 备份必须包含 `data/ssq.db`，以及 `data/hypotheses.json`、`data/adaptive_state.json`、
-> `data/llm_budget.json` 这些运行时状态；`.env`（含 LLM 凭据）另行单独备份。
+```bash
+/usr/local/bin/ssq-backup backup      # 手工备份一次（cron 同源命令）
+/usr/local/bin/ssq-backup list        # 列出已有备份
+/usr/local/bin/ssq-backup verify      # 校验最新归档（库完整性 + 期数 + 全部 json 可解析）
+ls -l /backup/ssq-backup-*.tar.gz     # 归档位置（权限 600）
+tail -20 /var/log/ssq-backup.log      # 脚本日志（只记路径/大小/期数，绝不写密钥）
+```
+
+**恢复步骤（演练与实战同一套命令）**：
+
+```bash
+# 1) 先恢复到临时目录校验，绝不直接覆盖生产 data/
+/usr/local/bin/ssq-backup restore /backup/ssq-backup-<时间戳>.tar.gz /tmp/restore-test
+
+# 2) 用项目 venv 直接读库，确认期数（本机实测基线 = 3515 期）
+cd /root/DSH/应用/ssqyuce
+LOTT_DB=/tmp/restore-test/ssq.db .venv/bin/python -c \
+  "from lottery import db; print('期数 =', db.count_draws()); print('最新期号 =', db.max_issue())"
+
+# 3) 确认 runtime json 都能 json.load（llm_config.json 含密钥，恢复后保持 600）
+.venv/bin/python - <<'PY'
+import json, pathlib
+d = pathlib.Path("/tmp/restore-test")
+for f in ("hypotheses.json", "adaptive_state.json", "llm_budget.json",
+          "llm_config.json", "llm_claims.json", "patterns_runtime.json"):
+    p = d / f
+    print(f, "OK" if not p.exists() else json.loads(p.read_text(encoding="utf-8")) is not None)
+PY
+
+# 4) 确认无误后再切换（会短暂停服）
+docker compose down
+cp -a /tmp/restore-test/. /root/DSH/应用/ssqyuce/data/   # 只覆盖，不动 ml_models/
+chmod 600 /root/DSH/应用/ssqyuce/data/llm_config.json
+docker compose up -d
+curl -fsS http://127.0.0.1:18000/api/health   # 核对 issues=3515 与 schema_version
+```
+
+**迁移前自动备份（V10-00d）**：`lottery/migrations.py::apply` 在真正有待执行迁移时，
+会先自动热备到 `data/ssq.db.pre-migrate-v<当前版本>`（例如 `data/ssq.db.pre-migrate-v2`）；
+任一迁移失败会**整体回滚**（含 DDL），`schema_version` 不前进。回滚到旧 schema 时：
+
+```bash
+docker compose down
+cp -a data/ssq.db.pre-migrate-v2 data/ssq.db   # 回到迁移前状态
+docker compose up -d
+curl -fsS http://127.0.0.1:18000/api/health | grep schema_version
+```
+
+> ⚠️ `.env`（`.env` 含 LLM 凭据与 `LOTT_TOKEN`）**不在** `data/` 里，本脚本不覆盖它，
+> 仍需另行单独备份（例如 `cp -a .env ~/env-backup-$(date +%F) && chmod 600 ~/env-backup-*`）。
 
 ## 八、公网访问：反代 + HTTPS（可选，推荐）
 

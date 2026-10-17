@@ -15,9 +15,9 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("LOTT_METHODS", "")
     monkeypatch.setenv("LOTT_METHOD_MODE", "production")
     from lottery import config, db
-    config.DATA_DIR = tmp_path / "data"
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path / "data")
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    config.DB_PATH = tmp_path / "test.db"
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "test.db")
     monkeypatch.setattr(config, "METHODS_CONFIG_FILE", tmp_path / "methods_config.json")
     # 复位 config 全局，避免 set_methods 的改动泄漏到其它测试
     monkeypatch.setattr(config, "METHODS_RAW", "")

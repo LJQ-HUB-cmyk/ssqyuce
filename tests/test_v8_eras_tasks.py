@@ -116,9 +116,12 @@ def test_binomial_era_needs_reasonable_sample():
     assert small["p_value"] is None and "样本过少" in small["note_zh"]
 
 
-def test_regime_overview_endpoint_accepts_era_mode(monkeypatch):
+def test_regime_overview_endpoint_accepts_era_mode(monkeypatch, seeded_db):
     from fastapi.testclient import TestClient
     from lottery import api_app
+    # V10-00b：此前该用例依赖生产库恰好有开奖数据；改为造 600 期合成数据
+    # （阶段切分 block=150 → 4 段），判定条件不变。
+    seeded_db(600)
     c = TestClient(api_app.app)
     for mode in ("adaptive", "calendar"):
         r = c.get(f"/api/regime/overview?era_mode={mode}")
@@ -158,9 +161,11 @@ def test_closed_loop_reports_progress_stages():
             assert kw in msgs, f"阶段提示缺少 {kw}"
 
 
-def test_async_closed_loop_endpoint_returns_task_id(monkeypatch):
+def test_async_closed_loop_endpoint_returns_task_id(monkeypatch, seeded_db):
     from fastapi.testclient import TestClient
     from lottery import api_app
+    # V10-00b：端点要求库里有开奖数据才进入后台任务分支，改为造合成数据
+    seeded_db(600)
     c = TestClient(api_app.app)
     captured = {}
 
@@ -177,9 +182,10 @@ def test_async_closed_loop_endpoint_returns_task_id(monkeypatch):
     assert "后台" in j["note_zh"]
 
 
-def test_async_llm_lab_endpoint_returns_task_id(monkeypatch):
+def test_async_llm_lab_endpoint_returns_task_id(monkeypatch, seeded_db):
     from fastapi.testclient import TestClient
     from lottery import api_app
+    seeded_db(600)      # V10-00b：同上，端点要求库非空
     c = TestClient(api_app.app)
     monkeypatch.setattr(api_app, "_bg_run", lambda kind, fn, on_done=None: f"t_{kind}")
     r = c.post("/api/llm_lab/run/async?rounds=1&use_llm=0")
@@ -190,37 +196,35 @@ def test_bg_run_marks_task_completed_and_failed(tmp_path, monkeypatch):
     """后台任务必须把成功/失败如实写回 tasks 表，前端才能区分「还在跑」和「挂了」。"""
     import time
 
-    from lottery import api_app, config
+    from lottery import api_app, config, db
 
-    old = config.DB_PATH
-    try:
-        config.DB_PATH = tmp_path / "t.db"
-        # 直接清空模块级连接，让 get_conn() 连到临时库
-        db._CONN = None
-        tid = api_app._bg_run("t", lambda p: (p(0.5, "半程"), {"note_zh": "done"})[1])
-        for _ in range(100):
-            t = db.load_task(tid)
-            if t and t["status"] in ("completed", "failed"):
-                break
-            time.sleep(0.05)
+    # V10-00b：用 monkeypatch 改全局路径（自动还原），并 db.close() 重置模块级连接缓存，
+    # 让 get_conn() 连到临时库；不再裸赋值 config.DB_PATH / 手改 db._CONN。
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "t.db")
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path / "data")
+    (tmp_path / "data").mkdir(parents=True, exist_ok=True)
+    db.close()
+    tid = api_app._bg_run("t", lambda p: (p(0.5, "半程"), {"note_zh": "done"})[1])
+    for _ in range(100):
         t = db.load_task(tid)
-        assert t["status"] == "completed", t
-        assert (t.get("result") or {}).get("note_zh") == "done"
+        if t and t["status"] in ("completed", "failed"):
+            break
+        time.sleep(0.05)
+    t = db.load_task(tid)
+    assert t["status"] == "completed", t
+    assert (t.get("result") or {}).get("note_zh") == "done"
 
-        def boom(p):
-            raise RuntimeError("boom")
+    def boom(p):
+        raise RuntimeError("boom")
 
-        tid2 = api_app._bg_run("t", boom)
-        for _ in range(100):
-            t2 = db.load_task(tid2)
-            if t2 and t2["status"] in ("completed", "failed"):
-                break
-            time.sleep(0.05)
+    tid2 = api_app._bg_run("t", boom)
+    for _ in range(100):
         t2 = db.load_task(tid2)
-        assert t2["status"] == "failed" and "boom" in t2["message"]
-    finally:
-        config.DB_PATH = old
-        db._CONN = None
+        if t2 and t2["status"] in ("completed", "failed"):
+            break
+        time.sleep(0.05)
+    t2 = db.load_task(tid2)
+    assert t2["status"] == "failed" and "boom" in t2["message"]
 
 
 # ---------- 号码格式 ----------

@@ -194,7 +194,7 @@ def test_info_exposes_backend_threshold():
     assert "不承诺中奖率" in info.get("honesty_boundary", "")
 
 
-def test_rigor_missing_module_does_not_break_startup(monkeypatch):
+def test_rigor_missing_module_does_not_break_startup(monkeypatch, seeded_db):
     """rigor 模块缺失时必须 503 + available=false，服务不得启动失败。
 
     为什么不能用打桩 ``builtins.__import__`` 的方式模拟（这里前后踩了三次坑）：
@@ -229,10 +229,9 @@ def test_rigor_missing_module_does_not_break_startup(monkeypatch):
     monkeypatch.delattr(lottery, "rigor", raising=False)
     monkeypatch.delitem(sys.modules, "lottery.rigor", raising=False)
     monkeypatch.delitem(sys.modules, "rigor", raising=False)
-    # 注：以前这里还要把 config.DB_PATH 指回真实库，因为别处曾用直接赋值
-    # （config.DB_PATH = tmp_path/...）把数据目录换成临时空库，本端点会先撞上
-    # 「本地暂无开奖数据」的 400 而非 503。该污染源已在 tests/test_v4_coverage.py
-    # 改为 monkeypatch.setattr，故此处不再需要兜底。
+    # 缺模块时端点必须走到 503（在"是否有数据"之后判定），因此需要一份**非空**的库；
+    # 这里用合成数据造库（V10-00b），不再依赖生产库恰好有数据。
+    seeded_db(600)
 
     client = TestClient(api_app.app)
     r = client.get("/api/rigor/randomness")

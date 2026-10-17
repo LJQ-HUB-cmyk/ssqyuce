@@ -13,9 +13,9 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("LOTT_LLM_EXTRA_BODY", "")
     monkeypatch.setenv("LOTT_LLM_EXTRA_BODY_MAP", "")
     from lottery import config
-    config.DATA_DIR = tmp_path / "data"
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path / "data")
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    config.DB_PATH = tmp_path / "test.db"
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "test.db")
     monkeypatch.setattr(config, "METHODS_RAW", "")
     monkeypatch.setattr(config, "METHOD_MODE", "production")
     monkeypatch.setattr(config, "METHODS_SPEC", {"mode": "all", "tokens": set()})

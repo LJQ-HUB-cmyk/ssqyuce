@@ -32,9 +32,9 @@ def fresh_env(tmp_path, monkeypatch):
     monkeypatch.setenv("LOTT_LLM_EXTRA_BODY", "")
     monkeypatch.setenv("LOTT_LLM_EXTRA_BODY_MAP", "")
     from lottery import config, db
-    config.DATA_DIR = tmp_path / "data"
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path / "data")
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    config.DB_PATH = tmp_path / "test.db"
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "test.db")
     db.close()
     db.upsert_draws(_mk_draws())
     monkeypatch.setattr(config, "METHODS_RAW", "")

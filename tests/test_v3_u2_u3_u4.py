@@ -140,10 +140,10 @@ def test_blue_mode_uniform_returns_uniform():
 
 def test_refresh_adaptive_weights_downweights_poor_method(tmp_path, monkeypatch):
     from lottery import config, db, methods as METH
-    config.DATA_DIR = tmp_path / "data"
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path / "data")
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    config.DB_PATH = tmp_path / "db.sqlite"
-    config.ADAPTIVE_STATE_FILE = tmp_path / "adaptive_state.json"
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "db.sqlite")
+    monkeypatch.setattr(config, "ADAPTIVE_STATE_FILE", tmp_path / "adaptive_state.json")
     config.ADAPTIVE_ENABLED = True
     config.ADAPTIVE_K = 20
     config.ADAPTIVE_DOWNWEIGHT_FACTOR = 0.5
@@ -174,10 +174,10 @@ def test_refresh_adaptive_weights_downweights_poor_method(tmp_path, monkeypatch)
 
 def test_adaptive_weights_research_mode_no_downweight(tmp_path, monkeypatch):
     from lottery import config, db, methods as METH
-    config.DATA_DIR = tmp_path / "data2"
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path / "data2")
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    config.DB_PATH = tmp_path / "db2.sqlite"
-    config.ADAPTIVE_STATE_FILE = tmp_path / "adaptive_state.json"
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "db2.sqlite")
+    monkeypatch.setattr(config, "ADAPTIVE_STATE_FILE", tmp_path / "adaptive_state.json")
     config.ADAPTIVE_ENABLED = True
     config.ADAPTIVE_K = 20
     config.METHOD_MODE = "research"
@@ -194,9 +194,9 @@ def test_adaptive_weights_research_mode_no_downweight(tmp_path, monkeypatch):
 
 def test_blue_running_rate(tmp_path, monkeypatch):
     from lottery import config, db, methods as METH
-    config.DATA_DIR = tmp_path / "data3"
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path / "data3")
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    config.DB_PATH = tmp_path / "db3.sqlite"
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "db3.sqlite")
     db.close()
     # 6 个蓝球命中里 2 个命中 → 2/6
     for i, hit in enumerate([1, 0, 0, 1, 0, 0]):
@@ -286,10 +286,10 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("LOTT_METHOD_MODE", "production")
     monkeypatch.setenv("LOTT_ML_ENABLED", "0")
     from lottery import config, db
-    config.DATA_DIR = tmp_path / "data"
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path / "data")
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    config.DB_PATH = tmp_path / "test.db"
-    config.ADAPTIVE_STATE_FILE = tmp_path / "adaptive_state.json"
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "test.db")
+    monkeypatch.setattr(config, "ADAPTIVE_STATE_FILE", tmp_path / "adaptive_state.json")
     monkeypatch.setattr(config, "METHODS_CONFIG_FILE", tmp_path / "methods_config.json")
     monkeypatch.setattr(config, "METHODS_RAW", "")
     monkeypatch.setattr(config, "METHOD_MODE", "production")

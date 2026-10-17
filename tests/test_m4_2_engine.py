@@ -14,9 +14,9 @@ def test_engine_reports_shortfall_when_all_methods_disabled(monkeypatch):
 
 def test_engine_research_snapshot_uses_effective_spec(tmp_path, monkeypatch):
     from lottery import config, db, engine, methods
-    config.DATA_DIR = tmp_path / "data"
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path / "data")
     config.DATA_DIR.mkdir()
-    config.DB_PATH = tmp_path / "db.sqlite"
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "db.sqlite")
     db.close()
     monkeypatch.setattr(config, "METHOD_MODE", "research")
     monkeypatch.setattr(config, "METHODS_RAW", "-llm")

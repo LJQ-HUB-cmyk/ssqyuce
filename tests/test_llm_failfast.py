@@ -31,9 +31,9 @@ def fresh_env(tmp_path, monkeypatch):
     monkeypatch.setenv("LOTT_HOME", str(tmp_path))
     monkeypatch.setenv("LOTT_DB", str(tmp_path / "test.db"))
     from lottery import config, db
-    config.DATA_DIR = tmp_path / "data"
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path / "data")
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    config.DB_PATH = tmp_path / "test.db"
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "test.db")
     db.close()
     db.upsert_draws(_mk_draws())
     # 复位方法开关，避免其它测试污染

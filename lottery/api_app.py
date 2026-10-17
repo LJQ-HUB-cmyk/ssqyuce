@@ -21,6 +21,7 @@ class _NoCacheStaticFiles(StaticFiles):
         return resp
 
 from . import config, data_fetcher, db
+from . import migrations
 from . import features as F, diagnose as D, mining as M
 
 app = FastAPI(title="双色球智能预测分析系统", version=config.APP_VERSION)
@@ -64,6 +65,13 @@ def reconcile_history(limit: int = Query(30, ge=1, le=500)):
 
 @app.get("/api/health")
 def health():
+    # V10-00d：对外暴露 schema_version，部署/回滚时可直接确认库结构版本
+    # （迁移是懒加载自动执行的，没有这个字段只能靠连库 PRAGMA 猜）。
+    try:
+        schema = migrations.status(db.get_conn())
+    except Exception as e:  # noqa: BLE001 - 健康检查不能因此 500
+        schema = {"version": None, "latest": migrations.latest_version(),
+                  "error": f"{type(e).__name__}: {e}"}
     return {
         "status": "ok",
         "version": config.APP_VERSION,
@@ -71,6 +79,8 @@ def health():
         "max_issue": db.max_issue(),
         "eval_methods": [r["method"] for r in db.cumulative_eval(limit=1).get("methods", [])],
         "app_build": config.APP_BUILD,
+        "schema_version": schema["version"],
+        "schema_latest": schema["latest"],
         "uptime_seconds": max(0, int(__import__('time').time() - config.STARTED_AT)),
         "api_auth_enabled": bool(config.API_TOKEN),
         "recent_tasks": db.list_tasks(limit=5),
