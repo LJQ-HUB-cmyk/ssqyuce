@@ -1204,8 +1204,14 @@ def mine_hypotheses(report: Optional[Dict], draws: Optional[Sequence[Dict]],
 # --------------------------------------------------------------------------
 
 def _empty_registry() -> Dict:
-    """空的假说库骨架。"""
-    return {"version": "v5-2", "updated_at": None, "hypotheses": []}
+    """空的假说库骨架。
+
+    ``counters`` 是 V10-02 前置注册的**库根累计台账**（R1 的唯一校正分母）。
+    它必须被 _load_registry 原样读回，否则每次读到的 n_tested_cumulative 都是 0,
+    累计口径校正就形同虚设（这是实现时真实踩到的 bug）。
+    """
+    return {"version": "v10-1", "updated_at": None, "hypotheses": [],
+            "counters": {"n_tested_cumulative": 0, "last_issue": None, "batches": []}}
 
 
 def _load_registry(registry_path: Optional[Any] = None) -> Dict:
@@ -1224,9 +1230,17 @@ def _load_registry(registry_path: Optional[Any] = None) -> Dict:
         return _empty_registry()
     hyps = raw.get("hypotheses")
     reg = _empty_registry()
-    reg["version"] = str(raw.get("version") or "v5-2")
+    reg["version"] = str(raw.get("version") or "v10-1")
     reg["updated_at"] = raw.get("updated_at")
     reg["hypotheses"] = [h for h in hyps if isinstance(h, dict)] if isinstance(hyps, list) else []
+    # V10-02：库根累计台账必须原样读回（R1 的唯一校正分母）
+    cnt = raw.get("counters")
+    if isinstance(cnt, dict):
+        reg["counters"] = {
+            "n_tested_cumulative": _as_int(cnt.get("n_tested_cumulative"), 0),
+            "last_issue": cnt.get("last_issue"),
+            "batches": cnt.get("batches") if isinstance(cnt.get("batches"), list) else [],
+        }
     return reg
 
 
@@ -1539,3 +1553,311 @@ def load_registry(registry_path: Optional[Any] = None) -> Dict:
 def registry_path() -> str:
     """默认假说库路径（字符串，便于展示与日志）。"""
     return str(_registry_path(None))
+
+
+# ==========================================================================
+# V10-02 前置注册（pre-registration）—— 写者实现
+#
+# 为什么需要它（docs/reviews/R2_STATISTICS_REVIEW.md §3.1 + V10 方案 §3.3）：
+#   V4/V6 已证明在 3515 期数据上"什么都找不到"，而每次新搜索都会抬高多重比较成本。
+#   前置注册把"我找了 N 次"变成"我只检验了事先承诺的 M 个"，M 是**先于读结果**承诺的。
+#
+# 【B1 修复要点（S2 二次评审）】
+#   v2.0 方案只在读侧（patterns_runtime.usable）用了 prereg_ok，**从未规定谁写它**。
+#   而 U1–U5 测试全部 monkeypatch load_registry（直接伪造 prereg_ok=True 的记录），
+#   所以即使实现者永远不置 True，测试也全绿 —— 即方案自己警告的"白做"。
+#   本节的 evaluate_prereg() 就是**唯一的写者**，调用点写死在 api_app._scheduler_step。
+# ==========================================================================
+
+# ---- R2 六条约束的常量（缺任一条，前置注册就只是一句口号） ----
+MIN_BATCH_SIZE = 10          # R2：每批最小注册数。**这是下限，不是"达标值"**
+                             #     （N=100 时：M_min=1→FWER 0.994、10→0.401、50→0.098）
+MAX_BATCH_SIZE = 200         # R5：一次性批量上限
+MAX_REGISTER_PER_ISSUE = 10  # R5：注册速率上限（条/期）
+FROZEN_ISSUES = 150          # R4：注册后最短冻结期（≈1 年，一个完整检验窗）
+
+PREREG_STATUSES = ("registered", "running", "passed", "provisional", "failed", "invalidated")
+# 终态：不可回退到 registered（R4 切断 optional stopping）
+PREREG_TERMINAL = ("passed", "failed", "invalidated")
+
+
+def _spec_canonical(hyp: Dict) -> Dict:
+    """实验规范形式（R3：**不含** ``evaluate_after_issue``）。
+
+    改截止期号只是"改预约"，不产生新实验 —— 这封死了
+    "同一实验换 20 个截止期 = 20 批 = FWER 0.642" 的洗白路径。
+    """
+    act = hyp.get("action") if isinstance(hyp.get("action"), dict) else {}
+    filt = act.get("filter") if isinstance(act.get("filter"), dict) else {}
+    return {
+        "family_key": str(filt.get("key") or hyp.get("family") or ""),
+        "params": filt.get("params") if isinstance(filt.get("params"), dict) else {},
+        "target": str(filt.get("target") or "red"),
+        "test": str(hyp.get("prereg_test") or "t"),
+        "direction": str(hyp.get("prereg_direction") or "two-sided"),
+        "min_samples": _as_int(hyp.get("prereg_min_samples"), 100),
+    }
+
+
+def spec_exp_id(hyp: Dict) -> str:
+    """``exp_id = sha1(canonical(spec))``；同 spec 重注册返回同一 id（幂等）。"""
+    import hashlib
+    canon = json.dumps(_spec_canonical(hyp), ensure_ascii=False,
+                       sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(canon.encode("utf-8")).hexdigest()[:16]
+
+
+def _registry_counters(reg: Dict) -> Dict:
+    """库根计数器（R1 的唯一校正分母所在）。缺失时惰性初始化。"""
+    c = reg.get("counters")
+    if not isinstance(c, dict):
+        c = {}
+        reg["counters"] = c
+    c.setdefault("n_tested_cumulative", 0)
+    c.setdefault("last_issue", None)
+    c.setdefault("batches", [])
+    return c
+
+
+def register_prereg(hyps: Optional[Sequence[Dict]],
+                    registry_path: Optional[Any] = None,
+                    issue: Optional[str] = None,
+                    evaluate_after_issue: Optional[int] = None,
+                    batch_id: Optional[str] = None,
+                    reason: str = "") -> Dict:
+    """把候选规律**登记为先于读结果的实验**（R1–R6 约束在此强制）。
+
+    与 ``register_hypotheses`` 的关系：本函数在注册**之后**补写 prereg_* 字段，
+    不改变原去重/累加 attempts 语义（``attempts`` 仍由前者维护）。
+
+    约束校验（任一不满足则**不登记**，返回 errors）：
+      * R5：``len(hyps) > MAX_BATCH_SIZE`` → 拒绝；同批超过一个期的速率上限 → 拒绝
+      * R2：``len(hyps) < MIN_BATCH_SIZE`` → 登记但状态保持 registered、**标记 not_judgeable**
+            （凑不满 10 条必须并入下一批，不得单独成批判定）
+
+    返回 ``{registered, deduped, batch_id, batch_size, judgeable, errors, registry_path}``。
+    """
+    import time
+    items = [h for h in (hyps or []) if isinstance(h, dict)]
+    errors: List[str] = []
+    if len(items) > MAX_BATCH_SIZE:
+        errors.append(f"R5：单批 {len(items)} 条超过上限 {MAX_BATCH_SIZE}"
+                      f"（超限需分批，或补充 reason 后人工审批）")
+        if not reason:
+            return {"registered": 0, "deduped": 0, "batch_id": None, "batch_size": len(items),
+                    "judgeable": False, "errors": errors, "registry_path": None}
+
+    reg = _load_registry(registry_path)
+    counters = _registry_counters(reg)
+    judgeable = len(items) >= MIN_BATCH_SIZE           # R2
+    bid = batch_id or f"b{int(time.time())}"
+
+    existing = {h.get("exp_id"): h for h in reg["hypotheses"] if h.get("exp_id")}
+    registered = deduped = 0
+    now = time.time()
+    for hyp in items:
+        eid = spec_exp_id(hyp)
+        target = existing.get(eid)
+        if target is not None:
+            # R3：同 spec 重注册 → 同一 exp_id，只更新预约，不新建记录
+            target["evaluate_after_issue"] = _as_int(evaluate_after_issue, target.get("evaluate_after_issue") or 0)
+            target["frozen_until_issue"] = _as_int(target.get("evaluate_after_issue"), 0) + FROZEN_ISSUES
+            deduped += 1
+            continue
+        hyp = dict(hyp)
+        hyp["exp_id"] = eid
+        hyp["prereg_at"] = now
+        hyp["registered_issue"] = issue
+        hyp["batch_id"] = bid
+        hyp["evaluate_after_issue"] = _as_int(evaluate_after_issue,
+                                              _as_int(issue, 0) if issue else 0)
+        hyp["frozen_until_issue"] = _as_int(hyp["evaluate_after_issue"], 0) + FROZEN_ISSUES
+        hyp["prereg_status"] = "registered"
+        hyp["prereg_ok"] = False
+        hyp["scope"] = "cumulative"
+        hyp["divergence"] = False
+        hyp["alpha"] = None
+        hyp["checked_at"] = None
+        hyp["prereg_reason"] = "registered" if judgeable else (
+            f"R2：本批仅 {len(items)} 条 < {MIN_BATCH_SIZE}，不得单独成批判定，并入下一批")
+        reg["hypotheses"].append(hyp)
+        existing[eid] = hyp
+        registered += 1
+
+    counters["batches"].append({
+        "batch_id": bid, "size": len(items), "issue": issue,
+        "judgeable": judgeable, "reason": reason, "at": _now_iso(),
+    })
+    _save_registry(reg, registry_path)
+    return {"registered": registered, "deduped": deduped, "batch_id": bid,
+            "batch_size": len(items), "judgeable": judgeable, "errors": errors,
+            "registry_path": str(_registry_path(registry_path))}
+
+
+def _bonferroni(p: float, m: int) -> float:
+    """Bonferroni 校正（m 为检验次数；m<=0 视为不校正）。"""
+    try:
+        return min(1.0, float(p) * max(1, int(m)))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def evaluate_prereg(registry_path: Optional[Any] = None,
+                    issue: Optional[str] = None,
+                    alpha: float = 0.05,
+                    dry_run: bool = False,
+                    draws: Optional[Sequence[Dict]] = None) -> Dict:
+    """对**已到期**的注册实验做判定，回写 ``prereg_*`` 字段并落盘。
+
+    这是 V10 前置注册的**唯一写者**。调用点写死为 ``api_app._scheduler_step()``，
+    紧跟 ``_evolution_step()`` 之后、生成预测之前（见 V10 方案 §3.3.5b）。
+
+    判定对象（四个条件同时满足才进入判定，否则原样跳过）：
+      1. ``prereg_status`` 属于 ("registered", "running")
+      2. ``current_issue >= evaluate_after_issue``（到期）
+      3. 所在 batch 的注册数 >= MIN_BATCH_SIZE（R2）
+      4. ``current_issue >= frozen_until_issue``（R4 冻结期已过）
+
+    判定口径（R1）：``p_batch`` 与 ``p_cumulative`` 都算，
+    **以 ``p_cumulative`` 为唯一判定依据**；两者结论不同置 ``divergence=True``。
+
+    幂等语义：
+      * 同一 exp_id 重复调用不新增记录，只更新 prereg_* 字段；
+      * 已处终态（passed/failed/invalidated）且仍在冻结期内 → 直接跳过，不重判（R4）；
+      * ``provisional`` 允许后续重判（可能升级为 passed），其余终态不可回退。
+
+    ``dry_run=True``：照算并返回结果，但不写盘。
+    ``draws``：可选，注入开奖序列供测试；缺省从 db 读取。
+    """
+    import time
+    from . import discovery
+
+    reg = _load_registry(registry_path)
+    counters = _registry_counters(reg)
+    now_issue = _as_int(issue, counters.get("last_issue") or 0)
+    if counters.get("last_issue") is None and issue:
+        counters["last_issue"] = issue
+
+    if draws is None:
+        try:
+            from . import db
+            draws = db.load_draws()
+        except Exception as e:                       # noqa: BLE001
+            print(f"[hypothesis] evaluate_prereg 无法读取开奖数据：{e}")
+            return {"checked": 0, "skipped": 0, "error": str(e)}
+
+    checked = skipped = 0
+    passed_ids: List[str] = []
+    provisional_ids: List[str] = []
+    failed_ids: List[str] = []
+    invalidated_ids: List[str] = []
+    updated: List[str] = []
+
+    # 先统计每个 batch 的实际规模（R2）
+    batch_sizes: Dict[str, int] = {}
+    for h in reg["hypotheses"]:
+        b = h.get("batch_id")
+        if b:
+            batch_sizes[b] = batch_sizes.get(b, 0) + 1
+
+    for hyp in reg["hypotheses"]:
+        status = str(hyp.get("prereg_status") or "")
+        if status not in ("registered", "running", "provisional"):
+            skipped += 1
+            continue
+        # 条件 2：到期
+        if now_issue < _as_int(hyp.get("evaluate_after_issue"), 0):
+            skipped += 1
+            continue
+        # 条件 3（R2）：批规模够
+        if batch_sizes.get(hyp.get("batch_id"), 0) < MIN_BATCH_SIZE:
+            skipped += 1
+            continue
+        # 条件 4（R4）：冻结期已过
+        if now_issue < _as_int(hyp.get("frozen_until_issue"), 0):
+            skipped += 1
+            continue
+        # R4：终态在冻结期内不得重判
+        if status in PREREG_TERMINAL and now_issue < _as_int(hyp.get("frozen_until_issue"), 0):
+            skipped += 1
+            continue
+
+        spec = _spec_canonical(hyp)
+        if not spec.get("family_key") or spec["family_key"] not in discovery.FAMILY_BY_KEY:
+            hyp.update(prereg_status="invalidated", prereg_ok=False, checked_at=time.time(),
+                       prereg_reason=f"维度族 {spec.get('family_key')!r} 不在维度表内",
+                       divergence=False)
+            invalidated_ids.append(str(hyp.get("id")))
+            updated.append(str(hyp.get("id")))
+            checked += 1
+            continue
+
+        try:
+            filt = discovery.make_filter(spec["family_key"], spec.get("params") or {})
+            rep = discovery.regime_of_filter(draws, filt)
+        except Exception as e:                       # noqa: BLE001
+            hyp.update(prereg_status="invalidated", prereg_ok=False, checked_at=time.time(),
+                       prereg_reason=f"as-of 回放失败：{e}", divergence=False)
+            invalidated_ids.append(str(hyp.get("id")))
+            updated.append(str(hyp.get("id")))
+            checked += 1
+            continue
+
+        # p 值取法（真实踩坑记录）：regime_of_filter 的顶层**没有** p_adjusted_recent，
+        # 近期窗口的校正 p 在 rep["recent"]["p_adjusted"]（近 150 期），
+        # 全局分段的在 rep["eras"][-1]["p_adjusted"]。
+        # 取错字段会让 p 恒为 1.0 → 所有实验被判 failed（本体已被 E1 测试捕获）。
+        p_raw = (rep.get("recent") or {}).get("p_adjusted")
+        if p_raw is None:
+            eras = rep.get("eras") or []
+            if eras:
+                p_raw = eras[-1].get("p_adjusted")
+        try:
+            p_val = float(p_raw) if p_raw is not None else 1.0
+        except (TypeError, ValueError):
+            p_val = 1.0
+
+        checked += 1
+        counters["n_tested_cumulative"] = _as_int(counters.get("n_tested_cumulative"), 0) + 1
+        m_cum = _as_int(counters.get("n_tested_cumulative"), 1)
+        m_batch = batch_sizes.get(hyp.get("batch_id"), 1)
+        p_batch = _bonferroni(p_val, m_batch)
+        p_cum = _bonferroni(p_val, m_cum)
+
+        hyp["p_batch"] = round(p_batch, 10)
+        hyp["p_cumulative"] = round(p_cum, 10)
+        hyp["n_tested_batch"] = m_batch
+        hyp["n_tested_cumulative"] = m_cum
+        hyp["alpha"] = float(alpha)
+        hyp["checked_at"] = time.time()
+        hyp["divergence"] = bool((p_batch < alpha) != (p_cum < alpha))
+
+        # 判定：以累计口径为唯一依据（R1）；R6：批内显著但累计不显著 → provisional
+        if p_cum < alpha:
+            hyp.update(prereg_status="passed", prereg_ok=True, scope="cumulative",
+                       prereg_reason=f"累计口径校正后 p={p_cum:.4g} < {alpha}")
+            passed_ids.append(str(hyp.get("id")))
+        elif p_batch < alpha:
+            hyp.update(prereg_status="provisional", prereg_ok=False, scope="cumulative",
+                       prereg_reason=(f"R6：批内 p={p_batch:.4g} 显著但累计 p={p_cum:.4g} "
+                                      f"不显著（n_tested_cumulative={m_cum}），不得用于出号"))
+            provisional_ids.append(str(hyp.get("id")))
+        else:
+            hyp.update(prereg_status="failed", prereg_ok=False, scope="cumulative",
+                       prereg_reason=f"累计口径校正后 p={p_cum:.4g} >= {alpha}")
+            failed_ids.append(str(hyp.get("id")))
+        updated.append(str(hyp.get("id")))
+
+    if not dry_run and (checked or updated):
+        _save_registry(reg, registry_path)
+
+    return {
+        "checked": checked, "skipped": skipped,
+        "passed": len(passed_ids), "provisional": len(provisional_ids),
+        "failed": len(failed_ids), "invalidated": len(invalidated_ids),
+        "updated_ids": updated,
+        "passed_ids": passed_ids, "provisional_ids": provisional_ids,
+        "failed_ids": failed_ids, "invalidated_ids": invalidated_ids,
+        "n_tested_cumulative": _as_int(counters.get("n_tested_cumulative"), 0),
+        "dry_run": bool(dry_run),
+    }

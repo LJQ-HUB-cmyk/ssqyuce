@@ -90,10 +90,20 @@ def _draws(n=600, seed=5):
 
 
 def test_snapshot_tiers_only_persistent_and_validated_is_usable(monkeypatch):
+    """分层口径：`usable` 需三条件齐备 —— 阶段持续 + A/B validated + **前置注册通过**。
+
+    V10-02 变更：V7 时代只有前两条即可 usable；V10 起还必须 `prereg_ok is True`
+    （由 hypothesis.evaluate_prereg() 写入）。缺字段按安全默认视为 False。
+    """
     hyps = [
         {"id": "u1", "status": "validated", "source": "stat", "statement": "热号",
+         "prereg_ok": True, "prereg_status": "passed",
          "action": {"type": "prefer_red_filter", "filter": {"key": "hot", "params": {"window": 30, "k": 6}}},
          "regime": {"status": "persistent", "label_zh": "持续有效", "reason_zh": "r", "recent_delta": 0.1}},
+        # V10 新增：三条件齐备但 prereg_ok 缺失 → 不得 usable（安全默认）
+        {"id": "u2", "status": "validated", "source": "stat", "statement": "热号但未前置注册",
+         "action": {"type": "prefer_red_filter", "filter": {"key": "hot", "params": {"window": 50, "k": 6}}},
+         "regime": {"status": "persistent", "label_zh": "持续有效", "reason_zh": "r"}},
         {"id": "m1", "status": "proposed", "source": "stat", "statement": "冷号",
          "action": {"type": "prefer_red_filter", "filter": {"key": "cold", "params": {"window": 30, "k": 6}}},
          "regime": {"status": "emerging", "label_zh": "新兴", "reason_zh": "r"}},
@@ -110,11 +120,13 @@ def test_snapshot_tiers_only_persistent_and_validated_is_usable(monkeypatch):
     snap = PR.build_snapshot(_draws(), scan={"n_tested": 1, "items": [], "verdict": "x"})
     by_id = {r["id"]: r for r in snap["rules"]}
     assert by_id["u1"]["tier"] == "usable"
+    # V10-02：缺 prereg_ok → 不能 usable（否则前置注册白做）
+    assert by_id["u2"]["tier"] == "monitor", "缺 prereg_ok 必须降级为 monitor"
     # 只有一个阶段显著（emerging）→ 永远不能用于出号，即使 A/B 已验证
     assert by_id["m2"]["tier"] == "monitor"
     assert by_id["r1"]["tier"] == "rejected"
     assert "x1" not in by_id, "无维度假说不写入快照"
-    assert snap["counts"]["usable"] == 1
+    assert snap["counts"]["usable"] == 1, "只有 u1 同时满足三条件"
 
 
 def test_snapshot_roundtrip_and_staleness(tmp_path, monkeypatch):

@@ -107,7 +107,18 @@ def build_snapshot(draws: Sequence[Dict], scan: Optional[Dict] = None,
             continue
         rep = h.get("regime") or {}
         status = rep.get("status") or "noise"
-        usable = (status in USABLE_STATUSES) and h.get("status") == "validated"
+        # V10-02 前置注册接线（docs/reviews/S2_PLAN_FEASIBILITY_REVIEW.md B1）
+        # 三条件缺一不可：阶段持续 + A/B 通过(validated) + 前置注册通过(prereg_ok)。
+        # 【关键】prereg_ok 由 hypothesis.evaluate_prereg() 在每期调度器里写；
+        #         缺字段即视为 False（安全默认），否则"前置注册"就白做了。
+        # 【关键】source=="llm" 永不 usable：llm 不可回放 + 规律本不存在，
+        #         "llm 且 passed" 的集合恒为空；放行会让死锁从后门复活（V10 G1）。
+        usable = (
+            (status in USABLE_STATUSES)
+            and h.get("status") == "validated"
+            and h.get("prereg_ok") is True
+            and (h.get("source") or "stat") != "llm"
+        )
         rules.append({
             "id": h.get("id"), "source": h.get("source") or "stat",
             "statement": h.get("statement"), "dim": spec,
@@ -116,6 +127,18 @@ def build_snapshot(draws: Sequence[Dict], scan: Optional[Dict] = None,
             "regime": {"status": status, "label": rep.get("label_zh"),
                        "reason": rep.get("reason_zh"),
                        "effect": rep.get("recent_delta"), "p_adjusted": rep.get("p_adjusted_recent")},
+            # V10：让前端看得见"为什么不可用"，而不是只看到 usable=False
+            "prereg": {
+                "status": h.get("prereg_status"),
+                "exp_id": h.get("exp_id"),
+                "scope": h.get("scope"),
+                "p_batch": h.get("p_batch"),
+                "p_cumulative": h.get("p_cumulative"),
+                "n_tested_batch": h.get("n_tested_batch"),
+                "n_tested_cumulative": h.get("n_tested_cumulative"),
+                "divergence": bool(h.get("divergence")),
+                "reason": h.get("prereg_reason"),
+            },
             "usable": bool(usable),
             "tier": ("usable" if usable
                      else ("rejected" if (status in REJECTED_STATUSES

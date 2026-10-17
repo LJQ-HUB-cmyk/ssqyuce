@@ -1169,6 +1169,19 @@ def _scheduler_step():
     except Exception as e:  # noqa: BLE001
         print("[scheduler] 进化失败（不影响预测）:", e)
 
+    # V10-02：前置注册判定（**唯一写者**的调用点，见 docs/V10_IMPROVEMENT_PLAN.md §3.3.5b）
+    # 必须在快照刷新**之前**跑，否则本期已到期的实验要等下一期才生效（时序错误）。
+    # 失败只降级、不中断（沿用 _evolution_step 的既有约定：判定失败只影响 usable 条数）。
+    try:
+        from . import hypothesis
+        # issue=None → 由 evaluate_prereg 从库里读最近一期作为"当前期号"
+        _prereg = hypothesis.evaluate_prereg()
+        print("[scheduler] 前置注册判定:", {k: _prereg.get(k) for k in
+                                            ("checked", "passed", "provisional", "failed",
+                                             "invalidated", "n_tested_cumulative")})
+    except Exception as e:  # noqa: BLE001
+        print("[scheduler] 前置注册判定失败（不影响预测）:", e)
+
     # V7：生成预测前先重建规律快照，让「刚验证出来的规律」本期就能进入出号链路。
     # 失败只记录、不影响预测（快照是可选加速层，缺失时引擎照常出号）。
     try:
