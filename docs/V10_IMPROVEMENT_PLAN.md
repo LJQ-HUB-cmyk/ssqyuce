@@ -1539,3 +1539,33 @@ significant   = False       ← 因为 0.05 < 0.05 为假
 两者是同一个 `p = (1 + #{null ≥ real}) / (1 + B)` 在 B 过小时的必然结果。
 **修复必须同时解决这两个方向**：单纯把判定改成 `p <= alpha` 会让假阳性更糟；
 正解是提高 B（或改用参数化尾部），使 p 的分辨率足够细。
+
+### D-3　`shuffled_label_test` 单次调用 60~165s，超出同步 API 合理范围
+
+**发现路径**：D-2 修复后跑全量测试时 `pytest` 卡在 19% 超时 6m40s，定位到
+`tests/test_v10_ml_calibration.py::test_t7`（fixture 跑 5 个种子）实测耗 6m40s+。
+
+**Lead 实测拆解**（本机 4 核，load average 5.8~8.0）：
+
+| 项 | 耗时 |
+|---|---|
+| `_make_diag_learner` 训练一次（VotingClassifier = RF + HistGB） | **6.76 s** |
+| `_pos_proba` 预测一次（200 样本） | 0.39 s |
+| 零分布 20 次 × fit | ≈ 135 s |
+| 置换重要性 (20 特征 × 2 重复) × 预测 | ≈ 16 s |
+| **合计（实测一次完整调用）** | **164.5 s** |
+
+**影响**：
+- `tests/test_v10_ml_calibration.py` 的 fixture（5 个种子）单文件 > 6m40s，
+  导致**全量测试无法在合理时间内跑完**（这是本轮"全量卡在 19%"的直接原因）；
+- `GET /api/ml/diagnosis` 是**同步接口**，D-2 把 standard 档 `n_null` 提到 200 后，
+  一次诊断 ≈ 200 × 6.76s ≈ **22 分钟**，远超任何 HTTP 超时。
+
+**修复建议**：
+1. **测试侧（必须，阻塞全量）**：`test_v10_ml_calibration.py` 的 fixture 大幅降规模
+   （`n=1000→300`、`n_null=20→5`、`n_estimators=15→8`），或整体放进 `LOTT_SLOW_TESTS` 闸门，
+   默认档只保留一个轻量冒烟用例。目标是该文件 < 20s。
+2. **生产侧**：`/api/ml/diagnosis` 必须改**异步任务**（复用现有 `tasks` 表机制），
+   或缓存优先 + 后台刷新，**不得同步跑 200 次零分布**。
+3. 诊断学习器可考虑去掉 HistGB（只留 RF）或把 `max_iter` 压到 10 —— 但需重做
+   D-2 的假阳性率校准（换学习器会改变零分布）。

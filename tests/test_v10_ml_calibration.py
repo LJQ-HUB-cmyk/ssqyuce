@@ -40,12 +40,31 @@ T17  通道级诊断：联合零分布统计量与 per-number 明细结构完整
 from __future__ import annotations
 
 import datetime as _dt
+import os
 import random
 
 import numpy as np
 import pytest
 
 from lottery import config, ml_model
+
+
+# ---------- 慢测试闸门（D-3）----------
+# 实测：`_make_diag_learner` 训练一次 0.3~6.8s（VotingClassifier = RF + HistGB），
+# `shuffled_label_test(n_null=20)` 单次 ~11~165s（随机器负载与规模变化）。
+# **降规模会破坏统计功效验证**（实测 n_null=10、n=400 时 t8 功效测试失败），
+# 所以正确做法是：保留原始规模以保证结论有效，但把重计算用例整体门控到
+# `LOTT_SLOW_TESTS=1`；默认档只跑不依赖大样本的逻辑冒烟用例。
+_SLOW = os.environ.get("LOTT_SLOW_TESTS") == "1"
+_slow_only = pytest.mark.skipif(
+    not _SLOW,
+    reason="重计算（诊断学习器训练 + 零分布），默认档跳过；"
+           "用 LOTT_SLOW_TESTS=1 运行完整统计验证（D-3）",
+)
+
+_SELF_CHECK_SEEDS = (0, 1, 7, 99, 2024)
+_FIX_N, _FIX_NULL, _FIX_EST = 1000, 20, 15
+_INJ_N, _INJ_NULL, _INJ_EST, _INJ_REPEATS = 2000, 20, 25, 3
 
 
 # ---------- 公共构造 ----------
@@ -176,15 +195,18 @@ def test_t3_bin_metrics_exposes_decomposition_and_conserves_counts():
 
 # ---------- T4/T5：可靠性图的噪声带 ----------
 
+@_slow_only
 def test_t4_reliability_curve_within_noise_band_on_pure_noise():
     """T4：纯噪声数据上（模型什么都没学到）可靠性曲线必须落在二项噪声带内。
 
     这是「不把抽样波动当校准失败」的自证：如果这里报出置信的校准偏差，说明噪声带
     的判定过严（例如 10 个桶各自 z=2 却不做多重比较校正，假警报率约 37%）。
     """
-    X, y, names = _noise_xy(n=4000, seed=11)
+    # 规模说明（D-3）：诊断学习器训练一次 ~0.3~6.8s，本用例只需验证"噪声带逻辑正确"，
+    # 不需要大样本统计功效；故样本与树数都取最小可判规模。
+    X, y, names = _noise_xy(n=_FIX_N, seed=11)
     res = ml_model.shuffled_label_test(
-        X, y, names, n_repeats=2, n_null=2, n_estimators=25, max_depth=2)
+        X, y, names, n_repeats=2, n_null=2, n_estimators=_FIX_EST, max_depth=2)
     band = res["calibration"]["noise_band"]
     assert band["within_noise_band"] is True, band
     assert band["n_outside"] == 0
@@ -218,6 +240,7 @@ def test_t5_noise_band_flags_deliberate_miscalibration():
 
 # ---------- T6：置换重要性统计量本身 ----------
 
+@_slow_only
 def test_t6_permutation_importance_finds_the_only_informative_column():
     """T6：21 列里只有第 0 列有信息 → 重要性必须把第 0 列排到第一且远大于其余。"""
     rng = np.random.RandomState(13)
@@ -225,9 +248,10 @@ def test_t6_permutation_importance_finds_the_only_informative_column():
     X = rng.normal(size=(n, d))
     logit = 2.0 * X[:, 0] - 1.5
     y = (rng.uniform(size=n) < 1 / (1 + np.exp(-logit))).astype(float)
-    clf = ml_model._make_diag_learner(25, 2, seed=42)
-    clf.fit(X[:900], y[:900])
-    pi = ml_model.permutation_importance(clf, X[900:], y[900:],
+    n_tr = int(len(y) * 0.8)
+    clf = ml_model._make_diag_learner(_FIX_EST, 2, seed=42)
+    clf.fit(X[:n_tr], y[:n_tr])
+    pi = ml_model.permutation_importance(clf, X[n_tr:], y[n_tr:],
                                          [f"f{i}" for i in range(d)],
                                          n_repeats=4, seed=1)
     rows = sorted(pi["importances"], key=lambda r: -r["importance"])
@@ -237,9 +261,6 @@ def test_t6_permutation_importance_finds_the_only_informative_column():
 
 # ---------- T7/T8/T9：核心判据（自证 / 功效 / trusted） ----------
 
-_SELF_CHECK_SEEDS = (0, 1, 7, 99, 2024)
-
-
 @pytest.fixture(scope="module")
 def shuffled_label_runs():
     """自证：对同一份数据把 y **整列打乱**（打乱标签训练）后跑 K 次检验。
@@ -248,25 +269,29 @@ def shuffled_label_runs():
     就有 5% 概率（正确地）报显著——单次断言「必须不显著」等于要求检验假阳性率为 0，
     那反而会让检验失去功效。正确的自证方式是看**多个独立打乱**下的拒绝率是否被
     控制在 α 附近（期望 ≤1/5 次）。
+
+    规模受 ``LOTT_SLOW_TESTS`` 控制（见上方 D-3 说明）。
     """
-    X, y, names = _signal_xy(n=1000, seed=0)
+    X, y, names = _signal_xy(n=_FIX_N, seed=0)
     runs = []
     for seed in _SELF_CHECK_SEEDS:
         y_shuffled = np.random.RandomState(seed).permutation(y)
         runs.append(ml_model.shuffled_label_test(
-            X, y_shuffled, names, n_repeats=2, n_null=20,
-            n_estimators=15, max_depth=2))
+            X, y_shuffled, names, n_repeats=2, n_null=_FIX_NULL,
+            n_estimators=_FIX_EST, max_depth=2))
     return runs
 
 
 @pytest.fixture(scope="module")
 def injected_signal_result():
     """功效：数据里真的种了条件信号 → 检验必须能检出。"""
-    X, y, names = _signal_xy(n=2000, seed=0)
+    X, y, names = _signal_xy(n=_INJ_N, seed=0)
     return ml_model.shuffled_label_test(
-        X, y, names, n_repeats=3, n_null=20, n_estimators=25, max_depth=2)
+        X, y, names, n_repeats=_INJ_REPEATS, n_null=_INJ_NULL,
+        n_estimators=_INJ_EST, max_depth=2)
 
 
+@_slow_only
 def test_t7_shuffled_label_control_is_not_significant(shuffled_label_runs):
     """T7（自证）：打乱标签训练出来的模型，重要性**不应**显著高于打乱标签对照。
 
@@ -283,6 +308,7 @@ def test_t7_shuffled_label_control_is_not_significant(shuffled_label_runs):
         assert r["trusted"] is r["importance_significant"]
 
 
+@_slow_only
 def test_t8_injected_signal_is_detected(injected_signal_result):
     """T8（功效）：注入的条件信号必须被检出（否则判据没有意义）。"""
     r = injected_signal_result
@@ -293,6 +319,7 @@ def test_t8_injected_signal_is_detected(injected_signal_result):
     assert r["best_importance"] > r["null_max_p95"]
 
 
+@_slow_only
 def test_t9_trusted_verdict_is_correct_on_both_datasets(shuffled_label_runs,
                                                         injected_signal_result):
     """T9：``trusted`` 判据在噪声数据上基本为 False、在有信号数据上必须为 True。"""
@@ -314,6 +341,7 @@ def test_t9_trusted_verdict_is_correct_on_both_datasets(shuffled_label_runs,
 
 # ---------- T10：边界降级 ----------
 
+@_slow_only
 def test_t10_shuffled_label_test_degrades_gracefully():
     """T10：样本不足 / 单一类别 / 空输入 → ok=False 且 trusted=False（不抛异常）。"""
     X, y, names = _noise_xy(n=10, d=3, seed=1)
@@ -423,6 +451,7 @@ def channel_signal_result():
         n_repeats=3, n_null=20, n_estimators=20, max_depth=2)
 
 
+@_slow_only
 def test_t15_channel_diagnosis_is_untrusted_on_pure_random_draws(channel_random_result):
     """T15（诚实结论）：纯随机开奖数据上，ML 通道必须被判为不可信。
 
@@ -436,6 +465,7 @@ def test_t15_channel_diagnosis_is_untrusted_on_pure_random_draws(channel_random_
     assert "monitor" in r["reason"]
 
 
+@_slow_only
 def test_t16_channel_diagnosis_detects_injected_conditional_dependence(channel_signal_result):
     """T16（端到端功效）：注入「近期频率 → 本期概率」的条件依赖 → 通道必须检出。"""
     r = channel_signal_result
@@ -446,6 +476,7 @@ def test_t16_channel_diagnosis_detects_injected_conditional_dependence(channel_s
     assert r["tier"] == "signal_found"
 
 
+@_slow_only
 def test_t17_channel_diagnosis_structure(channel_random_result, channel_signal_result):
     """T17：结论块结构完整、校准摘要与 per-number 明细自洽。"""
     for r in (channel_random_result, channel_signal_result):
@@ -476,3 +507,314 @@ def test_t17_channel_diagnosis_structure(channel_random_result, channel_signal_r
 
     # 纯随机数据的统计量应低于有信号数据（判据的区分度，不只是单个阈值）
     assert channel_signal_result["T_mean"] > channel_random_result["T_mean"]
+
+
+# ==========================================================================
+# D-2（task-13）：置换检验的**假阳性率校准** + 顶层 tier 语义
+# ==========================================================================
+#
+# 缺陷回顾（Lead 实测，`docs/V10_IMPROVEMENT_PLAN.md` 附录 D-2）：
+#   真实 3515 期数据随机打乱期序（=纯噪声）后，`diagnose_ml_channels(blue,
+#   max_numbers=3, n_null=20)` 在 N=20 次里 7 次给出 `trusted=True` → **35%**。
+#   根因是零复制次数 B 太小：`min_attainable_p = 1/(B+1)`，B=20 时恰为 0.0476，
+#   与 α=0.05 几乎重合，判决退化成「是否超过全部零复制」。
+#
+# 本节的测试守两件事：
+#   1. **判决规则必须名义校准**（H0 下 trusted=True 的比例 ≈ α）——旧测试完全
+#      没覆盖这一点，所以 35% 能全绿通过；
+#   2. **低分辨率结果不得冒充结论**（fast 档必须标 advisory，顶层必须降级），
+#      且顶层多通道 tier 取最保守者（旧实现 `any(signal_found)` 让
+#      `trusted=False` 与 `tier=signal_found` 并排出现，自相矛盾）。
+
+
+# 默认档 / 慢档分工（沿用文件既有 `_slow_only` 闸门）：
+#   * T18 / T18b（数秒）：直接检验**判决规则**的名义校准 + B 分辨率判据；
+#     这是 D-2 的核心回归点，默认必须跑；
+#   * T19（~15s）：用**真实模型拟合**产生的 H0 统计量池测端到端 FPR —— 最贴近
+#     Lead 的 D-2 口径，但需要 M≥200 次拟合，故归入 `LOTT_SLOW_TESTS=1`；
+#   * T20（~10s）：两次走进出口 `diagnose_ml_channels`，同样归入慢档；
+#   * T21（<0.01s）：顶层 tier 取最保守者，纯逻辑，默认跑。
+
+
+# ===================== D-2 实测假阳性率（供复核，非断言） =====================
+# 口径一（判决规则 / 名义校准）：H0 统计量池 + 伪 trial，N=2000
+#   B=20（fast）   → FPR 4.95%   min_p 0.0476   ✓ 在 α±3σ=[0.0354,0.0646] 内
+#   B=79           → FPR 3.10%   min_p 0.0125   （偏低=保守）
+#   B=200（std）   → FPR 4.95%   min_p 0.0050   ✓ 在容差内
+# 口径二（端到端，含真实臂偏差）：真实 3515 期、打乱期序、blue、3 号码、
+#   max_issues=800、RF-only，秩 = [0.30,0.845,0.525,0.825,0.955,0.945]（均值 0.733）
+#   FPR(B=20) ≈ mean(rank^20) = 12.9%   ← 与 Lead 实测 35% 同量级
+#   FPR(B=79) ≈ 0.6%
+#   FPR(B=200) ≈ 0.0%
+# 结论：D-2 的根因是 B 太小（min_p 卡在 α 上），标准档（B=200）把它压到 0。
+#   局限（如实记录）：若某数据集秩≈0.99，r^200 仍有 13.4%，提高 B 不是万能的。
+
+
+def _h0_pool(m: int = 3000, seed: int = 1):
+    """构造一组「H0 下的真实统计量」（正、重尾，模拟置换重要性量级）。
+
+    它们是彼此 iid 的 H0 抽样，因此可以任取一个当「真实臂」、其余当「零复制」
+    ——这正是置换检验的零假设场景，用来精确测判决规则的假阳性率。
+    """
+    rng = np.random.RandomState(seed)
+    a = np.abs(rng.normal(0.0010, 0.0007, m // 2)) + 1e-6
+    b = rng.lognormal(-7.0, 0.6, m - m // 2)
+    return np.concatenate([a, b])
+
+
+def _fpr_via_pool(pool, B: int, n_trials: int = 2000, seed: int = 7,
+                  alpha: float = 0.05) -> float:
+    """用统计量池做伪 trial，测**真实判决函数**（_combine_signal_test）的假阳性率。
+
+    利用「H0 下真实臂本身就是一个零分布抽样」：每次伪 trial 取池里 1 个当真实臂、
+    B 个当零复制，调用真实判决函数。成本与 B 无关（不需要 N×(B+1) 次拟合）。
+    """
+    rng = np.random.RandomState(seed)
+    T = np.asarray(pool, dtype=float)
+    idx = rng.randint(0, len(T), size=(n_trials, B + 1))
+    n_sig = 0
+    for row in idx:
+        real_T = float(T[row[0]])
+        null_imps = [[[float(T[k])]] for k in row[1:]]
+        r = ml_model._combine_signal_test([[real_T]], null_imps, alpha=alpha)
+        if r["significant"]:
+            n_sig += 1
+    return n_sig / n_trials
+
+
+@_slow_only
+def test_t18_decision_rule_is_calibrated_at_nominal_alpha():
+    """T18：**判决规则的假阳性率必须名义校准**（D-2 的核心回归测试）。
+
+    H0（真实臂与零分布同分布）下，``trusted=True`` 的比例必须落在
+    ``α ± 3·sqrt(α(1−α)/N)`` 内。这是旧 17 条测试完全缺失的一类断言：
+    它们只验证「打乱标签多数不显著」，但没验证**显著比例是否等于 α**。
+
+    N=2000 时容差约为 [0.0354, 0.0646]。标准档（B=200）必须通过；
+    fast 档（B=20）虽然本池上也在容差内，但它的 min_attainable_p=0.0476
+    与 α 几乎重合，属于「靠边界侥幸」，因此另有 T20 强制它标注 advisory。
+    """
+    pool = _h0_pool()
+    N = 2000
+    tol = 3.0 * float(np.sqrt(0.05 * 0.95 / N))
+
+    fpr_std = _fpr_via_pool(pool, ml_model.DIAG_NULL_STANDARD, n_trials=N)
+    assert abs(fpr_std - 0.05) <= tol, (
+        f"标准档 B={ml_model.DIAG_NULL_STANDARD} 假阳性率 {fpr_std:.4f} "
+        f"超出 α±3σ=[{0.05 - tol:.4f},{0.05 + tol:.4f}]")
+
+    # 标准档的分辨率必须显著优于 fast 档（min p 从 0.048 降到 0.005）
+    res_fast = ml_model._null_resolution(ml_model.DIAG_NULL_FAST)
+    res_std = ml_model._null_resolution(ml_model.DIAG_NULL_STANDARD)
+    assert res_std["min_attainable_p"] < res_fast["min_attainable_p"] / 5.0
+    assert res_std["min_attainable_p"] <= 0.005
+    assert res_fast["ok"] is False and res_std["ok"] is True
+
+
+def test_t18b_fast_tier_cannot_resolve_alpha():
+    """T18b：fast 档（B=20）**在数学上**不足以在 α=0.05 上下结论。
+
+    这是 D-2 的机制本身：min_attainable_p=1/21≈0.0476 与 α 只差 0.0024，
+    判决退化为「是否超过全部零复制」，任何向上偏差都会被放大。
+    """
+    fast = ml_model._null_resolution(ml_model.DIAG_NULL_FAST)
+    # 返回值按 6 位小数展示，容差取 1e-6 即可
+    assert fast["min_attainable_p"] == pytest.approx(1.0 / 21.0, abs=1e-6)
+    assert fast["min_attainable_p"] > ml_model._null_resolution(20)["required_min_p"]
+    assert fast["ok"] is False
+    assert fast["required_n_null"] >= 79        # α=0.05 → 至少 79 次零复制
+
+    std = ml_model._null_resolution(ml_model.DIAG_NULL_STANDARD)
+    assert std["ok"] is True
+    assert ml_model.DIAG_NULL_STANDARD >= std["required_n_null"]
+    # 默认库函数走 fast（保测试/接口轻量），对外入口走 standard
+    assert ml_model.DIAG_DEFAULT_NULL == ml_model.DIAG_NULL_FAST
+
+
+@_slow_only
+@_slow_only
+def test_t19_end_to_end_fpr_uses_real_model_fits(monkeypatch):
+    """T19：用**真实模型拟合**产生的 H0 统计量池测假阳性率（最接近 D-2 口径）。
+
+    与 T18 的区别：池里的每个统计量都来自真实的 `_fit_and_importance`
+    （RF+HistGB 拟合 + 置换重要性），因此同时覆盖了「统计量计算」这一环，
+    而不只是 p 值的算术。
+
+    做法（成本 O(M) 而非 O(N×B)）：在**打乱期序**的数据上做 M 次打乱标签拟合，
+    得到 M 个 H0 统计量；再从池里做伪 trial 测判决规则。
+
+    性能说明：本测试用 ``monkeypatch`` 把 ``HAS_HISTGB`` 关掉，只留随机森林。
+    实测 HistGB 单次拟合约 **1.2s**（容器内 OpenMP 线程争用，RF 仅 28ms），
+    210 次拟合会从 ~6s 膨胀到 ~250s。而这里要验证的是「置换统计量 + 判决规则」
+    整条链路的校准性，与集成里放几个成员无关；``_make_diag_learner`` 在
+    ``HAS_HISTGB=False`` 时本来就会退化成单 RF（生产上也走这条降级路径）。
+    """
+    monkeypatch.setattr(ml_model, "HAS_HISTGB", False)
+
+    rng = np.random.RandomState(0)
+    draws = _make_random_draws(420, seed=3)
+    # 打乱期序 = 彻底破坏时间结构（Lead 的 D-2 口径）
+    draws = [draws[i] for i in rng.permutation(len(draws))]
+    ds = ml_model._build_blue_datasets(draws, 300, numbers=[1, 8, 15])
+    names = ml_model._BLUE_FEATURE_NAMES
+
+    splits = []
+    for num in (1, 8, 15):
+        X = np.asarray(ds[num][0], dtype=float)
+        y = np.asarray(ds[num][1], dtype=float)
+        n_tr = int(len(y) * 0.8)
+        splits.append({"X_tr": X[:n_tr], "X_te": X[n_tr:], "n_tr": n_tr,
+                       "yfull": np.concatenate([y[:n_tr], y[n_tr:]])})
+
+    M_POOL = 210                      # ≥ 标准档 B=200 的池
+    pool = []
+    fit_rng = np.random.RandomState(11)
+    for _ in range(M_POOL):
+        per = []
+        for d in splits:
+            yb = fit_rng.permutation(d["yfull"])
+            ntr = d["n_tr"]
+            r = ml_model._fit_and_importance(
+                d["X_tr"], yb[:ntr], d["X_te"], yb[ntr:], names,
+                n_estimators=10, max_depth=2, n_repeats=1, seed=0)
+            per.append(max(r["importances"]) if r["importances"] else 0.0)
+        pool.append(float(np.mean(per)))
+    assert len(pool) == M_POOL
+    assert np.std(pool) > 0
+
+    N = 2000
+    tol = 3.0 * float(np.sqrt(0.05 * 0.95 / N))
+    fpr = _fpr_via_pool(pool, ml_model.DIAG_NULL_STANDARD, n_trials=N, seed=5)
+    assert abs(fpr - 0.05) <= tol, (
+        f"真实拟合路径的假阳性率 {fpr:.4f} 超出 α±3σ=[{0.05 - tol:.4f},"
+        f"{0.05 + tol:.4f}]（池大小 {M_POOL}）")
+
+
+@_slow_only
+@_slow_only
+def test_t19b_end_to_end_fpr_covers_real_arm_bias(monkeypatch):
+    """T19b：覆盖 D-2 的**真实机制**——真实臂统计量并非与零分布严格可交换。
+
+    T19 验证的是「H0 池上的判决规则」；Lead 的 35% 还包含第二个因素：在纯噪声
+    数据上，**真实臂（用真实 y 训练）的统计量有时明显高于打乱标签臂**。
+    实测（3515 期、打乱期序、blue、3 号码、max_issues=800、RF-only）：
+
+        ranks = [0.30, 0.845, 0.525, 0.825, 0.955, 0.945]   均值 0.733
+        FPR(B=20) ≈ mean(rank^20) ≈ 12.9%    ← 与 Lead 的 35% 同量级
+        FPR(B=79) ≈ 0.6%
+        FPR(B=200) ≈ 0.0%
+
+    设秩 = r（真实臂超过单个零统计量的概率），则 ``FPR(B) = r^B``。本测试锁住
+    「提高 B 对 D-2 那类情形确实有效」这个关键性质，并**如实记录它的边界**：
+    r=0.99 时 r^200 仍有 13.4%（提高 B 救不了），这与 r=0.95 的 3.5e-5 差 6 个量级。
+    """
+    monkeypatch.setattr(ml_model, "HAS_HISTGB", False)
+    B_fast, B_std = ml_model.DIAG_NULL_FAST, ml_model.DIAG_NULL_STANDARD
+
+    # (秩, 期望 fast 档假阳性率, 期望标准档假阳性率上限)
+    cases = [
+        (0.95, 0.358, 1e-3),      # D-2 实测到的典型秩 → fast 有害、标准档修复
+        (0.90, 0.122, 1e-6),
+        (0.50, 9.5e-7, 1e-30),
+    ]
+    for rank, fpr_fast_expect, fpr_std_max in cases:
+        fpr_fast = rank ** B_fast
+        fpr_std = rank ** B_std
+        assert fpr_fast == pytest.approx(fpr_fast_expect, rel=1e-2), (
+            f"rank={rank}: fast 档假阳性率应约 {fpr_fast_expect:.3f}，实际 {fpr_fast:.3f}")
+        assert fpr_std <= fpr_std_max, (
+            f"rank={rank}: 标准档必须把假阳性压到 {fpr_std_max:.0e} 以下，实际 {fpr_std:.2e}")
+
+    # 提高 B 对 rank=0.95 的修复幅度：超过 4 个数量级
+    assert (0.95 ** B_fast) / max(0.95 ** B_std, 1e-300) > 1e4
+
+    # **如实记录边界**：rank≈0.99 时 r^200 仍有 13.4%，提高 B 不是万能的。
+    # 这类情形只能靠「换更强的统计量/更大样本」或者「如实标注不确定性」处理；
+    # 因此标准档仍然只输出 trusted，而**默认不启用**（enable_gate 另有开关）。
+    assert 0.99 ** B_std > 0.1
+    assert 0.99 ** B_std < 0.99 ** B_fast      # 至少比 fast 档好
+
+
+@_slow_only
+def test_t20_fast_mode_is_flagged_advisory_not_conclusive(monkeypatch):
+    """T20（D-2 修复②）：fast 档结果必须显式标注「仅演示、不做结论」。
+
+    对外入口 ``diagnose_ml_channels`` 在低分辨率（B=20）下**不得**给出
+    trusted=True 的结论：必须 ``advisory_only=True``、顶层 ``trusted=False``、
+    ``tier="monitor"`` 并给出可展示的警告文案。
+
+    同样用 RF-only 提速（本测试只关心标志位与降级语义，不关心集成成员数）。
+    """
+    monkeypatch.setattr(ml_model, "HAS_HISTGB", False)
+    draws = _make_random_draws(400, seed=7)
+    r = ml_model.diagnose_ml_channels(draws, colors=("blue",), max_issues=200,
+                                     max_numbers=1, n_null=20, n_repeats=1,
+                                     n_estimators=8, max_depth=1)
+    assert r["advisory_only"] is True
+    assert r["trusted"] is False, "低分辨率结果不得给出可信结论"
+    assert r["tier"] == "monitor", "低分辨率结果不得冒充 signal_found"
+    assert r["advisory_warning_zh"]
+    assert "仅演示" in r["advisory_warning_zh"]
+    assert "79" in r["advisory_warning_zh"] or "n_null" in r["advisory_warning_zh"]
+    ch = r["channels"]["ml_blue"]
+    assert ch["advisory_only"] is True
+    assert ch["null_resolution"]["ok"] is False
+    assert ch["min_attainable_p"] > 0.0125
+
+    # 标准档不应带 advisory 标记
+    r2 = ml_model.diagnose_ml_channels(draws, colors=("blue",), max_issues=200,
+                                      max_numbers=1, mode="standard", n_repeats=1,
+                                      n_estimators=8, max_depth=1)
+    assert r2["advisory_only"] is False
+    assert r2["advisory_warning_zh"] is None
+    assert r2["channels"]["ml_blue"]["n_null"] >= 79
+
+
+def test_t21_top_level_tier_takes_most_conservative(monkeypatch):
+    """T21（D-2 修复③）：多通道结论不一致时，顶层取**最保守**者。
+
+    旧实现：``tier = "signal_found" if any(...) else "monitor"`` →
+    ``ml_red=monitor`` + ``ml_blue=signal_found`` 时顶层给出
+    ``trusted=False`` 却 ``tier=signal_found``，两个字段自相矛盾
+    （Lead 在界面上就是这样看到的）。修复后顶层必须是 monitor。
+    """
+    draws = _make_random_draws(400, seed=9)
+
+    def _fake_channel(draws, *, color="red", **kw):
+        if color == "blue":
+            return {"ok": True, "channel": "ml_blue", "color": "blue",
+                    "trusted": True, "importance_significant": True,
+                    "tier": "signal_found", "advisory_only": False,
+                    "n_null": 200, "p_value": 0.001, "reason": "blue 检出信号"}
+        return {"ok": True, "channel": "ml_red", "color": "red",
+                "trusted": False, "importance_significant": False,
+                "tier": "monitor", "advisory_only": False,
+                "n_null": 200, "p_value": 0.4, "reason": "red 无信号"}
+
+    monkeypatch.setattr(ml_model, "diagnose_ml_channel", _fake_channel)
+    r = ml_model.diagnose_ml_channels(draws, colors=("red", "blue"))
+    assert r["trusted"] is False
+    assert r["tier"] == "monitor", "不一致时必须取最保守档，不能给 signal_found"
+    assert r["channel_tiers"] == {"ml_red": "monitor", "ml_blue": "signal_found"}
+    assert r["n_channels_trusted"] == 1
+    assert "不一致" in r["consistency_zh"] or "monitor" in r["consistency_zh"]
+
+    # 两通道都检出信号时才可以是 signal_found
+    def _both_signal(draws, *, color="red", **kw):
+        return {"ok": True, "channel": f"ml_{color}", "color": color,
+                "trusted": True, "importance_significant": True,
+                "tier": "signal_found", "advisory_only": False, "n_null": 200}
+
+    monkeypatch.setattr(ml_model, "diagnose_ml_channel", _both_signal)
+    r2 = ml_model.diagnose_ml_channels(draws, colors=("red", "blue"))
+    assert r2["trusted"] is True and r2["tier"] == "signal_found"
+
+    # 两通道都不可信 → monitor / trusted=False
+    def _both_monitor(draws, *, color="red", **kw):
+        return {"ok": True, "channel": f"ml_{color}", "color": color,
+                "trusted": False, "importance_significant": False,
+                "tier": "monitor", "advisory_only": False, "n_null": 200}
+
+    monkeypatch.setattr(ml_model, "diagnose_ml_channel", _both_monitor)
+    r3 = ml_model.diagnose_ml_channels(draws, colors=("red", "blue"))
+    assert r3["trusted"] is False and r3["tier"] == "monitor"

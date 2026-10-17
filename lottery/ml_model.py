@@ -368,8 +368,66 @@ def brier_decomposition(p: np.ndarray, y: np.ndarray, n_bins: int = 10) -> Dict:
 # 注意：这是一个 **α 水平的检验**，不是「打乱标签必须永远不显著」——单次运行本身
 # 有 α 概率（正确地）报显著。自证方式看的是多个独立打乱下的**拒绝率**（测试 T7）。
 
-DIAG_DEFAULT_NULL = 20      # 打乱标签对照重复次数（B=20 → 最小可达 p = 1/21 ≈ 0.048）
+# ---- 零复制次数 B（V10-08 / D-2 修正）----
+#
+# 置换检验的 p = (1 + #{零复制统计量 ≥ 真实统计量}) / (1 + B)，因此**最小可达 p
+# 就是 1/(B+1)**。B 太小会出两个致命问题（D-2 实测踩过）：
+#   1. **分辨率不足**：B=20 时最小 p = 1/21 ≈ 0.0476，刚好卡在 α=0.05 判定线上。
+#      于是「显著」等价于「真实统计量超过全部 20 个零复制」——门槛近乎「比零分布
+#      最大值略高」，而不是 5% 水平。任何一点向上偏差都会被放大成高假阳性率
+#      （Lead 实测 B=20 时 trusted=True 假阳性率 35%）；
+#   2. **Monte-Carlo 误差大**：p̂ 的标准误 ≈ sqrt(p(1-p)/B)，B=20 时在 p≈0.05 处
+#      约 0.048，p 几乎只剩「0.048 或更大」两档。
+#
+# 因此默认用 **standard（B=200）**，最小 p = 1/201 ≈ 0.005（α/10 量级）；
+# **fast（B=20）** 仅供演示/冒烟，输出一律带 ``advisory_only=True``，
+# 上层 ``diagnose_ml_channels`` 也不会把 fast 结果当成结论。
+DIAG_NULL_FAST = 20         # 演示档：约 1/(B+1)=0.048 分辨率，**不可用于下结论**
+DIAG_NULL_STANDARD = 200    # 结论档：1/201 ≈ 0.005 分辨率
+# 库函数默认值：**fast**。理由：底层函数是"可被频繁调用的诊断原语"（单测、
+# 页面卡片、逐通道探测），默认 200 会让任何一次调用从 ~10s 变成 ~100s。
+# 结论档必须显式要求：``mode="standard"`` 或 ``n_null>=79``；而 ``diagnose_ml_channels``
+# （对外唯一入口）默认就是 standard。低分辨率调用的输出一律带
+# ``advisory_only=True``，顶层会被强制降级为 trusted=False / tier=monitor。
+DIAG_DEFAULT_NULL = DIAG_NULL_FAST
 DIAG_DEFAULT_REPEATS = 6    # 每特征置换重复次数
+
+
+def _null_resolution(B: int, alpha: float = 0.05) -> Dict:
+    """零复制次数 B 是否足以在 α 水平上「有分辨率」地下结论。
+
+    判据：最小可达 p = 1/(B+1) 必须 ≤ α/4。含义是「判定阈值不能被单个零复制
+    左右的抖动决定」——B=20 时 1/21 = 0.048 > 0.0125，故判为分辨率不足（仅演示）。
+    B ≥ ceil(4/α) − 1 = 79（α=0.05）才算够。
+    """
+    B = max(0, int(B))
+    min_p = 1.0 / (1.0 + B)
+    need_b = max(1, int(np.ceil(4.0 / float(alpha))) - 1)
+    return {
+        "n_null": B,
+        "min_attainable_p": round(min_p, 6),
+        "required_min_p": round(float(alpha) / 4.0, 6),
+        "required_n_null": need_b,
+        "ok": bool(min_p <= float(alpha) / 4.0),
+        "mc_se_at_alpha": round(float(np.sqrt(float(alpha) * (1 - float(alpha)) / max(1, B))), 5),
+    }
+
+
+def _resolve_n_null(mode: Optional[str], n_null: Optional[int],
+                    alpha: float = 0.05) -> Dict:
+    """把 (mode, n_null) 解析成实际使用的 B，并给出是否仅为「演示档」。"""
+    if n_null is not None:
+        B = int(n_null)
+    elif str(mode or "standard").lower().startswith("f"):
+        B = DIAG_NULL_FAST
+    else:
+        B = DIAG_NULL_STANDARD
+    B = max(2, B)
+    info = _null_resolution(B, alpha)
+    info["mode"] = ("fast" if (B <= DIAG_NULL_FAST) else
+                    ("standard" if info["ok"] else "custom"))
+    info["advisory_only"] = not info["ok"]
+    return info
 
 
 def _brier(p, y) -> float:
@@ -536,7 +594,8 @@ def _fit_and_importance(X_tr, y_tr, X_te, y_te, names,
 def shuffled_label_test(
     X, y, feature_names: Optional[List[str]] = None, *,
     n_repeats: int = DIAG_DEFAULT_REPEATS,
-    n_null: int = DIAG_DEFAULT_NULL,
+    n_null: Optional[int] = None,
+    mode: Optional[str] = None,
     alpha: float = 0.05,
     seed: int = 0,
     test_ratio: float = 0.2,
@@ -590,6 +649,8 @@ def shuffled_label_test(
                 "reason": "训练集标签单一，无法训练/诊断"}
 
     rng = np.random.RandomState(int(seed) % (2 ** 32))
+    nul = _resolve_n_null(mode, n_null, alpha)
+    n_null_eff = int(nul["n_null"])
 
     # 1) 真实模型
     real_clf = _make_diag_learner(n_estimators, max_depth, seed=42)
@@ -603,7 +664,7 @@ def shuffled_label_test(
     # 2) 打乱标签对照：同样的结构、同样的切分、同样的置换种子
     null_per_feat: List[List[float]] = [[] for _ in range(n_feat)]
     null_maxes: List[float] = []
-    for _ in range(max(1, int(n_null))):
+    for _ in range(max(1, n_null_eff)):
         yb = rng.permutation(y)                 # 整列打乱 → 切断 y 与 X 的一切关联
         yb_tr, yb_te = yb[:n_tr], yb[n_tr:]
         if len(np.unique(yb_tr)) < 2:
@@ -665,6 +726,19 @@ def shuffled_label_test(
             f"零分布 95 分位 {null_max_p95:.5f} ≥ 真实最大 {max_real:.5f}）："
             f"模型未学到超出噪声的结构")
         tier = "monitor"
+    advisory_only = bool(nul["advisory_only"])
+    if advisory_only:
+        # 注意：**不**改写 tier —— tier 的既有语义（"signal_found"/"monitor"）是
+        # 「检验本身检出了什么」，被 17 条既有用例钉住。低分辨率问题用
+        # advisory_only + warnings 表达，并在 `diagnose_ml_channels` 顶层
+        # 强制降级（那里才是"能不能当结论展示"的唯一出口）。
+        reasons.append(
+            f"⚠️ 仅演示：零复制次数 B={n_null_eff} 的最小可达 p="
+            f"{nul['min_attainable_p']:.4f} > α/4={nul['required_min_p']:.4f}，"
+            f"分辨率不足（需 B ≥ {nul['required_n_null']}），本结论不可当真")
+        warnings.append(
+            f"零复制次数不足（B={n_null_eff}，需 ≥{nul['required_n_null']}）："
+            f"仅演示、不做结论")
     if not band["within_noise_band"]:
         warnings.append(
             f"可靠性图有 {band['n_outside']}/{band['n_checked']} 个桶超出二项噪声带"
@@ -694,6 +768,9 @@ def shuffled_label_test(
         "null_max_p95": null_max_p95,
         "null_maxes": [float(v) for v in null_maxes_arr.tolist()],
         "n_null": int(n_null_done),
+        "null_resolution": nul,
+        "advisory_only": advisory_only,
+        "mode": nul["mode"],
         "p_value": round(float(p_max), 4),
         "min_attainable_p": round(float(1.0 / (1.0 + len(null_maxes_arr))), 4),
         "importance_significant": significant,
@@ -721,8 +798,12 @@ def _combine_signal_test(real_imps: List[List[float]], null_imps: List[List[List
         号码×特征组合显著」。
 
     为什么不用「逐号码 p 值 + Bonferroni」：零复制次数 B 有限，最小可达 p 是
-    ``1/(B+1)``（B=19 → 0.05），再乘号码数 m 必然 > α，**永远无法拒绝**。
-    联合零分布只要求 B ≥ 1/α − 1 次复制，与 m 无关。
+    ``1/(B+1)``，再乘号码数 m 必然 > α，**永远无法拒绝**。联合零分布与 m 无关。
+
+    ⚠️ **B 必须足够大（D-2）**：``min_attainable_p = 1/(B+1)``。B=20 时它是 0.0476，
+    与 α=0.05 几乎重合 → 检验退化成「真实统计量是否超过全部零复制」，任何一点
+    向上偏差都会被放大（实测 trusted=True 假阳性率 35%）。返回体里给出
+    ``resolution``（含 ``ok``：min_p ≤ α/4）供上层判断该结论能否当结论用。
     """
     m = len(real_imps)
     B = len(null_imps)
@@ -748,6 +829,7 @@ def _combine_signal_test(real_imps: List[List[float]], null_imps: List[List[List
         "p_value_mean_stat": round(float(p_mean), 4),
         "p_value_max_stat": round(float(p_max), 4),
         "min_attainable_p": round(float(1.0 / (1.0 + max(1, len(ntm)))), 4),
+        "resolution": _null_resolution(len(ntm), alpha),
         "significant": bool(p_mean < alpha and real_T_max > 0.0),
         "n_null": int(len(ntm)), "n_numbers": int(m),
     }
@@ -759,7 +841,8 @@ def diagnose_ml_channel(draws: List[Dict], *, color: str = "red",
                         numbers: Optional[List[int]] = None,
                         max_numbers: int = 6,
                         n_repeats: int = 4,
-                        n_null: int = DIAG_DEFAULT_NULL,
+                        n_null: Optional[int] = None,
+                        mode: Optional[str] = None,
                         alpha: float = 0.05, seed: int = 0,
                         n_estimators: int = 30, max_depth: int = 3,
                         test_ratio: float = 0.2,
@@ -789,6 +872,9 @@ def diagnose_ml_channel(draws: List[Dict], *, color: str = "red",
     if not HAS_SKLEARN:
         return {"ok": False, "error": "scikit-learn 未安装，无法诊断",
                 "trusted": False, "importance_significant": False, "tier": "monitor"}
+    # 零复制次数：默认走 standard（B=200）；显式 n_null 优先；fast 仅演示
+    nul = _resolve_n_null(mode, n_null, alpha)
+    n_null_eff = int(nul["n_null"])
     color = "blue" if str(color).lower().startswith("b") else "red"
     names = _BLUE_FEATURE_NAMES if color == "blue" else _FEATURE_NAMES
     builder = _build_blue_datasets if color == "blue" else _build_red_datasets
@@ -849,7 +935,7 @@ def diagnose_ml_channel(draws: List[Dict], *, color: str = "red",
     # 联合零分布：每个复制里每个号码各自打乱 y、各自重训
     rng = np.random.RandomState(int(seed) % (2 ** 32) + 17)
     null_imps: List[List[List[float]]] = []
-    for _ in range(max(1, int(n_null))):
+    for _ in range(max(1, n_null_eff)):
         per_num: List[List[float]] = []
         for d in splits:
             yb = rng.permutation(d["y"])            # 整列打乱该号码的 y
@@ -913,6 +999,7 @@ def diagnose_ml_channel(draws: List[Dict], *, color: str = "red",
         "within_noise_band": bool(all(d["within_noise_band"] for d in per_number)),
     }
     trusted = bool(agg["significant"])
+    advisory_only = bool(nul["advisory_only"])
     if trusted:
         reason = (f"真实特征重要性显著高于打乱标签对照"
                   f"（平均号码内最强重要性 {agg['T_mean']:.5f} vs 零分布 95 分位 "
@@ -925,7 +1012,19 @@ def diagnose_ml_channel(draws: List[Dict], *, color: str = "red",
                   f"{agg['null_T_mean_p95']:.5f}，p={agg['p_value']:.3f} ≥ α={alpha}）"
                   f" → ML 通道应降级为 monitor（只监控，不参与出号加权）")
         tier = "monitor"
+    # D-2：零复制次数不足时，**任何**方向都不能当结论（tier 保持原语义，
+    # 由 advisory_only + 上层强制降级表达，见 diagnose_ml_channels）
+    if advisory_only:
+        reason = (f"⚠️ 仅演示（不做结论）：零复制次数 B={n_null_eff} 的最小可达 p="
+                  f"{nul['min_attainable_p']:.4f} > α/4={nul['required_min_p']:.4f}，"
+                  f"分辨率不足（需要 B ≥ {nul['required_n_null']}）。"
+                  f"原始读数：{reason}")
     warnings: List[str] = []
+    if advisory_only:
+        warnings.append(
+            f"零复制次数 B={n_null_eff} 不足以在 α={alpha} 上下结论"
+            f"（min p={nul['min_attainable_p']:.4f}，需 B ≥ {nul['required_n_null']}）："
+            f"本结果是**演示口径**，不得作为 trusted 结论展示或用于任何决策")
     if not cal_summary["within_noise_band"]:
         warnings.append(
             f"{cal_summary['n_outside_noise_band']}/{cal_summary['n_numbers']} 个号码的"
@@ -945,10 +1044,14 @@ def diagnose_ml_channel(draws: List[Dict], *, color: str = "red",
         "null_T_max_p95": agg["null_T_max_p95"],
         "min_attainable_p": agg["min_attainable_p"],
         "n_null": agg["n_null"],
+        "null_resolution": nul,
+        "advisory_only": advisory_only,
+        "mode": nul["mode"],
         "alpha": float(alpha),
         "n_numbers": len(per_number),
         "importance_significant": bool(agg["significant"]),
         "trusted": trusted,
+        # 演示档的 tier 一律 monitor（D-2：不让低分辨率结果冒充结论）
         "tier": tier,
         "reason": reason,
         "warnings": warnings,
@@ -962,13 +1065,57 @@ def diagnose_ml_channel(draws: List[Dict], *, color: str = "red",
 
 
 def diagnose_ml_channels(draws: List[Dict], colors=("red", "blue"), **kwargs) -> Dict:
-    """红/蓝两个通道一起诊断（供 API 一次性返回）。"""
+    """红/蓝两个通道一起诊断（供 API 一次性返回）。
+
+    **顶层结论取最保守者（D-2）**：两个通道结论不一致时，顶层
+    ``trusted`` 必须是 ``all(...)``（任一通道不可信 → 整体不可信），
+    ``tier`` 必须取**最保守**的档（只要有一个通道是 ``monitor``，顶层就是
+    ``monitor``）。历史缺陷：旧实现用
+    ``"signal_found" if any(...) else "monitor"``，于是
+    ``ml_red=monitor`` + ``ml_blue=signal_found`` 时顶层给出
+    ``trusted=False`` 却 ``tier=signal_found`` —— 两个字段自相矛盾，
+    界面上看起来像「有信号但不可信」。
+
+    另外：只要有任一通道处于**演示档**（``advisory_only``），顶层一律
+    ``trusted=False`` / ``tier="monitor"``，并给出 ``advisory_warning_zh``。
+    """
+    # 对外入口默认走 **standard**（B=200）：它是"能不能当结论"的唯一出口，
+    # 因此不能沿用底层原语的 fast 默认。调用方显式传 n_null/mode 时以显式值为准。
+    if "mode" not in kwargs and "n_null" not in kwargs:
+        kwargs = {**kwargs, "mode": "standard"}
     out: Dict = {"ok": True, "channels": {}}
     for c in colors:
         out["channels"][f"ml_{c}"] = diagnose_ml_channel(draws, color=c, **kwargs)
     vals = list(out["channels"].values())
+    tiers = {str(v.get("tier")) for v in vals}
+    advisory = [str(v.get("channel")) for v in vals if v.get("advisory_only")]
+    out["channel_tiers"] = {str(v.get("channel")): v.get("tier") for v in vals}
+    out["channel_trusted"] = {str(v.get("channel")): bool(v.get("trusted")) for v in vals}
+    # 最保守：任一通道不可信 → 整体不可信
     out["trusted"] = bool(vals) and all(bool(v.get("trusted")) for v in vals)
-    out["tier"] = "signal_found" if any(v.get("tier") == "signal_found" for v in vals) else "monitor"
+    # 最保守：任一通道 monitor（或缺失）→ 顶层 monitor；只有全部 signal 才 signal
+    out["tier"] = ("signal_found"
+                   if (vals and tiers == {"signal_found"}) else "monitor")
+    out["n_channels"] = len(vals)
+    out["n_channels_trusted"] = int(sum(1 for v in vals if v.get("trusted")))
+    out["advisory_only"] = bool(advisory)
+    if advisory:
+        out["tier"] = "monitor"
+        out["trusted"] = False
+        out["advisory_warning_zh"] = (
+            f"⚠️ 仅演示（不做结论）：{', '.join(advisory)} 的零复制次数不足，"
+            f"无法在 α 水平上下结论。请用 mode='standard'（B=200）或 "
+            f"n_null>=79 重跑；在此之前**不得**把 trusted/tier 当作结论展示。")
+    else:
+        out["advisory_warning_zh"] = None
+    if vals and tiers == {"signal_found"} and out["n_channels_trusted"] == len(vals):
+        out["consistency_zh"] = "所有通道一致：均检出信号（仍需独立样本复现）。"
+    elif not out["trusted"]:
+        out["consistency_zh"] = (
+            f"通道结论不一致或均为 monitor（{out['channel_tiers']}）："
+            f"顶层按**最保守**口径给出 trusted=False / tier=monitor。")
+    else:
+        out["consistency_zh"] = "所有通道一致。"
     return out
 
 

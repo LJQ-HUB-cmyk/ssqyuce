@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Dict, Iterable, List, Optional, Set
 
 ENV_NAME = "LOTT_METHODS"
@@ -384,6 +385,102 @@ def _read_methods_config() -> Dict:
         return {}
 
 
+# ---------- V10-11：技能关停状态（写 data/llm_config.json，由 resolve_channels 读取） ----------
+#
+# 为什么状态放 ``llm_config.json`` 而**不是** os.environ（R3 G6 三条约束）：
+#   1. **不得与 ``LLM_DISABLED`` 共用**：那个开关会让 Web 预测直接 503
+#      （``config.LLM_DISABLED`` → ``engine.predict_next(llm_required=True)`` 抛
+#      ``LLMChannelError``）。技能关停只关"LLM 出号决策通道"，预测必须照常成功。
+#   2. **必须可持久**：写 ``os.environ`` 只在当前进程有效，容器重启即失效。
+#   3. **必须与既有优先级链一致**：``llm_config.json`` 是设置页与运行时配置的
+#      住地（``config.load_runtime_llm_config`` 读它），所以放在这里并由
+#      ``resolve_channels()`` 统一读取，不新增第 7 层开关。
+
+#: 关停标志在 llm_config.json 里的键名（冻结）
+DECISION_DISABLED_KEY = "decision_disabled"
+DECISION_REASON_KEY = "decision_disabled_reason"
+DECISION_AT_KEY = "decision_disabled_at"
+
+
+def _llm_config_file():
+    """``data/llm_config.json`` 路径（延迟导入 config，避免循环 import）。
+
+    **必须容错**：``config`` 在 import 期（``config.py:175``）就调
+    ``resolve_channels()``，那时 ``config.LLM_CONFIG_FILE``（定义在 :421）**还不存在**。
+    因此这里用 ``getattr`` 兜底到 ``DATA_DIR / "llm_config.json"``——两者是同一路径，
+    只是绕开"半初始化的 config 模块"。
+    """
+    from . import config
+    path = getattr(config, "LLM_CONFIG_FILE", None)
+    if path is not None:
+        return path
+    return config.DATA_DIR / "llm_config.json"
+
+
+def read_llm_runtime_config(path=None) -> Dict:
+    """读 ``llm_config.json``（容错：不存在/损坏 → ``{}``）。
+
+    注意：**只读键，不打印内容** —— 文件里有 ``api_key``。
+    """
+    import json
+    p = path if path is not None else _llm_config_file()
+    try:
+        if not p.exists():
+            return {}
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (ValueError, OSError):
+        return {}
+
+
+def decision_state(path=None) -> Dict:
+    """当前"LLM 决策通道"关停状态（供 ``resolve_channels()`` 与 API 读取）。
+
+    返回 ``{"disabled": bool, "reason": str, "at": float|None, "source": str}``。
+    ``source`` 为 ``llm_config.json`` 或 ``default``，便于前端说明"这个关停是谁写的"。
+    """
+    conf = read_llm_runtime_config(path)
+    if DECISION_DISABLED_KEY not in conf:
+        return {"disabled": False, "reason": "", "at": None, "source": "default"}
+    at = conf.get(DECISION_AT_KEY)
+    try:
+        at = float(at) if at is not None else None
+    except (TypeError, ValueError):
+        at = None
+    return {
+        "disabled": bool(conf.get(DECISION_DISABLED_KEY)),
+        "reason": str(conf.get(DECISION_REASON_KEY) or ""),
+        "at": at,
+        "source": "llm_config.json",
+    }
+
+
+def set_decision_disabled(disabled: bool, reason: str = "", *, path=None) -> Dict:
+    """写入/解除技能关停状态，**保留 ``llm_config.json`` 里的其它键**。
+
+    先写 ``.tmp`` 再 ``os.replace``（原子替换），避免半截文件让
+    ``config.load_runtime_llm_config`` 解析失败而**丢掉整份配置**。
+    返回写入后的状态（同 :func:`decision_state`）。
+    """
+    import json
+    import os as _os
+    p = path if path is not None else _llm_config_file()
+    conf = read_llm_runtime_config(p)
+    conf[DECISION_DISABLED_KEY] = bool(disabled)
+    if disabled:
+        conf[DECISION_REASON_KEY] = str(reason or "")
+        conf[DECISION_AT_KEY] = time.time()
+    else:
+        # 恢复：清掉 reason/at（留一个明确的 False 仍然比删键更可审计）
+        conf[DECISION_REASON_KEY] = str(reason or "")
+        conf[DECISION_AT_KEY] = None
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps(conf, ensure_ascii=False, indent=2), encoding="utf-8")
+    _os.replace(str(tmp), str(p))
+    return decision_state(p)
+
+
 def resolve_layer() -> str:
     """判定生效开关来自哪一层：``methods_config.json`` / ``.env`` / ``default``。
 
@@ -480,8 +577,14 @@ def resolve_channels(*, force_production: bool = False) -> Dict:
     families = {fam: bool(is_enabled(fam, effective)) for fam in FAMILIES}
 
     llm_output_mode = _resolve_llm_output_mode(conf, families["llm"])
+    # V10-11：技能关停（决策技能 Wilson 下界 ≤ 随机基线 → 关掉"LLM 出号决策通道"）。
+    # **只影响 llm_can_pick**：预测链路照常出号（统计/ML/uniform），不会像
+    # LLM_DISABLED 那样让 Web 预测 503。状态来自 data/llm_config.json。
+    _decision = decision_state()
+    decision_disabled = bool(_decision["disabled"])
     llm_can_pick = bool(
         families["llm"] and llm_output_mode != "off" and mode == "production"
+        and not decision_disabled
     )
     research_arm = {
         "stat": bool(families["stat"]),
@@ -496,6 +599,11 @@ def resolve_channels(*, force_production: bool = False) -> Dict:
         "llm_output_mode": llm_output_mode,
         "llm_can_pick": llm_can_pick,
         "research_arm": research_arm,
+        # ---- V10-11 新增（schema 只增不改）----
+        "decision_disabled": decision_disabled,
+        "decision_disabled_at": _decision["at"],
+        "decision_disabled_reason": _decision["reason"],
+        "decision_disabled_source": _decision["source"],
     }
     canon = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     body["fingerprint"] = hashlib.sha1(canon.encode("utf-8")).hexdigest()[:16]

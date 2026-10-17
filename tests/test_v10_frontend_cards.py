@@ -19,6 +19,16 @@ import json
 import re
 from pathlib import Path
 
+import os
+import pytest
+
+# D-3：`/api/ml/diagnosis` 会跑 `diagnose_ml_channels`（红/蓝两通道 × 多号码 ×
+# 零分布重训），实测单次 >100s。默认档跳过这几个重计算用例，用
+# LOTT_SLOW_TESTS=1 跑完整验证。
+_SLOW = os.environ.get("LOTT_SLOW_TESTS") == "1"
+_slow_only = pytest.mark.skipif(
+    not _SLOW, reason="ML 诊断端点重计算（D-3），默认档跳过；LOTT_SLOW_TESTS=1 运行")
+
 import pytest
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
@@ -182,6 +192,7 @@ def test_registry_endpoint_lists_prereg_reasons(client, isolated_env):
 
 # ============================================================ 3) ML 诊断端点
 
+@_slow_only
 def test_ml_diagnosis_endpoint_ok_and_honesty(client, with_draws):
     """``GET /api/ml/diagnosis`` → 200，含 trusted / tier / p_value 与诚实说明。"""
     r = client.get("/api/ml/diagnosis?max_numbers=1&n_null=5&max_issues=200")
@@ -213,6 +224,7 @@ def test_ml_diagnosis_without_data_is_graceful(client):
         assert "ok" in body
 
 
+@_slow_only
 def test_ml_diagnosis_cache_reuse(client, with_draws, monkeypatch):
     """同参数第二次调用命中进程内缓存（诊断一次 10~30s，页面刷新不该反复重算）。
 
@@ -268,6 +280,7 @@ def test_llm_arm_endpoint_ok(client, with_draws):
     assert "report" not in r2.json()
 
 
+@_slow_only
 def test_all_new_endpoints_have_no_numpy_objects(client, with_draws):
     """**统一闸门**：所有新端点返回体递归检查，不得含 np.float64 / np.ndarray。"""
     urls = ["/api/portfolio/distribution?exact=false",
@@ -347,6 +360,7 @@ def test_vector_badge_shows_families_and_llm_can_pick():
     assert "FAMILY_LABEL" in js
 
 
+@_slow_only
 def test_ml_diagnosis_cache_key_includes_dataset_fingerprint(client, with_draws, monkeypatch):
     """缓存必须按**数据集**失效：新开奖入库后同参数不得返回旧的 trusted 结论。
 

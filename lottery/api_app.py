@@ -240,6 +240,14 @@ def predict(use_llm: Optional[bool] = None, n_tickets: int = 10,
                     "blue_covered": meta.get("blue_covered"),
                     "blue_coverage_rate": meta.get("blue_coverage_rate"),
                     "adaptive": METH.adaptive_status() if config.ADAPTIVE_ENABLED else None}
+    # V10-11：技能关停（decision_disabled）只关「LLM 出号决策通道」，**不**关预测。
+    # 关键区别（R3 G6 第 2 条）：走 LLM_DISABLED 时 engine 会因 llm_required=True
+    # 抛 LLMChannelError → 503「预测失败」；这里改为**主动不请求 LLM 通道**，
+    # 预测照常成功，只是不含该通道的注（`llm_used=false`、`decision_channel_disabled=true`）。
+    _channels_now = METH.resolve_channels()
+    _decision_disabled = bool(_channels_now.get("decision_disabled"))
+    if _decision_disabled:
+        use_llm = False
     try:
         res = engine.predict_next(draws, use_llm=use_llm, n_tickets=n_tickets,
                                   llm_required=(use_llm is True),
@@ -256,6 +264,13 @@ def predict(use_llm: Optional[bool] = None, n_tickets: int = 10,
         return JSONResponse({"ok": False, "error": f"预测引擎异常: {e}"}, status_code=500)
     res["from_cache"] = False
     res.setdefault("data_basis", _exp)
+    # 让前端能明确解释「为什么勾了使用大模型却没有 LLM 注」
+    res["decision_channel_disabled"] = _decision_disabled
+    if _decision_disabled:
+        res["decision_channel_note_zh"] = (
+            "LLM 决策通道已被自动关停（决策技能 Wilson 下界 ≤ 随机基线 0.5），"
+            "本次预测**照常成功**，只是不含 LLM 通道的注。"
+            "恢复入口：POST /api/llm/decision/restore。")
     return res
 
 
@@ -1460,6 +1475,358 @@ def samples_side_by_side(mode: str = Query("replay")):
     return _jsonable({"ok": True, **data})
 
 
+# ==========================================================================
+# V10-11：成本口径（读 usage 的账本）+ 「AI 边际价值」+ LLM 决策技能关停
+#
+# 规格来源：``docs/reviews/R3_AI_REVIEW.md`` **G6**（三个真实问题）
+#   1. 成本分母不可信 —— ``llm_client.chat()`` 原先完全不读 ``data["usage"]``；
+#      本任务已在 ``llm_client`` 补齐全部出口记账（见 ``llm_client.cost_report``）。
+#   2. 关停方式会误伤 —— **不得**复用 ``LLM_DISABLED``：那会让 Web 预测直接 503
+#      （``engine.predict_next(llm_required=True)`` 抛 ``LLMChannelError``）。
+#   3. 关停必须可持久且走唯一判据 —— 状态写 ``data/llm_config.json``（**不写
+#      os.environ**，否则重启即失效、且与 ``methods_config.json`` 优先级链冲突），
+#      由 ``methods.resolve_channels()`` 统一读取（``decision_disabled``）。
+#
+# 「AI 边际价值」的口径（**分母与分子都必须可审计**）：
+#   分母 = ``data/llm_cost_log.jsonl`` 里**已计费**调用的人民币估算总额；
+#   分子①（可用决策数）= ``data/llm_claims.json`` 里**契约可落地**的 claim 数
+#     （维度 key 在 ``discovery.FAMILY_BY_KEY`` 内 → 能注册成可检验实验的决策）；
+#   分子②（通过规律数）= 假说库中 ``prereg_status == "passed"`` 的条数（前置注册通过）。
+#   **零数据不返回 0**：没有成本数据时两个比值都是 ``None`` 并附 ``reason_zh``；
+#   有成本但分子为 0 时返回 ``0.0``（"花了钱什么都没换到"是真实结论，不是缺数据）。
+# ==========================================================================
+
+#: 决策技能的随机基线：LLM 臂相对基线臂"胜"的概率在无技能时就是 0.5
+DECISION_SKILL_BASELINE = 0.5
+
+
+def _wilson_lower(hits: int, n: int, z: float = 1.96) -> float:
+    """Wilson 95% 区间下界（小样本比例不做正态近似）。
+
+    与 ``hypothesis._wilson_lower`` 同一公式（同一口径只能有一个公式；这里内联
+    是为了不跨模块 import 私有函数，数值一致性由测试钉住）。
+    """
+    n = int(n)
+    if n <= 0:
+        return 0.0
+    p = float(hits) / n
+    denom = 1.0 + z * z / n
+    centre = p + z * z / (2 * n)
+    margin = z * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5)
+    return float(max(0.0, (centre - margin) / denom))
+
+
+def decide_from_wilson(wilson_lower: Optional[float],
+                       baseline: float = DECISION_SKILL_BASELINE) -> Dict:
+    """判据本体（纯函数，便于钉边界）：Wilson 下界 ≤ 基线 → 应关停。
+
+    ``wilson_lower is None``（无决定性配对样本）→ ``should_disable=None``：
+    **无证据不等于证否**，此时既不关停也不宣称有技能。
+    """
+    if wilson_lower is None:
+        return {
+            "should_disable": None,
+            "baseline": float(baseline),
+            "wilson_lower": None,
+            "reason_zh": "没有可判定的配对样本：下界无从计算，不做关停判断（也不宣称有技能）。",
+        }
+    w = float(wilson_lower)
+    disable = w <= float(baseline)
+    return {
+        "should_disable": bool(disable),
+        "baseline": float(baseline),
+        "wilson_lower": w,
+        "reason_zh": (
+            f"决策技能 Wilson 95% 下界 {w:.4f} "
+            + ("≤" if disable else ">")
+            + f" 随机基线 {float(baseline):.2f} → "
+            + ("应关停该决策通道（保守口径：连下界都追不平随机，不能证明有技能）。"
+               if disable else
+               "下界高于随机基线，暂不关停（仍受 llm_can_pick 等其他开关约束）。")),
+    }
+
+
+def decision_skill(rows: Optional[List[Dict]] = None, *,
+                   baseline: float = DECISION_SKILL_BASELINE,
+                   max_tickets: int = 20) -> Dict:
+    """LLM **决策技能**：同期逐注配对比较 ``llm:*`` 臂 vs 基线族（stat/ml/blend/uniform）。
+
+    为什么用"胜率 vs 0.5"而不是均值差：技能被定义为"决策比随机更好"的**二分类**
+    能力，胜率可以直接套 Wilson 区间；均值差需要分布假设，而在 30 注量级上任何
+    近似都不可信（``rigor._min_detectable_effect``：n=30 → 40.7%）。
+
+    口径（与 ``battle.llm_arm_report`` 的配对纪律一致，见 V10-09）：
+      * **同期**：两臂必须在同一 ``issue`` 都有记录；
+      * **同注数**：该期两臂注数必须相等（不同规模的期剔除并计数）；
+      * **逐注配对**：按 ``seq`` 一一对应；逐期取**均值**后比较（注间相关，
+        不能把每注当独立样本）；
+      * **平局剔除**：两臂逐期均值相等时该期不进 Wilson 分母（否则平局会被
+        当成"没输"，系统性抬高胜率）——平局数单独给出。
+    """
+    from . import evaluate as EV
+    if rows is None:
+        rows = db.load_eval_details()
+    rows = [dict(r) for r in (rows or [])]
+    by_issue: Dict[str, Dict[str, List[Dict]]] = {}
+    for r in rows:
+        issue = str(r.get("issue") or "")
+        method = str(r.get("method") or "")
+        if not issue or not method:
+            continue
+        by_issue.setdefault(issue, {}).setdefault(method, []).append(r)
+
+    wins = losses = ties = 0
+    dropped_mismatch = 0
+    used_issues: List[str] = []
+    for issue, methods in by_issue.items():
+        llm_rows = sorted((r for m, rs in methods.items() if m.startswith("llm:")
+                           for r in rs), key=lambda x: int(x.get("seq") or 0))
+        base_rows = sorted((r for m, rs in methods.items()
+                            if not m.startswith("llm:")
+                            and EV.method_family(m) in ("stat", "ml", "blend", "uniform")
+                            for r in rs), key=lambda x: int(x.get("seq") or 0))
+        if not llm_rows or not base_rows:
+            continue
+        if len(llm_rows) != len(base_rows):
+            dropped_mismatch += 1
+            continue
+        if max_tickets and len(llm_rows) > int(max_tickets):
+            continue
+        llm_mean = sum(float(r.get("red_hits") or 0) for r in llm_rows) / len(llm_rows)
+        base_mean = sum(float(r.get("red_hits") or 0) for r in base_rows) / len(base_rows)
+        if llm_mean > base_mean:
+            wins += 1
+        elif llm_mean < base_mean:
+            losses += 1
+        else:
+            ties += 1
+            continue
+        used_issues.append(issue)
+
+    decisive = wins + losses
+    win_rate = (wins / decisive) if decisive else None
+    wilson = _wilson_lower(wins, decisive) if decisive else None
+    return {
+        "ok": True,
+        "metric": "decision_skill_win_rate",
+        "n_issues_compared": decisive + ties,
+        "n_decisive": decisive,
+        "wins": wins,
+        "losses": losses,
+        "ties": ties,
+        "dropped_ticket_mismatch": dropped_mismatch,
+        "win_rate": None if win_rate is None else round(float(win_rate), 6),
+        "wilson_lower": None if wilson is None else round(float(wilson), 6),
+        **decide_from_wilson(wilson, baseline=baseline),
+        "issues": used_issues,
+        "note_zh": ("技能 = LLM 决策在**同期配对**中胜过基线（stat/ml/blend/uniform）"
+                    "的比例；无技能时该比例应为 0.5。**平局剔除**且平局数单列。"
+                    "小样本下 Wilson 下界天然偏低 → 关停是**保守**决定而非「证明无用」；"
+                    "反过来，样本不足时也不得宣称有技能。"),
+    }
+
+
+def _usable_decision_count() -> Dict:
+    """分子①：LLM 产出的**可落地决策**数（契约可落地 = 维度 key 在维度表内）。"""
+    from . import llm_lab
+    claims = list((llm_lab.load_claims() or {}).get("claims") or [])
+    try:
+        from . import discovery
+        known = set(discovery.FAMILY_BY_KEY.keys())
+    except Exception:                                  # noqa: BLE001
+        known = set()
+    usable = 0
+    for c in claims:
+        c = c or {}
+        key = str(c.get("key") or c.get("dimension") or "").strip()
+        if not key:
+            act = c.get("action") if isinstance(c.get("action"), dict) else {}
+            filt = act.get("filter") if isinstance(act.get("filter"), dict) else {}
+            key = str(filt.get("key") or "")
+        if key and key in known:
+            usable += 1
+    return {"n_claims": len(claims), "n_usable": usable,
+            "source": "data/llm_claims.json",
+            "definition_zh": ("可用决策 = 维度 key 落在 discovery.FAMILY_BY_KEY 内、"
+                              "能注册成可检验实验的 claim（契约可落地）。")}
+
+
+def _passed_pattern_count() -> Dict:
+    """分子②：**通过**规律的条数（前置注册 ``passed``，V10-02 的唯一写者判定）。"""
+    from . import hypothesis
+    try:
+        reg = hypothesis.load_registry() or {}
+    except Exception as e:                             # noqa: BLE001
+        return {"n_passed": None, "n_hypotheses": None,
+                "source": "data/hypotheses.json", "error": f"{type(e).__name__}: {e}"}
+    hyps = list(reg.get("hypotheses") or [])
+    passed = sum(1 for h in hyps if str((h or {}).get("prereg_status") or "") == "passed")
+    validated = sum(1 for h in hyps if str((h or {}).get("status") or "") == "validated")
+    return {"n_passed": passed, "n_validated": validated, "n_hypotheses": len(hyps),
+            "source": "data/hypotheses.json",
+            "definition_zh": ("通过规律 = prereg_status==passed（前置注册按预注册检验通过）。"
+                              "validated（A/B 晋升）单列，不与 passed 相加。")}
+
+
+def llm_marginal_value(cost: Optional[Dict] = None) -> Dict:
+    """「AI 边际价值」：每 ¥1 换回的可用决策数 / 通过规律数。
+
+    **零数据不返回 0**：没有已计费成本时两个比值都是 ``None`` 并说明原因；
+    有成本但分子为 0 时返回 ``0.0``（"花了钱什么都没换到"是结论，不是缺数据）。
+    """
+    if cost is None:
+        from .llm_client import cost_report
+        cost = cost_report()
+    yuan = cost.get("yuan")
+    decisions = _usable_decision_count()
+    patterns = _passed_pattern_count()
+
+    def _ratio(numerator):
+        if yuan is None or numerator is None or float(yuan) <= 0:
+            return None
+        return round(float(numerator) / float(yuan), 6)
+
+    if yuan is None:
+        reason = "成本日志里没有已计费调用（yuan=null），比值无法计算 —— 不用 0 假装有值。"
+    elif float(yuan) <= 0:
+        reason = "已计费成本为 0，比值无意义。"
+    else:
+        reason = ("比值 = 分子 ÷ 已计费人民币估算额。分子为 0 时给 0.0（真实结论："
+                  "花了钱没换到可审计产物），分母缺失时给 null（缺数据）——两者必须区分展示。")
+    return {
+        "yuan": yuan,
+        "per_yuan_usable_decisions": _ratio(decisions.get("n_usable")),
+        "per_yuan_passed_patterns": _ratio(patterns.get("n_passed")),
+        "numerator_usable_decisions": decisions,
+        "numerator_passed_patterns": patterns,
+        "reason_zh": reason,
+        "honesty_zh": ("这两个数**不是** ROI，也不代表 AI 有价值：LLM 默认不出号"
+                       "（llm_can_pick=False），可用决策与通过规律都可能在真随机世界里"
+                       "长期为 0。本指标只回答「花掉的每一块钱换回了多少可审计产物」。"),
+    }
+
+
+def _maybe_auto_disable_decision(*, rows: Optional[List[Dict]] = None,
+                                 force: bool = False) -> Dict:
+    """技能不达标时**自动**写入关停状态（``llm_config.json``，不写 os.environ）。
+
+    判定：Wilson 下界 ≤ 0.5 且**有决定性配对样本**（``n_decisive > 0``）。
+    没有样本 → 不写（无证据不等于证否，绝不能凭"没有数据"关掉通道）。
+    已处于关停状态时保持原状（不覆盖已有 reason）。
+    整体失败只打印，绝不影响调用方（调度/进化链路不能被它拖垮）。
+    """
+    from . import methods as METH
+    try:
+        skill = decision_skill(rows=rows)
+        state = METH.decision_state()
+        changed = False
+        should = skill.get("should_disable") is True and int(skill.get("n_decisive") or 0) > 0
+        if (force or should) and not state.get("disabled"):
+            METH.set_decision_disabled(True, str(skill.get("reason_zh") or "")[:300])
+            changed = True
+        if changed:
+            # 刷新 import 期快照：``config.CHANNELS`` 是引擎 ``channels_snapshot()`` 的
+            # 读口，不刷新的话同一进程内引擎仍看到关停前的 llm_can_pick。
+            try:
+                config.refresh_channels()
+            except Exception as exc:                   # noqa: BLE001
+                print(f"[cost] 通道快照刷新失败（关停已落盘）: {exc}")
+        return {"ok": True, "applied": bool(changed), "skill": skill,
+                "decision_state": METH.decision_state()}
+    except Exception as e:                             # noqa: BLE001
+        print(f"[cost] 决策技能关停判定失败（不影响出号）: {e}")
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+@app.get("/api/llm/cost")
+def llm_cost(limit: Optional[int] = Query(None, ge=1, le=100000)):
+    """成本报表：总调用数 / 总 token / 总花费 / 按 model 与 purpose 分组 + 边际价值。
+
+    数据源唯一：``llm_client.cost_report()``（``data/llm_cost_log.jsonl``）。
+    **零调用时金额与 token 一律 null**（不是 0），并给出原因。
+    """
+    from .llm_client import cost_report
+    from . import methods as METH
+    try:
+        cost = cost_report(limit=limit)
+    except Exception as exc:                          # noqa: BLE001 - 报表失败不 500
+        return JSONResponse({"ok": False, "error": f"成本报表失败: {exc}"},
+                            status_code=200)
+    ch = METH.resolve_channels()
+    return _jsonable({
+        "ok": True,
+        "cost": cost,
+        "marginal_value": llm_marginal_value(cost),
+        "decision": {
+            "decision_disabled": bool(ch.get("decision_disabled")),
+            "decision_disabled_reason": ch.get("decision_disabled_reason") or "",
+            "decision_disabled_at": ch.get("decision_disabled_at"),
+            "llm_can_pick": bool(ch.get("llm_can_pick")),
+            "channels_fingerprint": ch.get("fingerprint"),
+        },
+        "note_zh": ("成本来自每次 ``chat()`` 出口一行的 append-only 日志；token 数才是"
+                    "账本口径，yuan 是按可配置单价折算的**估算**。决策关停只关"
+                    "「LLM 出号决策通道」，**不**影响预测本身能否成功。"),
+    })
+
+
+@app.get("/api/llm/decision/status")
+def llm_decision_status(limit_issues: Optional[int] = Query(None, ge=1, le=2000)):
+    """LLM 决策技能与关停状态（判据 + 当前状态 + 通道快照）。"""
+    from . import methods as METH
+    rows = db.load_eval_details(limit_issues=limit_issues) if limit_issues else None
+    try:
+        skill = decision_skill(rows=rows)
+    except Exception as exc:                          # noqa: BLE001
+        skill = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    ch = METH.resolve_channels()
+    return _jsonable({
+        "ok": True,
+        "skill": skill,
+        "decision_state": METH.decision_state(),
+        "channels": {
+            "decision_disabled": bool(ch.get("decision_disabled")),
+            "llm_can_pick": bool(ch.get("llm_can_pick")),
+            "families": ch.get("families"),
+            "llm_output_mode": ch.get("llm_output_mode"),
+            "fingerprint": ch.get("fingerprint"),
+        },
+        "criterion_zh": ("判据：决策技能 Wilson 95% 下界 ≤ 随机基线 0.5 → 标记该决策通道"
+                         "应关停。关停状态写在 data/llm_config.json（重启仍生效），由"
+                         "resolve_channels() 读取；**不使用** LLM_DISABLED，因此预测不会 503。"),
+    })
+
+
+@app.post("/api/llm/decision/restore")
+def llm_decision_restore(reason: str = Query("", max_length=300)):
+    """人工恢复 LLM 决策通道（前端恢复按钮由后续任务接）。
+
+    **只清关停标志**，不动 ``disabled`` / 模型 / 密钥等其它配置键
+    （``set_decision_disabled`` 保留 ``llm_config.json`` 的其余键）。
+    恢复后调用 ``config.refresh_channels()`` 刷新 import 期快照。
+    """
+    from . import methods as METH
+    try:
+        state = METH.set_decision_disabled(False, reason or "人工恢复")
+        config.refresh_channels()
+    except Exception as exc:                          # noqa: BLE001
+        return JSONResponse({"ok": False, "error": f"恢复失败: {exc}"}, status_code=200)
+    ch = METH.resolve_channels()
+    return _jsonable({
+        "ok": True,
+        "restored": True,
+        "decision_state": state,
+        "channels": {
+            "decision_disabled": bool(ch.get("decision_disabled")),
+            "llm_can_pick": bool(ch.get("llm_can_pick")),
+            "fingerprint": ch.get("fingerprint"),
+        },
+        "note_zh": ("已清除决策关停标志（data/llm_config.json）。注意：LLM 是否真的参与"
+                    "出号仍由 families.llm / llm_output_mode（默认 off）决定，"
+                    "恢复关停不等于启用 LLM 出号。"),
+    })
+
+
 # ---------- 页面 ----------
 
 
@@ -1528,8 +1895,13 @@ def _scheduler_step():
         print("[scheduler] 警告：数据源落后于开奖日历，缺", exp.get("missed_draws"), "期")
     issue = exp["issue"]
     if not db.load_predictions(issue):
-        engine.predict_next(draws, use_llm=True)
-        print("[scheduler] 已生成", issue, "预测")
+        # V10-11：决策通道被关停时不再请求 LLM（省钱且不产出被关停通道的注），
+        # 但预测**照常生成**（这就是与 LLM_DISABLED 的区别：后者会 503）。
+        from . import methods as METH
+        _llm_on = not bool(METH.resolve_channels().get("decision_disabled"))
+        engine.predict_next(draws, use_llm=_llm_on)
+        print("[scheduler] 已生成", issue, "预测",
+              "（LLM 决策通道已关停，本次为纯统计/ML）" if not _llm_on else "")
 
 
 def _evolution_step(limit: int = 0, use_llm: bool = True) -> dict:
@@ -1611,6 +1983,14 @@ def _evolution_step(limit: int = 0, use_llm: bool = True) -> dict:
     st = evolution.evolution_status()
     summary["by_status"] = st.get("by_status")
     summary["active_overrides"] = st.get("active_overrides")
+
+    # 5) V10-11：决策技能达标性判定（Wilson 下界 ≤ 0.5 → 自动关停决策通道）。
+    #    写 data/llm_config.json（不写 os.environ）；无决定性样本时**不**写。
+    #    失败只降级、不影响预测（沿用本函数的既有约定）。
+    try:
+        summary["decision_skill"] = _maybe_auto_disable_decision()
+    except Exception as e:  # noqa: BLE001
+        summary["decision_skill"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
     print("[evolution] 本轮完成:", summary["resolution"], "| 库:", summary["by_status"])
     return summary
 

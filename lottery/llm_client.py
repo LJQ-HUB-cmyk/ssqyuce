@@ -17,6 +17,323 @@ _usage_lock = threading.Lock()
 from . import config
 
 
+# ==========================================================================
+# V10-11：成本口径（读响应 usage + append-only 成本日志）
+#
+# 为什么必须做（docs/reviews/R3_AI_REVIEW.md **G6**）：
+#   改动前 ``chat()`` **完全没读** 响应里的 ``data["usage"]``（旧代码 R3 定位在
+#   ``llm_client.py:241-251``），只有"提示字符数 / 完成字符数"这种与计费无关的
+#   代理指标。于是所有"成本"报表的分母都建立在**没有数据**上：既不能说明花了
+#   多少钱，也就无法回答"每 ¥1 换回多少可用决策"。
+#
+# 本节的四条纪律：
+#   1. **全部出口记账**：正常返回 / 重试后成功 / 超时 / 异常（含"未配置"这类
+#      未真正发请求的出口）都在 ``chat()`` 退出前落一行，不允许有静默出口。
+#   2. **缺失 usage 时降级为 ``None``，绝不写 0**：0 会被当成"确实免费"混进均值，
+#      把成本系统性拉低；``None`` 表示"未知"，报表按"已计费调用数"单独统计。
+#   3. **日志绝不写密钥**：一行只有 model / tokens / purpose / yuan / ts / ok
+#      （+ attempts / 价格假设）。**不写** base_url、api_key、Authorization、
+#      请求/响应正文（提示词里可能含用户数据）。
+#   4. **append-only 且不得撑爆磁盘**：按大小轮转到 ``.1``（默认保留 1 份），
+#      单文件上限默认 2 MB（约 1.5~2 万行）。
+# ==========================================================================
+
+#: 成本日志文件名（放在 ``config.DATA_DIR``，即挂载卷，容器重启不丢）
+COST_LOG_NAME = "llm_cost_log.jsonl"
+
+#: 单文件上限（字节）与轮转保留份数（``llm_cost_log.jsonl.1``）
+COST_LOG_MAX_BYTES = int(os.environ.get("LOTT_LLM_COST_LOG_MAX_BYTES", str(2 * 1024 * 1024)))
+COST_LOG_ROTATE_KEEP = int(os.environ.get("LOTT_LLM_COST_LOG_ROTATE_KEEP", "1"))
+
+#: 美元→人民币汇率（**仅用于把既有 ``LLM_EVAL_PRICE_PER_1M``(USD) 折算成人民币**，
+#: 不是实时汇率；可在 .env 覆盖 ``LOTT_USD_CNY``）
+USD_TO_CNY = float(os.environ.get("LOTT_USD_CNY", "7.2"))
+
+_cost_lock = threading.Lock()
+
+
+def cost_log_path():
+    """成本日志路径。**函数而非模块常量**：``config.DATA_DIR`` 会被测试/部署替换。"""
+    return config.DATA_DIR / COST_LOG_NAME
+
+
+def price_per_1m_yuan() -> float:
+    """估算价（人民币元 / 百万 token）——门槛口径，集中一处便于披露假设。
+
+    优先级：``LOTT_LLM_PRICE_PER_1M_YUAN``（显式人民币价）＞
+    ``config.LLM_EVAL_PRICE_PER_1M``(USD) × ``LOTT_USD_CNY``。
+    """
+    raw = os.environ.get("LOTT_LLM_PRICE_PER_1M_YUAN")
+    if raw not in (None, ""):
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            pass
+    try:
+        usd = float(getattr(config, "LLM_EVAL_PRICE_PER_1M", 1.0))
+    except (TypeError, ValueError):
+        usd = 1.0
+    return float(usd) * float(USD_TO_CNY)
+
+
+def _yuan_for_tokens(tokens_in: Optional[int], tokens_out: Optional[int]) -> Optional[float]:
+    """按 token 数估算人民币花费；**任一份缺失即返回 None**（不拿 0 冒充）。"""
+    if tokens_in is None and tokens_out is None:
+        return None
+    total = int(tokens_in or 0) + int(tokens_out or 0)
+    return round(total / 1_000_000.0 * price_per_1m_yuan(), 8)
+
+
+def parse_usage(data: object) -> Dict[str, Optional[int]]:
+    """从响应体解析 ``usage.prompt_tokens`` / ``usage.completion_tokens``。
+
+    返回 ``{"tokens_in": int|None, "tokens_out": int|None, "has_usage": bool}``。
+    **缺失即 None**：缺字段、非 dict、非数字、负数一律不猜（尤其不写 0）。
+    """
+    out: Dict[str, Optional[int]] = {"tokens_in": None, "tokens_out": None,
+                                     "has_usage": False}
+    if not isinstance(data, dict):
+        return out
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        return out
+
+    def _as_tokens(value):
+        if isinstance(value, bool):          # bool 是 int 的子类，必须先行排除
+            return None
+        if isinstance(value, int):
+            return value if value >= 0 else None
+        if isinstance(value, float):
+            return int(value) if value >= 0 else None
+        if isinstance(value, str) and value.strip().isdigit():
+            return int(value.strip())
+        return None
+
+    tokens_in = _as_tokens(usage.get("prompt_tokens"))
+    tokens_out = _as_tokens(usage.get("completion_tokens"))
+    if tokens_in is not None or tokens_out is not None:
+        out["has_usage"] = True
+    out["tokens_in"] = tokens_in
+    out["tokens_out"] = tokens_out
+    return out
+
+
+#: 属于"决策/研究"性质的调用用途。``decision_disabled`` 只关这些，不关 Web 预测。
+DECISION_PURPOSES = frozenset({"decision", "lab", "evolution", "hypothesis", "prereg"})
+
+
+def infer_purpose(depth: int = 2) -> str:
+    """调用方模块名（``engine`` / ``llm_lab`` / ``api_app`` / ``hypothesis`` …）。
+
+    为什么用调用栈而不是让每个调用点传参：``chat()`` 的调用点分布在
+    ``engine`` / ``llm_lab`` / ``hypothesis`` / ``api_app``，本任务的文件域不含
+    那几个模块（不得改动）。因此把"调用方模块名"作为**兜底**用途标签，稳定、
+    零侵入，且足够回答"钱花在出号轮还是研究轮"。调用点可以随时用显式
+    ``purpose=`` 覆盖它（显式优先）。任何异常都退化为 ``"unspecified"``，
+    **绝不**因为打标签而让调用失败。
+    """
+    try:
+        import sys
+        frame = sys._getframe(1)
+        for _ in range(max(1, int(depth)) + 3):
+            if frame is None:
+                break
+            name = str(frame.f_globals.get("__name__") or "")
+            if name and name != __name__:
+                short = name.rsplit(".", 1)[-1]
+                return short or "unspecified"
+            frame = frame.f_back
+    except Exception:                             # noqa: BLE001 - 打标签绝不影响调用
+        pass
+    return "unspecified"
+
+
+def _bill_new(model: str, purpose: Optional[str]) -> Dict:
+    """开始一次 ``chat()`` 的账单累加器（跨重试累加，整个调用只落一行）。"""
+    return {
+        "model": str(model or ""),
+        "purpose": str(purpose or "unspecified"),
+        "attempts": 0,
+        "tokens_in": 0,
+        "tokens_out": 0,
+        "usage_seen": 0,
+        "t0": time.time(),
+    }
+
+
+def _bill_add_usage(bill: Dict, data: object) -> None:
+    """把某次 HTTP 200 响应里的 usage 累加进账单（缺失即不累加、不补 0）。"""
+    parsed = parse_usage(data)
+    if not parsed["has_usage"]:
+        return
+    bill["usage_seen"] += 1
+    if parsed["tokens_in"] is not None:
+        bill["tokens_in"] += parsed["tokens_in"]
+    if parsed["tokens_out"] is not None:
+        bill["tokens_out"] += parsed["tokens_out"]
+
+
+def _rotate_if_needed(path) -> None:
+    """按大小轮转（append-only 且不撑爆磁盘）。保留 ``.1``，更老的直接丢弃。
+
+    轮转是"丢弃最旧"策略：成本账本用于**近期**边际价值判断，不是审计凭证；
+    真要长期留存请从 ``.1`` 备份出去（DEPLOY.md 的备份脚本已覆盖 data/）。
+    """
+    try:
+        if not path.exists() or path.stat().st_size < COST_LOG_MAX_BYTES:
+            return
+        if COST_LOG_ROTATE_KEEP <= 0:
+            path.unlink()
+            return
+        import shutil
+        shutil.move(str(path), str(path) + ".1")
+    except OSError as e:                          # pragma: no cover - 磁盘异常不阻塞调用
+        print(f"[llm] 成本日志轮转失败: {e}")
+
+
+def _append_cost_row(row: Dict) -> None:
+    """append-only 写一行（失败只打印，**绝不影响** LLM 调用本身）。"""
+    path = cost_log_path()
+    try:
+        with _cost_lock:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _rotate_if_needed(path)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except OSError as e:                          # pragma: no cover - 磁盘异常不阻塞调用
+        print(f"[llm] 成本日志写入失败: {e}")
+
+
+def _bill_finish(bill: Dict, *, ok: bool, error: Optional[str] = None) -> Dict:
+    """结束账单：算出 yuan 并落一行，返回该行（供测试与调试）。"""
+    usage_seen = int(bill.get("usage_seen") or 0)
+    tokens_in = int(bill.get("tokens_in") or 0) if usage_seen else None
+    tokens_out = int(bill.get("tokens_out") or 0) if usage_seen else None
+    row = {
+        "ts": round(float(bill.get("t0") or time.time()), 3),
+        "model": bill.get("model") or "",
+        "purpose": bill.get("purpose") or "unspecified",
+        "tokens_in": tokens_in,              # None = 上游未返回 usage（未知，不是 0）
+        "tokens_out": tokens_out,
+        "yuan": _yuan_for_tokens(tokens_in, tokens_out),
+        "ok": bool(ok),
+        "attempts": int(bill.get("attempts") or 0),
+        "price_per_1m_yuan": price_per_1m_yuan(),   # 披露估算假设，便于事后重算
+        "usage_seen": usage_seen,
+    }
+    if error:
+        row["error"] = str(error)[:200]
+    _append_cost_row(row)
+    return row
+
+
+def read_cost_log(limit: Optional[int] = None) -> List[Dict]:
+    """读取成本日志（含已轮转的 ``.1``），按时间升序。坏行直接跳过。"""
+    rows: List[Dict] = []
+    path = cost_log_path()
+    sources = [str(path) + ".1", str(path)]
+    for src in sources:
+        try:
+            with open(src, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(rec, dict):
+                        rows.append(rec)
+        except OSError:
+            continue
+    rows.sort(key=lambda r: float(r.get("ts") or 0.0))
+    if limit:
+        rows = rows[-int(limit):]
+    return rows
+
+
+def cost_report(limit: Optional[int] = None) -> Dict:
+    """成本报表：总调用 / 总 token / 总花费 / 按 model 与 purpose 分组。
+
+    **零数据时的口径**：``n_calls == 0`` → 金额与 token 全部返回 ``None``
+    （而不是 0），并给出 ``reason_zh`` 说明"没有数据"；绝不用 0 假装有值。
+    """
+    rows = read_cost_log(limit=limit)
+    billed = [r for r in rows if r.get("tokens_in") is not None or r.get("tokens_out") is not None]
+    ok_rows = [r for r in rows if r.get("ok")]
+    tokens_in = sum(int(r.get("tokens_in") or 0) for r in billed)
+    tokens_out = sum(int(r.get("tokens_out") or 0) for r in billed)
+    yuan = round(sum(float(r.get("yuan") or 0.0) for r in billed), 6)
+
+    def _group(key: str) -> Dict[str, Dict]:
+        out: Dict[str, Dict] = {}
+        for r in rows:
+            name = str(r.get(key) or "unknown")
+            g = out.setdefault(name, {"n_calls": 0, "n_billed": 0, "n_ok": 0,
+                                      "tokens_in": 0, "tokens_out": 0, "yuan": 0.0})
+            g["n_calls"] += 1
+            if r.get("ok"):
+                g["n_ok"] += 1
+            if r in billed:
+                g["n_billed"] += 1
+                g["tokens_in"] += int(r.get("tokens_in") or 0)
+                g["tokens_out"] += int(r.get("tokens_out") or 0)
+                g["yuan"] = round(g["yuan"] + float(r.get("yuan") or 0.0), 6)
+        # 分组内没有已计费行时，金额/token 一律 None（不拿 0 冒充）
+        for g in out.values():
+            if g["n_billed"] == 0:
+                g["tokens_in"] = None
+                g["tokens_out"] = None
+                g["yuan"] = None
+        return out
+
+    if not rows:
+        return {
+            "ok": True,
+            "available": False,
+            "n_calls": 0,
+            "n_billed": 0,
+            "n_ok": 0,
+            "tokens_in": None,
+            "tokens_out": None,
+            "tokens_total": None,
+            "yuan": None,
+            "price_per_1m_yuan": price_per_1m_yuan(),
+            "by_model": {},
+            "by_purpose": {},
+            "first_ts": None,
+            "last_ts": None,
+            "log_path": str(cost_log_path()),
+            "reason_zh": ("成本日志为空（还没有可计费的 LLM 调用记录）："
+                          "总花费/总 token 一律返回 null，**不**用 0 假装有值。"),
+        }
+    return {
+        "ok": True,
+        "available": True,
+        "n_calls": len(rows),
+        "n_billed": len(billed),
+        "n_ok": len(ok_rows),
+        "tokens_in": tokens_in if billed else None,
+        "tokens_out": tokens_out if billed else None,
+        "tokens_total": (tokens_in + tokens_out) if billed else None,
+        "yuan": yuan if billed else None,
+        "price_per_1m_yuan": price_per_1m_yuan(),
+        "by_model": _group("model"),
+        "by_purpose": _group("purpose"),
+        "first_ts": rows[0].get("ts"),
+        "last_ts": rows[-1].get("ts"),
+        "log_path": str(cost_log_path()),
+        "price_note_zh": (
+            "金额是**估算**：yuan = (tokens_in + tokens_out) / 1e6 × price_per_1m_yuan。"
+            "价格来自 LOTT_LLM_PRICE_PER_1M_YUAN，缺省 = LOTT_LLM_EVAL_PRICE_PER_1M(USD) "
+            f"× LOTT_USD_CNY(={USD_TO_CNY})，不是账单原文；token 数才是账本口径。"),
+        "unknown_usage_note_zh": (
+            f"{len(rows) - len(billed)} 次调用的上游响应**没有 usage 字段**（或调用未真正发出），"
+            "这些行的 token/金额为 null 而不是 0 —— 它们不参与均值与边际价值的分母。"),
+    }
+
+
 # ---------- 推理型模型的「可用输出预算」学习（线程安全，落盘容错） ----------
 # 背景：部分推理型模型（deepseek-v4-flash / glm-5.3 等）会把整个 max_tokens 预算
 # 花在 reasoning_content 上，content 为空。不同模型需要的预算差一个数量级
@@ -134,7 +451,8 @@ def _extract_json(text: str) -> Optional[dict]:
 def chat(system: str, user: str, max_tokens: int = 2000,
          temperature: float = 0.8, timeout: Optional[float] = None,
          model_cfg: Optional[Dict] = None,
-         deadline: Optional[float] = None, strict: bool = False) -> Optional[str]:
+         deadline: Optional[float] = None, strict: bool = False,
+         purpose: Optional[str] = None) -> Optional[str]:
     """调用 OpenAI 兼容 chat/completions，返回 content。
 
     model_cfg: {"name","base_url","api_key","model"}；缺省用主通道配置。
@@ -143,8 +461,17 @@ def chat(system: str, user: str, max_tokens: int = 2000,
               每次尝试的单次超时会被钳制在剩余预算内，超预算立即放弃。
     strict:  True 时任何失败（未配置/HTTP 错误/超时/空返回）抛 LLMChannelError，
             供 Web 预测快速失败；False 保持原有降级语义（返回 None）。
+    purpose: V10-11 成本日志的用途标签（``decision`` / ``lab`` / ``evolution`` …
+             或任意自由标签）。None → 用调用方模块名兜底（见 :func:`infer_purpose`）。
+
+    **成本记账（V10-11）**：本函数的**每一个**出口（停用/未配置/正常返回/
+    重试后成功/超时/异常）都会写一行 ``data/llm_cost_log.jsonl``；
+    上游未返回 ``usage`` 时 token 记为 ``None``（未知），绝不写 0。
     """
+    _purpose = str(purpose) if purpose else infer_purpose(depth=2)
     if config.LLM_DISABLED:
+        bill = _bill_new("", _purpose)
+        _bill_finish(bill, ok=False, error="llm_disabled")
         if strict:
             raise LLMChannelError("LLM 已被停用（设置页「停用 LLM」或 LOTT_LLM_DISABLED=1）")
         return None
@@ -153,6 +480,8 @@ def chat(system: str, user: str, max_tokens: int = 2000,
         if not (config.LLM_BASE_URL and config.LLM_API_KEY and config.LLM_MODEL_LIST):
             msg = ("LLM 通道未配置（请设置 LOTT_LLM_BASE_URL / LOTT_LLM_API_KEY / "
                    "LOTT_LLM_MODEL，或在设置页配置并保存）")
+            bill = _bill_new(str(getattr(config, "LLM_MODEL", "") or ""), _purpose)
+            _bill_finish(bill, ok=False, error="not_configured")
             if strict:
                 raise LLMChannelError(msg)
             print("[llm] " + msg + "，降级为纯统计模型")
@@ -166,6 +495,8 @@ def chat(system: str, user: str, max_tokens: int = 2000,
         url = base_url + "/chat/completions"
         api_key = str(model_cfg["api_key"])
         model = str(model_cfg["model"])
+    # 账单累加器：跨重试累加 usage，整个 chat() 只落一行（含 attempts）。
+    bill = _bill_new(model, _purpose)
     payload = {
         "model": model,
         "messages": [
@@ -222,6 +553,8 @@ def chat(system: str, user: str, max_tokens: int = 2000,
         else:
             eff_timeout = timeout or config.LLM_TIMEOUT
         try:
+            # V10-11：真实发出的请求都算一次尝试（含最终抛异常的那些）
+            bill["attempts"] = int(bill.get("attempts") or 0) + 1
             r = requests.post(url, json=payload, headers=headers, timeout=eff_timeout)
             if r.status_code != 200:
                 last_err = f"HTTP {r.status_code}: {r.text[:200]}"
@@ -239,6 +572,9 @@ def chat(system: str, user: str, max_tokens: int = 2000,
                         continue
                 continue
             data = r.json()
+            # V10-11：**每一次** HTTP 200 都读 usage（含后续重试/空正文的 200）——
+            # 上游对这些请求同样计费，漏记就等于把成本算低。
+            _bill_add_usage(bill, data)
             msg = data["choices"][0]["message"]
             content = msg.get("content") or ""
             if content:
@@ -248,6 +584,7 @@ def chat(system: str, user: str, max_tokens: int = 2000,
                         len(m.get("content") or "") for m in payload["messages"])
                     _usage["completion_chars"] += len(content)
                 remember_max_tokens(base_url, model, payload.get("max_tokens", 0))
+                _bill_finish(bill, ok=True)          # 出口 1：正常返回 / 重试后成功
                 return content
             # content 为空：可能 reasoning_content 吃光了 max_tokens（推理型模型）
             finish = data["choices"][0].get("finish_reason")
@@ -291,8 +628,10 @@ def chat(system: str, user: str, max_tokens: int = 2000,
                 attempt -= 1
                 continue
     if strict:
+        _bill_finish(bill, ok=False, error=last_err)      # 出口 3：strict 抛错
         raise LLMChannelError(f"LLM 调用失败: {last_err}")
     # 降级：记录但不抛出，让上层走统计兜底
+    _bill_finish(bill, ok=False, error=last_err)          # 出口 4：超时/异常后降级
     print(f"[llm] 调用失败（3 次重试后）: {last_err}")
     return None
 
@@ -302,9 +641,11 @@ def chat_json(system: str, user: str, max_tokens: int = 2000,
               model_cfg: Optional[Dict] = None,
               deadline: Optional[float] = None,
               strict: bool = False,
-              timeout: Optional[float] = None) -> Optional[dict]:
+              timeout: Optional[float] = None,
+              purpose: Optional[str] = None) -> Optional[dict]:
     text = chat(system, user, max_tokens=max_tokens, temperature=temperature,
-                model_cfg=model_cfg, deadline=deadline, strict=strict, timeout=timeout)
+                model_cfg=model_cfg, deadline=deadline, strict=strict, timeout=timeout,
+                purpose=purpose)
     if not text:
         return None
     return _extract_json(text)
