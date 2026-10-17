@@ -475,6 +475,82 @@ def persist_run(result: Dict, path=None) -> Dict:
     return {"ok": True, "path": str(p), "stored": len(data["claims"])}
 
 
+def run_closed_loop(draws: Sequence[Dict], rounds: int = 3, use_llm: bool = True,
+                    persist: bool = True) -> Dict:
+    """**AI 规律闭环**：挖掘 → 验证 → 注册 → 更新规律快照 → 可用于出号。
+
+    这是用户第 4 条诉求（"要用 AI 来挖掘规律、验证规律、使用规律"）的单一入口，
+    也是把 V6 的三块能力串成一条可重复执行的流水线：
+
+    1. **挖掘**：维度空间 as-of 扫描（91 组）+ LLM 三轮「提规律 → 自我质疑 → 修订」；
+    2. **验证**：LLM 每条规律强制映射维度表并做 as-of 回放 + 9 阶段画像（`evaluate_claims`）；
+    3. **注册**：只把 support/reject/regime_only 落进假说库（`evolution.register_llm_lab_claims`）；
+    4. **使用**：重建规律运行时快照（`patterns_runtime.refresh`），
+       让「阶段持续有效 + 通过验证」的规律真正进入 `engine.predict_next` 的出号链路；
+    5. **复算阶段时效**：给假说库每条规律写回阶段状态（`evolution.annotate_hypotheses`）。
+
+    每一步的产出都带样本量与阶段状态；任何一步失败只影响该步（结果里 ``errors`` 列出），
+    绝不把失败包装成结论。
+    """
+    from . import evolution, patterns_runtime
+
+    t0 = time.time()
+    steps: List[Dict] = []
+    errors: List[str] = []
+
+    lab = run_lab(draws, rounds=rounds, use_llm=use_llm, persist=persist)
+    steps.append({"step": "mine_and_verify", "llm_used": lab.get("llm_used"),
+                  "n_claims": len(lab.get("claims") or []),
+                  "summary": lab.get("summary"), "error": lab.get("error")})
+    if lab.get("error") and not lab.get("llm_used"):
+        errors.append(f"LLM 环节降级：{lab.get('error')}（维度扫描结果仍然有效）")
+
+    reg = {}
+    try:
+        reg = evolution.register_llm_lab_claims(draws)
+        steps.append({"step": "register", "picked": reg.get("picked"),
+                      "registered": (reg.get("registered") or {}).get("registered"),
+                      "skipped": reg.get("skipped_n")})
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"注册失败：{type(e).__name__}: {e}")
+
+    ann = {}
+    try:
+        ann = evolution.annotate_hypotheses(draws)
+        steps.append({"step": "annotate_regime", **{k: ann.get(k) for k in
+                                                   ("annotated", "no_dimension", "total")}})
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"阶段标注失败：{type(e).__name__}: {e}")
+
+    snap = {}
+    try:
+        snap = patterns_runtime.refresh(draws)
+        steps.append({"step": "refresh_runtime", "counts": (snap.get("snapshot") or {}).get("counts")})
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"规律快照刷新失败：{type(e).__name__}: {e}")
+
+    return {
+        "ok": True,
+        "closed_loop": True,
+        "llm_used": bool(lab.get("llm_used")),
+        "claims": lab.get("claims") or [],
+        "summary": lab.get("summary") or {},
+        "overall": lab.get("overall"),
+        "next_dimensions": lab.get("next_dimensions") or [],
+        "scan_summary": lab.get("scan_summary"),
+        "steps": steps,
+        "errors": errors,
+        "runtime": {"counts": (snap.get("snapshot") or {}).get("counts"),
+                    "base_issue": (snap.get("snapshot") or {}).get("base_issue"),
+                    "generated_at": (snap.get("snapshot") or {}).get("generated_at_text"),
+                    "usable_rules": (snap.get("snapshot") or {}).get("usable_rules")},
+        "elapsed_sec": round(time.time() - t0, 2),
+        "note_zh": ("闭环已跑完：" + (f"LLM 参与并给出 {len(lab.get('claims') or [])} 条可验证规律；"
+                                     if lab.get("llm_used") else "LLM 未参与（仅维度扫描）；")
+                    + f"规律快照现有 {((snap.get('snapshot') or {}).get('counts') or {}).get('usable', 0)} 条可用规律。"),
+    }
+
+
 def summarize_verdicts(claims: Sequence[Dict]) -> Dict:
     counts: Dict[str, int] = {}
     for c in claims:

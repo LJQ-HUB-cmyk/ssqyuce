@@ -564,3 +564,18 @@ footer { color: var(--muted); font-size: 12px; text-align: center; margin-top: 2
   border: 1px solid var(--border); border-radius: 10px; white-space: nowrap; }
 #evalSub-regime .multi-correct-banner .mcb-main b { font-size: 16px; }
 #rgProbeCard .range-sel { max-width: 320px; }
+
+/* ==================== V7：预测元信息 + 规律使用情况 ==================== */
+.pred-meta { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; color: var(--muted);
+  margin: 2px 0 10px; align-items: center; }
+.pred-meta .pm-item { display: inline-flex; align-items: center; gap: 4px; }
+.pred-meta .pm-item b { color: var(--text); font-weight: 600; }
+.pred-meta .pm-warn { color: var(--yellow, #d29922); }
+.pred-meta .pm-key { font-variant-numeric: tabular-nums; }
+.rule-tier { display: inline-block; font-size: 10px; font-weight: 700; padding: 0 6px;
+  border-radius: 8px; border: 1px solid var(--border); margin-left: 4px; }
+.rule-tier.usable { color: var(--green); border-color: var(--green); }
+.rule-tier.monitor { color: var(--gold); border-color: var(--gold); }
+.rule-tier.rejected { color: var(--red); border-color: var(--red); }
+.rule-shadow { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px;
+  background: var(--bg2); font-size: 12px; line-height: 1.75; margin-top: 6px; }

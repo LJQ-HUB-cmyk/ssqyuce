@@ -482,7 +482,20 @@ def build_context(draws: List[Dict], stats: Dict, patterns: List[Dict]) -> Dict:
         ],
         "feedback": _last_feedback(draws),
         "constraints": constraint_ctx(draws),
+        # V7：把「阶段时效 + 验证结论」真正交给 LLM，而不是只给 A/B 级战绩。
+        # usable=可用于出号；monitor=只观察（新兴/衰减/陈旧）；rejected=不可用。
+        "regime_rules": _regime_rules_for_prompt(draws),
     }
+
+
+def _regime_rules_for_prompt(draws: List[Dict], limit: int = 8) -> List[Dict]:
+    """规律运行时快照 → LLM 可读的规律清单（含阶段状态与可信度分层）。"""
+    try:
+        from . import patterns_runtime
+        snap = patterns_runtime.load_snapshot(current_issue=draws[-1]["issue"] if draws else None)
+        return patterns_runtime.rules_for_prompt(snap, limit=limit)
+    except Exception:  # noqa: BLE001
+        return []
 
 
 def _last_feedback(draws: List[Dict]) -> Optional[Dict]:
@@ -509,6 +522,154 @@ def _last_feedback(draws: List[Dict]) -> Optional[Dict]:
         }
     except Exception:  # noqa: BLE001
         return None
+
+
+# ---------- V7：规律 → 出号（运行时快照驱动） ----------
+
+def _rules_hit(history: List[Dict], spec: Dict) -> Optional[set]:
+    """按维度筛选条件求「本期该规律的候选号码集合」（严格 as-of：只用 history）。"""
+    try:
+        from . import discovery
+        key = str((spec or {}).get("key") or "")
+        if not key:
+            return None
+        flt = discovery.make_filter(key, (spec or {}).get("params") or {})
+        return set(int(x) for x in (flt["selector"](list(history)) or set()))
+    except Exception:  # noqa: BLE001 —— 规律不可用不应影响出号
+        return None
+
+
+def _norm_sorted_reds(t: Dict) -> tuple:
+    """票的红球签名：必须**排序后**比较。
+
+    ``evidence_by_ticket`` 用 ``tuple(t["reds"])`` 当键，而候选的红球可能未排序
+    （LLM 输出、或规律命中的号码集合本身是无序的）。不统一排序会导致
+    "第 2 次应用规律时找不到证据"，表现为重复加成、引用丢失——本轮实测踩到。
+    """
+    return tuple(sorted(int(x) for x in (t.get("reds") or [])))
+
+
+def _rule_matches_ticket(t: Dict, rule: Dict, hits: set) -> int:
+    if rule.get("target") == "blue":
+        return 1 if int(t.get("blue") or 0) in hits else 0
+    return len(set(int(x) for x in t.get("reds") or []) & hits)
+
+
+def apply_rules_to_candidates(candidates: List[Dict], history: List[Dict],
+                              snapshot: Optional[Dict]) -> Dict:
+    """把「可用规律」作用到候选上，并返回**可审计的影响描述**。
+
+    三种结果（``mode``）：
+      * ``off``        —— 没有快照 / 没有 usable 规律（系统如实说明"本期无可用规律"）；
+      * ``shadow``     —— 已算出规律偏置，但**不改号码**，只记录"若生效会怎样"
+                           （哪些注被顶替、置信度变化多少、本期命中会怎么变）；
+      * ``active``     —— 规律真正改变候选排序与入选注（``LOTT_RULE_APPLY=1``）。
+
+    偏置强度刻意温和：每条规律把该注的置信度提高 ``RULE_CONF_BOOST``，
+    且**只在候选池内部重排**，不凭空生成号码——规律不能凌驾于概率模型之上。
+    """
+    from . import patterns_runtime
+
+    out: Dict = {"mode": "off", "usable_rules": [], "matched": {}, "changed": False,
+                 "swapped": [], "note_zh": "本期没有可用规律（未通过阶段验证），出号等同纯模型基线"}
+    if not snapshot:
+        return out
+    usable = patterns_runtime.usable_rules(snapshot)
+    snap_stale = bool(snapshot.get("stale"))
+    if not usable:
+        counts = snapshot.get("counts") or {}
+        out["note_zh"] = (
+            "本期无可用规律：规律快照中 0 条通过「阶段持续有效 + A/B 验证」，"
+            f"另有 {int(counts.get('monitor', 0))} 条仅监控、{int(counts.get('rejected', 0))} 条不可用")
+        if snap_stale:
+            out["note_zh"] += "（且规律快照已过期，需刷新）"
+        out["snapshot"] = {"counts": counts, "stale": snap_stale,
+                           "generated_at": snapshot.get("generated_at_text")}
+        return out
+
+    hits_by_rule: Dict[str, set] = {}
+    usable_rows = []
+    for r in usable:
+        hits = _rules_hit(history, r.get("dim") or {})
+        if hits is None:
+            continue
+        hits_by_rule[str(r.get("id"))] = hits
+        usable_rows.append(r)
+    if not usable_rows:
+        out["note_zh"] = "规律快照里的可用规律维度当前无法求值（维度不可用），出号等同基线"
+        return out
+
+    before = [(tuple(t["reds"]), t["blue"], float(t.get("confidence") or 0)) for t in candidates]
+    # 原始排序键必须**在加成之前**取值：``list(candidates)`` 只是浅拷贝，
+    # 元素仍是同一个 dict，加成写回后读到的就不是原值了（会导致加成被重复计权）。
+    _orig_conf = {(_norm_sorted_reds(t), int(t.get("blue") or 0)): float(t.get("confidence") or 0)
+                  for t in candidates}
+    _orig_pos = {k: i for i, k in enumerate(_orig_conf)}
+    placement_before = [(_norm_sorted_reds(t), int(t.get("blue") or 0)) for t in candidates]
+    evidence_by_ticket: Dict[tuple, List[str]] = {}
+    for t in candidates:
+        boost = 0.0
+        refs: List[str] = []
+        for r in usable_rows:
+            hits = hits_by_rule[str(r.get("id"))]
+            n = _rule_matches_ticket(t, r, hits)
+            if n <= 0:
+                continue
+            gain = config.RULE_CONF_BOOST * n
+            boost += gain
+            refs.append(f"{r.get('statement', '')[:36]}（命中 {n} 个 → 置信度 +{gain:.1f}）")
+        if boost:
+            t["confidence"] = float(t.get("confidence") or 0) + boost
+            evidence_by_ticket[(_norm_sorted_reds(t), int(t.get("blue") or 0))] = refs
+    # **只有生效模式才真的排序**。影子模式必须原样返回候选顺序——它是"若生效会怎样"的
+    # 模拟，不能反过来影响本期号码；也不能让调用方误以为候选已被规律改动。
+    # 排序键是"原始置信度 + 规律加成"，而不是已经加成的置信度——
+    # 否则同一条规律会被重复计权（加成本身已写回 t["confidence"]），
+    # 而且结果会依赖候选的初始顺序，违背"规律只是温和偏置"的约定。
+    if patterns_runtime.apply_enabled():
+        # 稳定性：同分时保持原始顺序（否则 50.0+10 与 10.0+50 这类巧合会互换，
+        # 让"规律造成了几注重排"变成随机噪声）。
+        candidates.sort(key=lambda t: (
+            -(_orig_conf.get((_norm_sorted_reds(t), int(t.get("blue") or 0)), 0.0) + float(t.get("confidence") or 0)),
+            _orig_pos.get((_norm_sorted_reds(t), int(t.get("blue") or 0)), 10 ** 6)))
+    after = [(tuple(t["reds"]), t["blue"], float(t.get("confidence") or 0)) for t in candidates]
+
+    out.update({
+        "mode": "active" if patterns_runtime.apply_enabled() else "shadow",
+        "usable_rules": [{"id": r.get("id"), "statement": r.get("statement"),
+                          "dim": r.get("dim"), "regime": r.get("regime")} for r in usable_rows],
+        "matched": {k: sorted(v) for k, v in hits_by_rule.items()},
+        "changed": before != after,
+        "evidence_by_ticket": evidence_by_ticket,
+        "snapshot": {"counts": snapshot.get("counts"), "stale": snap_stale,
+                     "generated_at": snapshot.get("generated_at_text")},
+    })
+    # 规律的真实影响有两个维度，必须分开报，否则会得出错误结论：
+    #   · boosted —— 有多少注的置信度被规律抬高（"规律命中了这些注"）；
+    #   · resorted —— 有多少注的**排序位置**因此变化（"规律真的改变了出号顺序"）。
+    # 影子模式下置信度照样被算出并记录（便于回答"若生效会怎样"），但不排序。
+    conf_before = {(_norm_sorted_reds(t), int(t.get("blue") or 0)): float(t.get("confidence") or 0)
+                   for t in candidates}
+    boosted = [k for k, refs in evidence_by_ticket.items()]
+    before_order = list(placement_before)
+    after_order = [(_norm_sorted_reds(t), int(t.get("blue") or 0)) for t in candidates]
+    n_resorted = sum(1 for a, b in zip(before_order, after_order) if a != b)
+    out["swapped"] = [{"from": list(a[0]) + [a[1]], "to": list(b[0]) + [b[1]],
+                       "conf_before": round(a[2], 1), "conf_after": round(b[2], 1)}
+                      for a, b in zip(before, after) if a[0] != b[0] or a[1] != b[1]][:6]
+    out["n_resorted"] = n_resorted
+    out["n_boosted"] = len(boosted)
+    out["note_zh"] = (
+        f"可用规律 {len(usable_rows)} 条（已通过阶段持续有效 + A/B 验证）；"
+        + ("已生效：候选按规律证据重排" if out["mode"] == "active"
+           else "影子模式：已算出规律影响但不改号码（LOTT_RULE_APPLY=0）")
+        + (f"；{len(boosted)} 注被规律命中" if boosted else "；本期无候选被规律选中")
+        + (f"；{n_resorted} 注排序发生变化" if n_resorted else
+           ("；排序未变（规律未改变入选结果）" if boosted else ""))
+    )
+    if snap_stale:
+        out["note_zh"] += "；⚠️ 规律快照已过期，建议刷新"
+    return out
 
 
 def _parse_tickets_response(res: Optional[dict], method_name: str) -> List[Dict]:
@@ -635,11 +796,12 @@ def llm_tickets(draws: List[Dict], stats: Dict, patterns: List[Dict],
     def _ticket_call(cfg: Dict) -> List[Dict]:
         res = llm_client.chat_json(
             llm_client.SYSTEM_BASE,
-            llm_client.tickets_prompt(
+            llm_client.tickets_prompt(  # noqa
                 llm_client.compact_stats(ctx["stats"]), ctx["recent"], ctx["patterns"], obs,
                 feedback=ctx.get("feedback"),
                 red_probs=red_probs.tolist() if red_probs is not None else None,
-                blue_probs=blue_probs.tolist() if blue_probs is not None else None),
+                blue_probs=blue_probs.tolist() if blue_probs is not None else None,
+                regime_rules=ctx.get("regime_rules")),
             max_tokens=2000, temperature=0.9, model_cfg=cfg,
             deadline=deadline, strict=strict,
         )
@@ -1404,7 +1566,7 @@ def predict_next(draws: List[Dict], use_llm: Optional[bool] = None,
     if llm_required and llm_deadline is None:
         llm_deadline = time.time() + config.LLM_TOTAL_TIMEOUT
     n_tickets = n_tickets or config.N_TICKETS
-    issue = BT.next_issue(draws[-1]["issue"])
+    issue = BT.expected_issue(draws)["issue"]
 
     stats = F.compute_features(draws)
     patterns = db.load_patterns()
@@ -1490,6 +1652,11 @@ def predict_next(draws: List[Dict], use_llm: Optional[bool] = None,
     # M4.2 兜底：最终按生效开关过滤候选（allow/deny 模式下丢弃关闭通道的票）
     candidates = METH.filter_candidates(candidates, methods_spec)
 
+    # V7：规律 → 出号。规律快照（阶段时效 + 维度扫描 + 假说库）由
+    # patterns_runtime 定期刷新，这里只读不重算（<1ms），并按 shadow/active 模式记录影响。
+    from . import patterns_runtime
+    _rule_snap = patterns_runtime.load_snapshot(current_issue=issue)
+
     # 去重 + 评分
     seen = set()
     scored: List[Dict] = []
@@ -1506,6 +1673,15 @@ def predict_next(draws: List[Dict], use_llm: Optional[bool] = None,
             conf = round(10 + 0.25 * em, 1)
         t["confidence"] = min(100.0, max(1.0, conf))
         scored.append(t)
+
+    # V7：把可用规律作用到**已评分候选**上（shadow 只记录、active 才真正改变号码）
+    _rule_info = apply_rules_to_candidates(scored, draws, _rule_snap)
+    _rule_active = _rule_info.get("mode") == "active"
+    if _rule_active:
+        # 用重排后的顺序重建 scored（置信度已在函数内更新）
+        order = {(tuple(t["reds"]), t["blue"]): i for i, t in enumerate(scored)}
+        scored.sort(key=lambda t: order.get((tuple(t["reds"]), t["blue"]), 10 ** 6))
+    _rule_refs = _rule_info.get("evidence_by_ticket") or {}
 
     # LLM 实际生成注数模式（默认开，LOTT_LLM_ONLY_OUTPUT=0 关闭）：
     # 当 LLM 通道产出了有效候选时，最终注数以 LLM **实际返回**的注数为准，
@@ -1562,6 +1738,23 @@ def predict_next(draws: List[Dict], use_llm: Optional[bool] = None,
             shortfall_reason = "llm_only_actual_count"
         else:
             shortfall_reason = "all_methods_disabled" if not scored else "candidate_pool_exhausted"
+    # V7：票级「规律引用」——只写**真正参与该注计算**的规律，
+    # 不再由 LLM 自行填写 pattern-key（那样既不可核验，也容易变成装饰性文字）。
+    for t in picked:
+        refs = _rule_refs.get((tuple(t["reds"]), t["blue"])) or []
+        if refs:
+            t["patterns_used"] = list(refs)
+            t.setdefault("evidence", {})
+            if isinstance(t.get("evidence"), dict):
+                t["evidence"]["规律引用"] = "；".join(refs)
+        elif _rule_info.get("mode") == "off":
+            t.setdefault("evidence", {})
+            if isinstance(t.get("evidence"), dict) and "规律引用" not in t["evidence"]:
+                t["evidence"]["规律引用"] = "无可用规律（0 条通过阶段验证）"
+        elif _rule_info.get("usable_rules"):
+            t.setdefault("evidence", {})
+            if isinstance(t.get("evidence"), dict) and "规律引用" not in t["evidence"]:
+                t["evidence"]["规律引用"] = "可用规律未命中本注（该注完全由概率模型决定）"
     n_distinct_blue = len({t["blue"] for t in picked})
     # V4-C：覆盖指标与期望奖金（诚实口径：覆盖提高中奖频率，不提高期望收益）
     _blue_hit_prob = _portfolio_blue_hit_prob([t["blue"] for t in picked])
@@ -1590,14 +1783,27 @@ def predict_next(draws: List[Dict], use_llm: Optional[bool] = None,
         "blue_hit_prob_naive": round(_blue_hit_naive, 6),
         "portfolio_ev": _portfolio_ev,
         "adaptive": METH.adaptive_status() if config.ADAPTIVE_ENABLED else None,
+        "rules": {
+            "mode": _rule_info.get("mode"),
+            "usable": len(_rule_info.get("usable_rules") or []),
+            "n_boosted": _rule_info.get("n_boosted", 0),
+            "n_resorted": _rule_info.get("n_resorted", 0),
+            "swapped": _rule_info.get("swapped") or [],
+            "note_zh": _rule_info.get("note_zh"),
+            "usable_rules": _rule_info.get("usable_rules") or [],
+            "snapshot": _rule_info.get("snapshot"),
+            "apply_enabled": patterns_runtime.apply_enabled(),
+        },
         "patterns_summary": {
             "A": sum(1 for p in patterns if p["grade"] == "A"),
             "B": sum(1 for p in patterns if p["grade"] == "B"),
             "C": sum(1 for p in patterns if p["grade"] == "C"),
         },
         "ml": _ml_result_block(ml_entry, use_ml, ml_extra),
-        "note": ("样本外回测未发现稳定显著的规律，预测仅基于统计结构的均衡建议；"
-                 "置信度为模型结构分，不构成中奖概率。理性购彩。"),
+        "note": ((f"已叠加 {len(_rule_info.get('usable_rules') or [])} 条通过阶段验证的规律"
+                  if _rule_info.get("usable_rules") else
+                  "样本外回测未发现稳定显著的规律，预测仅基于统计结构的均衡建议")
+                 + "；置信度为模型结构分，不构成中奖概率。理性购彩。"),
     }
     if persist:
         db.save_features(issue, stats)

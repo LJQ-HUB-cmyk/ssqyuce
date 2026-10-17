@@ -313,7 +313,14 @@ async function runPredict(regenerate, btnId) {
 }
 
 function renderPredictions(res) {
-  $("#predIssue").textContent = res.issue ? "目标期号 " + res.issue : "";
+  // V7：目标期号 + 数据基准。期号由后端按真实开奖日历（每周二/四/日）推算，
+  // 数据落后时会明确提示「数据只到哪一期」，不再让人对着一个凑不出来的期号猜。
+  const basis = res.data_basis || {};
+  let issueTxt = res.issue ? "目标期号 " + res.issue : "";
+  if (basis.basis_issue) issueTxt += "（基于上期 " + basis.basis_issue + " · " + (basis.basis_date || "") + "）";
+  $("#predIssue").textContent = issueTxt;
+  renderPredMeta(res);
+  renderRuleUsage(res);
   const list = $("#predList");
   const items = res.tickets || [];
   if (!items.length) {
@@ -364,6 +371,144 @@ function renderPredictions(res) {
   $("#predNote").textContent = res.note || "";
   renderWinReceipt();
   renderCountdown();
+}
+
+// V7：预测元信息（生成时间 / 数据基准 / 数据新鲜度 / 注数口径）
+function fmtTs(ts) {
+  if (!ts) return "—";
+  const n = Number(ts);
+  const d = new Date((n > 1e12 ? n : n * 1000));
+  if (isNaN(d.getTime())) return "—";
+  const p = x => String(x).padStart(2, "0");
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " +
+    p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+}
+
+function renderPredMeta(res) {
+  const el = $("#predMeta");
+  if (!el) return;
+  const basis = res.data_basis || {};
+  const items = [];
+  // 生成时间：优先用票上的 created_at（真实落库时间），其次 res.generated_at
+  let ts = res.generated_at_ts;
+  if (!ts) {
+    const list = (res.tickets || []).filter(t => t.created_at);
+    if (list.length) ts = Math.max.apply(null, list.map(t => Number(t.created_at)));
+  }
+  let genTxt = ts ? fmtTs(ts) : (res.generated_at || null);
+  if (!genTxt) genTxt = res.from_cache ? "未知（历史缓存预测，生成时未记录时间）" : "—";
+  items.push('<span class="pm-item">🕒 生成时间 <b class="pm-key">' + escHtml(genTxt) + '</b>' +
+    (res.from_cache ? '<span class="pm-warn">（缓存）</span>' : "") + '</span>');
+  if (basis.basis_issue) {
+    items.push('<span class="pm-item">📥 数据基准 <b>' + escHtml(basis.basis_issue) + '</b>（' +
+      escHtml(basis.basis_date || "") + '）</span>');
+  }
+  if (basis.days_since !== undefined && basis.days_since !== null) {
+    const stale = basis.expected_draws_missing;
+    items.push('<span class="pm-item' + (stale ? ' pm-warn' : '') + '">' +
+      (stale ? "⚠️ 数据落后 " + basis.days_since + " 天（缺 " + basis.missed_draws + " 期，目标期号已按日历顺推）"
+             : "✅ 数据与开奖日历一致（距今 " + basis.days_since + " 天）") + '</span>');
+  }
+  if (basis.next_draw_date) {
+    items.push('<span class="pm-item">📅 预计开奖 <b>' + escHtml(basis.next_draw_date) + '</b></span>');
+  }
+  const nReq = Number(res.requested_tickets || 0);
+  const nAct = (res.tickets || []).length;
+  if (nReq || nAct) {
+    items.push('<span class="pm-item">🎫 注数 <b>' + nAct + '</b>' + (nReq && nReq !== nAct ? " / 请求 " + nReq : "") + '</span>');
+  }
+  const r = res.rules || {};
+  if (r.mode) {
+    const modeTxt = r.mode === "active" ? "已生效" : (r.mode === "shadow" ? "影子模式（只记录不改号）" : "未使用规律");
+    items.push('<span class="pm-item">🧩 规律 <b>' + escHtml(modeTxt) + '</b>' +
+      (r.usable ? '（可用 ' + r.usable + ' 条）' : "") + '</span>');
+  }
+  el.innerHTML = items.join("");
+}
+
+// V7：本期规律使用情况（可用 / 只监控 / 不可用 + 影子模式的实际影响）
+function renderRuleUsage(res) {
+  const el = $("#ruleBody");
+  const tag = $("#ruleTag");
+  if (!el) return;
+  const r = res.rules || {};
+  if (!r.mode) { if (tag) tag.textContent = "未加载"; return; }
+  const snap = r.snapshot || {};
+  const counts = snap.counts || {};
+  if (tag) tag.textContent = r.mode === "active" ? "规律已生效" : (r.mode === "shadow" ? "影子模式" : "未使用规律");
+  let h = '<div class="track-metrics">' +
+    metricItem("可用规律", Number(r.usable || 0), "阶段持续有效 + A/B 通过") +
+    metricItem("本轮受规律影响的候选", Number(r.n_resorted || 0), r.mode === "active" ? "已按规律重排" : "影子模式：仅记录") +
+    metricItem("快照可用/监控/否决",
+      (counts.usable || 0) + " / " + (counts.monitor || 0) + " / " + (counts.rejected || 0),
+      snap.generated_at ? "快照 " + snap.generated_at : "未生成快照") +
+    '</div>';
+  h += '<div class="rule-shadow">' + escHtml(r.note_zh || "") + '</div>';
+  const rules = r.usable_rules || [];
+  if (rules.length) {
+    h += '<div class="scroll" style="margin-top:8px"><table class="battle-table"><thead><tr>' +
+      '<th>可用规律</th><th>维度</th><th>阶段状态</th><th>效应</th><th>校正p</th></tr></thead><tbody>';
+    for (const x of rules) {
+      const rg = x.regime || {};
+      h += '<tr><td style="text-align:left">' + escHtml((x.statement || "").slice(0, 46)) + '</td>' +
+        '<td style="text-align:left">' + escHtml((x.dim && x.dim.key) || "") + ' ' +
+        escHtml(JSON.stringify((x.dim && x.dim.params) || {})) + '</td>' +
+        '<td>' + escHtml(rg.label || rg.status || "") + '</td>' +
+        '<td>' + (rg.effect === null || rg.effect === undefined ? "—" : Number(rg.effect).toFixed(4)) + '</td>' +
+        '<td>' + (rg.p_adjusted === null || rg.p_adjusted === undefined ? "—" : Number(rg.p_adjusted).toFixed(4)) + '</td></tr>';
+    }
+    h += '</tbody></table></div>';
+  } else {
+    h += '<div class="track-note">当前 0 条规律满足「阶段持续有效 + A/B 验证」。"无可用规律"是诚实的结论，' +
+      '不是系统没找——可到「评估报告 → ⏳ 规律时效」看全部规律的阶段画像，或点「⟳ 规律闭环」让 AI 重新挖掘验证。</div>';
+  }
+  h += '<div class="eval-actions" style="margin-top:8px">' +
+    '<button onclick="refreshRuleSnapshot()">⟳ 刷新规律快照</button>' +
+    '<button onclick="runClosedLoop()">🤖 跑一次 AI 规律闭环（挖掘→验证→使用）</button>' +
+    '<span class="hint-inline">闭环约 1~8 分钟（含大模型三轮）；完成后本期规律状况会随之更新</span></div>';
+  el.innerHTML = h;
+}
+
+async function refreshRuleSnapshot() {
+  if (_rgBusy) { toast("正在计算中，请稍候"); return; }
+  _rgBusy = true;
+  try {
+    const r = await api("/api/rules/refresh", { method: "POST" });
+    toast("规律快照已刷新：" + JSON.stringify(r.counts || {}));
+    await loadLastPrediction();
+  } catch (e) { toast("刷新失败: " + e.message); }
+  _rgBusy = false;
+}
+
+async function runClosedLoop() {
+  if (_rgBusy) { toast("正在计算中，请稍候"); return; }
+  if (!window.confirm("AI 规律闭环：大模型三轮提规律/自我质疑 → 逐条 as-of 回放验证 → 注册 → 刷新规律快照。\n预计 1~8 分钟，确定开始？")) return;
+  _rgBusy = true;
+  const el = $("#ruleBody");
+  if (el) el.innerHTML = '<div class="track-note warn"><span class="spin">⏳</span> 闭环进行中：挖掘 → 验证 → 注册 → 刷新快照…</div>';
+  try {
+    const r = await api("/api/rules/closed-loop?rounds=3&use_llm=1", { method: "POST" });
+    const rt = r.runtime || {};
+    toast("闭环完成：可用规律 " + ((rt.counts || {}).usable || 0) + " 条");
+    await loadLastPrediction();
+    if (typeof loadRegimeOverview === "function") loadRegimeOverview(false);
+  } catch (e) { toast("闭环失败: " + e.message); }
+  _rgBusy = false;
+}
+
+// 载入最近一期预测（进首页时用，带生成时间与规律使用情况）
+async function loadLastPrediction() {
+  try {
+    const r = await api("/api/predictions/last");
+    if (!r || !r.issue) return;
+    currentIssue = r.issue;
+    renderPredictions(r);
+    const nActual = (r.tickets || []).length;
+    const gen = r.generated_at || "未知时间";
+    $("#predStatus").textContent = "📄 已加载上期保存的预测（" + r.issue + "，" + nActual +
+      " 注，生成于 " + gen + "）";
+    $("#predStatus").style.color = "var(--muted)";
+  } catch (e) { /* 首页静默失败，不打扰 */ }
 }
 
 // 一句话结构小结：和值 · 三区 · 奇偶
@@ -2869,8 +3014,15 @@ async function loadAll() {
     renderPatterns(pats.items, pats.summary);
     allPatterns = pats.items;
     if (preds.tickets && preds.tickets.length) {
-      renderPredictions({issue: preds.issue, tickets: preds.tickets, note: ""});
+      // V7：带上后端返回的生成时间 / 数据基准 / 规律使用情况（此前这几项被丢弃，
+      // 用户因此看不到「预测是什么时候生成的」）
+      renderPredictions(Object.assign({note: ""}, preds));
     } else {
+      // 尚无该期预测：仍然展示「上期数据基准 + 数据是否落后 + 规律快照」，避免空页让人误解
+      renderPredictions({issue: preds.issue, tickets: [], note: "", data_basis: preds.data_basis,
+                         generated_at: null, rules: null});
+      $("#predList").innerHTML = '<div class="note">本期（' + escHtml(preds.issue || "") +
+        '）还没有生成预测，点右上角「🎯 生成预测」。</div>';
       renderCountdown();
     }
     await renderHistory();

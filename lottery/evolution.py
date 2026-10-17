@@ -628,7 +628,7 @@ def predict_with_evolution(draws: List[Dict], n_tickets: int = 10,
     issue = None
     try:
         from . import backtest as _BT
-        issue = _BT.next_issue(draws[-1]["issue"]) if draws else None
+        issue = _BT.expected_issue(draws)["issue"] if draws else None
     except Exception:  # noqa: BLE001
         issue = None
 

@@ -394,7 +394,8 @@ def observations_prompt(stats_json: dict, recent: list, patterns: list,
 def tickets_prompt(stats_json: dict, recent: list, patterns: list, observations: dict,
                      feedback: Optional[dict] = None,
                      red_probs: Optional[list] = None,
-                     blue_probs: Optional[list] = None) -> str:
+                     blue_probs: Optional[list] = None,
+                     regime_rules: Optional[list] = None) -> str:
     """第 2 轮：组合结构优化（U3 LLM 角色重定位）。
 
     双色球独立随机，LLM 不再“自由猜测号码”。给定统计模型/ML 的 33/16 维概率
@@ -415,7 +416,10 @@ def tickets_prompt(stats_json: dict, recent: list, patterns: list, observations:
         f"## 统计报告\n```json\n{json.dumps(stats_json, ensure_ascii=False)}\n```\n"
         f"## 最近走势\n{json.dumps(recent, ensure_ascii=False)}\n"
         f"## 已回测规律明细（n/边际/p_adj/威尔逊区间）\n{json.dumps(patterns, ensure_ascii=False)}\n"
-        f"## 你的观察\n{json.dumps(observations, ensure_ascii=False)}\n"
+        + (f"## 规律的**阶段时效**清单（tier=usable 才可用于出号；monitor 仅供观察，"
+           f"rejected 已判不可用——不得引用作选号理由）\n"
+           f"{json.dumps(regime_rules, ensure_ascii=False)}\n" if regime_rules else "")
+        + f"## 你的观察\n{json.dumps(observations, ensure_ascii=False)}\n"
         + red_hint
         + fb
         + f"请生成 {config.TICKETS_PER_LLM_CALL} 注候选，输出形如：\n"
@@ -429,6 +433,7 @@ def tickets_prompt(stats_json: dict, recent: list, patterns: list, observations:
         "硬约束：红球从概率分布 Top 区间内选择且尽量分散（不同注之间少重复号）；"
         "和值落在历史常见区间，三区比/奇偶比不要极端。若某尺度没有可靠信号，请如实降低置信度并说明。"
         "evidence 必须引用上文具体数字，禁止编造。"
+        "patterns_used 只能填 tier=usable 的规律（按「维度key 参数」写）；没有可用规律时请留空数组并如实说明。"
     )
 
 

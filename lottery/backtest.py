@@ -7,21 +7,101 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 from scipy import stats
 
+import datetime
+
 from . import db, features as F, patterns as P
 
 
+# 双色球开奖节奏：每周二、四、日（2003-02-23 首期即为周日）。
+# 实测 2021-2025 每年 150~151 期、期号连续无跳号、间隔以 2/3 天为主（每周三期）。
+# 历史上每年最多 154 期（2003-2005），**从未出现 4xx 期号**——所以
+# 「seq+1 > 999 就跳到下一年 001」这种写法虽然合法，却掩盖了「本地数据落后了一整年」
+# 这个真实故障（实测：本地只有 2026118（10-15，周四），而 10-17 应开 2026119，
+# 旧逻辑把用户看到的「目标期号」显示成了明年第 401 期）。
+DRAW_WEEKDAYS = (1, 3, 6)      # 周一=0 → 周二/周四/周日（与 config.DRAW_WEEKDAYS 同口径）
+MAX_SEQ_PER_YEAR = 160         # 真实最多 154，留出余量只用于识别异常
+
+
 def next_issue(issue: str) -> str:
+    """期号 +1（同一自然年内递增，期末不跨年跳号）。
+
+    注意：这是**纯序号推算**，它假设本地数据与官方同步。若本地数据陈旧（例如官方
+    已开 2026119 而本地只到 2026118），本函数给出的 2026119 仍然正确；
+    真正会出错的是「跨年跳号」的老写法，见 ``DRAW_WEEKDAYS`` 上方注释。
+    """
     year = int(issue[:4])
     seq = int(issue[4:])
-    seq += 1
-    if seq > 999:
-        year, seq = year + 1, 1
-    return f"{year:04d}{seq:03d}"
+    return f"{year:04d}{seq + 1:03d}"
+
+
+def expected_issue(draws: List[Dict], today: Optional[datetime.date] = None) -> Dict:
+    """按**真实开奖日历**推算"下一个应开期号"，并给出数据新鲜度。
+
+    为什么要这么做：期号不能靠猜。用户的诉求是「上期实际是 2026118、目标期号应准确」，
+    而准确的唯一依据是「现在离上一期开奖过了几个开奖日」。
+
+    口径（实测本机 3515 期）：
+      * 开奖日为每周二/四/日（``DRAW_WEEKDAYS``），每年 150~151 期、期号连续；
+      * 以最后一期开奖日为起点，数「今天之前还应当开过几次」，逐次 +1；
+      * 跨年时**不**跳到 001，而是按「同一年内最多 ``MAX_SEQ_PER_YEAR`` 期」判断——
+        超过就说明本地数据缺了整整一年，此时给出 ``stale_year=True`` 让界面明说。
+
+    返回::
+
+        {issue, basis_issue, basis_date, days_since, missed_draws, stale_days,
+         next_draw_date, expected_draws_missing, stale_year, note_zh}
+    """
+    today = today or datetime.date.today()
+    if not draws:
+        return {"issue": None, "basis_issue": None, "basis_date": None,
+                "days_since": None, "missed_draws": 0, "stale_days": None,
+                "next_draw_date": None, "expected_draws_missing": True,
+                "stale_year": False, "note_zh": "本地暂无开奖数据，无法推算目标期号"}
+    last = draws[-1]
+    try:
+        base_date = datetime.date(*map(int, str(last["date"]).split("-")))
+    except (TypeError, ValueError):
+        base_date = today
+    seq = int(str(last["issue"])[4:])
+    year = int(str(last["issue"])[:4])
+    # 逐个数开奖日：base_date 之后的第一个开奖日，到「今天或今天之前的最后一个开奖日」
+    # 之间一共还有几个开奖日 = 本地缺了几期
+    d = base_date
+    missed = 0
+    while True:
+        d = d + datetime.timedelta(days=1)
+        if d.weekday() in DRAW_WEEKDAYS:
+            if d >= today:
+                break
+            missed += 1
+    next_draw = d
+    issue_seq = seq + missed + 1
+    stale_year = issue_seq > MAX_SEQ_PER_YEAR
+    stale_days = max(0, (today - base_date).days)
+    return {
+        "issue": f"{year:04d}{issue_seq:03d}",
+        "basis_issue": last.get("issue"),
+        "basis_date": last.get("date"),
+        "days_since": stale_days,
+        "missed_draws": missed,
+        "stale_days": stale_days,
+        "next_draw_date": next_draw.isoformat(),
+        "expected_draws_missing": missed > 0,
+        "stale_year": stale_year,
+        "note_zh": (
+            f"本地最新开奖 {last.get('issue')}（{last.get('date')}），"
+            + (f"按每周二/四/日节奏，其后已又有 {missed} 个开奖日仍未入库，"
+               f"数据落后 {stale_days} 天；目标期号应为 {year:04d}{issue_seq:03d}" if missed else
+               f"目标期号应为 {year:04d}{issue_seq:03d}（下一开奖日 {next_draw.isoformat()}）")
+            + ("；⚠️ 期号推算超过一年量级，本地数据可能缺了整整一年，请先检查数据源"
+               if stale_year else "")
+        ),
+    }
 
 
 def _draw_value(outcome: str, draw: Dict) -> float:

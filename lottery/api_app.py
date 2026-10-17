@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import hmac
+import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -189,7 +190,10 @@ def predict(use_llm: Optional[bool] = None, n_tickets: int = 10,
     draws = db.load_draws()
     if not draws:
         return JSONResponse({"ok": False, "error": "本地暂无开奖数据，请先刷新"}, status_code=400)
-    issue = BT.next_issue(draws[-1]["issue"])
+    # V7：期号按真实开奖日历推算（每周二/四/日），并在数据陈旧时明说，
+    # 不再用「seq+1」硬猜（旧写法在期号越界时会显示成明年的 4xx 期号）。
+    _exp = BT.expected_issue(draws)
+    issue = _exp["issue"]
     if not regenerate:
         existing = db.load_predictions(issue)
         if existing:
@@ -206,7 +210,12 @@ def predict(use_llm: Optional[bool] = None, n_tickets: int = 10,
             if bm not in ("single", "blue_compound", "dan_tuo"):
                 bm = "single"
             _llm_used = any(str(t.get("method", "")).startswith("llm:") for t in existing)
+            _gen_ts = max((t.get("created_at") or 0) for t in existing) if existing else None
             return {"issue": issue, "tickets": existing, "from_cache": True,
+                    "generated_at": (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(_gen_ts))
+                                     if _gen_ts else None),
+                    "generated_at_ts": _gen_ts,
+                    "data_basis": _exp,
                     "actual_tickets": len(existing),
                     "requested_tickets": meta.get("requested_tickets") or len(existing),
                     "shortfall_reason": meta.get("shortfall_reason"),
@@ -232,17 +241,46 @@ def predict(use_llm: Optional[bool] = None, n_tickets: int = 10,
     except Exception as e:  # noqa: BLE001
         return JSONResponse({"ok": False, "error": f"预测引擎异常: {e}"}, status_code=500)
     res["from_cache"] = False
+    res.setdefault("data_basis", _exp)
     return res
 
 
 @app.get("/api/predictions/last")
 def last_predictions():
+    """最近一期预测（含**生成时间**与数据基准，V7）。
+
+    V6 及以前只返回 issue + tickets，前端因此无法显示"什么时候生成的"；
+    现在补上 generated_at / data_basis / rules 摘要，让"这注是什么时候、基于哪期数据算的"可见。
+    """
+    from . import backtest as BT
     issue = None
     rows = db.get_conn().execute(
         "SELECT issue FROM predictions ORDER BY issue DESC LIMIT 1").fetchone()
+    tickets = []
     if rows:
         issue = rows["issue"]
-    return {"issue": issue, "tickets": db.load_predictions(issue) if issue else []}
+        tickets = db.load_predictions(issue)
+    draws = db.load_draws()
+    gen_ts = max((t.get("created_at") or 0) for t in tickets) if tickets else None
+    meta = {}
+    for m in (db.load_eval_meta(issue) if issue else []):
+        try:
+            meta = json.loads(m.get("config_snapshot_json") or "{}")
+        except (TypeError, ValueError):
+            meta = {}
+        break
+    rules_used = sorted({r for t in tickets for r in (t.get("patterns_used") or [])})
+    return {
+        "issue": issue,
+        "tickets": tickets,
+        "generated_at": (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(gen_ts))
+                         if gen_ts else None),
+        "generated_at_ts": gen_ts,
+        "data_basis": BT.expected_issue(draws) if draws else None,
+        "requested_tickets": meta.get("requested_tickets"),
+        "llm_used": any(str(t.get("method", "")).startswith("llm:") for t in tickets),
+        "patterns_used": rules_used,
+    }
 
 
 # ---------- 评估 ----------
@@ -1098,8 +1136,19 @@ def _scheduler_step():
     except Exception as e:  # noqa: BLE001
         print("[scheduler] 进化失败（不影响预测）:", e)
 
+    # V7：生成预测前先重建规律快照，让「刚验证出来的规律」本期就能进入出号链路。
+    # 失败只记录、不影响预测（快照是可选加速层，缺失时引擎照常出号）。
+    try:
+        from . import patterns_runtime
+        print("[scheduler] 规律快照:", patterns_runtime.refresh(db.load_draws()))
+    except Exception as e:  # noqa: BLE001
+        print("[scheduler] 规律快照刷新失败（不影响预测）:", e)
+
     draws = db.load_draws()
-    issue = BT.next_issue(draws[-1]["issue"])
+    exp = BT.expected_issue(draws)
+    if exp.get("expected_draws_missing"):
+        print("[scheduler] 警告：数据源落后于开奖日历，缺", exp.get("missed_draws"), "期")
+    issue = exp["issue"]
     if not db.load_predictions(issue):
         engine.predict_next(draws, use_llm=True)
         print("[scheduler] 已生成", issue, "预测")
@@ -1470,6 +1519,74 @@ def backtest_regime(key: str = Query(..., min_length=1),
                              "detail": f"{type(e).__name__}: {e}"}, status_code=503)
     return {"ok": True, "filter": {"key": key, "params": p, "label": flt["label"],
                                    "target": flt["target"]}, "regime": rep}
+
+
+@app.get("/api/rules/runtime")
+def rules_runtime():
+    """规律运行时快照：现在到底有哪些规律「可用」、哪些只监控、哪些已否决。"""
+    try:
+        from . import patterns_runtime
+    except ImportError as e:
+        return JSONResponse({"ok": False, "available": False,
+                             "error": "规律运行时模块尚未就绪", "detail": str(e)},
+                            status_code=503)
+    draws = db.load_draws()
+    current = draws[-1]["issue"] if draws else None
+    snap = patterns_runtime.load_snapshot(current_issue=current)
+    if not snap:
+        return {"ok": True, "available": False, "stale": True,
+                "note_zh": "尚未生成规律快照（点「刷新规律快照」或等调度器刷新）"}
+    return {"ok": True, "available": True,
+            "apply_enabled": patterns_runtime.apply_enabled(),
+            "current_issue": current, **{k: snap.get(k) for k in
+                                         ("generated_at_text", "base_issue", "n_draws",
+                                          "counts", "scan", "eras", "stale", "age_text")},
+            "rules": snap.get("rules") or []}
+
+
+@app.post("/api/rules/refresh")
+def rules_refresh():
+    """重算规律运行时快照（阶段时效 + 维度扫描 + 假说库 → 快照文件，约 5~20 秒）。"""
+    try:
+        from . import patterns_runtime
+    except ImportError as e:
+        return JSONResponse({"ok": False, "error": "规律运行时模块尚未就绪",
+                             "detail": str(e)}, status_code=503)
+    draws = db.load_draws()
+    if not draws:
+        return JSONResponse({"ok": False, "error": "本地暂无开奖数据"}, status_code=400)
+    try:
+        r = patterns_runtime.refresh(draws)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": "刷新失败",
+                             "detail": f"{type(e).__name__}: {e}"}, status_code=503)
+    return {"ok": True, **r}
+
+
+@app.post("/api/rules/closed-loop")
+def rules_closed_loop(rounds: int = Query(3, ge=1, le=3),
+                      use_llm: int = Query(1, ge=0, le=1)):
+    """**AI 规律闭环**：挖掘 → 验证 → 注册 → 刷新规律快照（供出号使用）。
+
+    这是用户诉求「用 AI 挖掘规律、验证规律、使用规律」的一键入口：
+    LLM 三轮提规律并自我质疑 → 逐条 as-of 回放 + 阶段画像 → 注册假说库 →
+    重建规律快照 → 下一期预测自动消费（LOTT_RULE_APPLY=1 时真正影响号码，
+    默认影子模式只记录影响）。耗时 1~8 分钟（含 LLM）。
+    """
+    try:
+        from . import llm_lab
+    except ImportError as e:
+        return JSONResponse({"ok": False, "error": "LLM 规律工坊模块尚未就绪",
+                             "detail": str(e)}, status_code=503)
+    draws = db.load_draws()
+    if not draws:
+        return JSONResponse({"ok": False, "error": "本地暂无开奖数据"}, status_code=400)
+    try:
+        res = llm_lab.run_closed_loop(draws, rounds=int(rounds), use_llm=bool(use_llm))
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": "闭环执行失败",
+                             "detail": f"{type(e).__name__}: {e}"}, status_code=503)
+    return res
 
 
 @app.get("/api/battle/report")

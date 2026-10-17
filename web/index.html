@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>双色球智能预测分析系统</title>
-<link rel="stylesheet" href="/static/style.css?v=20261017.1">
+<link rel="stylesheet" href="/static/style.css?v=20261017.2">
 <!-- ECharts CDN + 本地 fallback -->
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"
   onerror="this.src='/static/vendor/echarts.min.js?v=20260817.7'"></script>
@@ -67,9 +67,17 @@
             <button class="btn-follow" onclick="followMyPick()">🤝 跟我买</button>
           </div>
         </div>
+        <div class="pred-meta" id="predMeta"></div>
         <div class="pred-status" id="predStatus"></div>
         <div id="predList"></div>
         <div class="note" id="predNote"></div>
+
+        <!-- V7：本期规律使用情况（可用/监控/不可用 + 影子模式影响） -->
+        <div class="card" id="ruleCard">
+          <h2>🧩 本期规律使用情况 <span class="tag" id="ruleTag">未加载</span></h2>
+          <div id="ruleBody"><div class="note">规律只有在「阶段持续有效 + 通过 A/B 验证」后才被标记为可用；
+            未通过的一律只监控或否决，不会影响号码。</div></div>
+        </div>
 
         <!-- 我的号码诊断 -->
         <div class="card">
@@ -554,7 +562,7 @@
   </aside>
 
   
-      <footer>双色球智能预测分析系统 <span class="badge badge-ver" id="verText">v2.2.0</span>（M1-M5 + U1-U9 + V4/V5/V6 已上线）· 仅供研究参考 · 随机性诚实声明 · 数据源 e.17500.cn</footer>
+      <footer>双色球智能预测分析系统 <span class="badge badge-ver" id="verText">v2.3.0</span>（M1-M5 + U1-U9 + V4~V7 已上线）· 仅供研究参考 · 随机性诚实声明 · 数据源 e.17500.cn</footer>
 </div>
 
 <!-- 号码详情弹窗（全局：任意 Tab 均可触发） -->
@@ -569,6 +577,6 @@
 </div>
 
 <div id="toast"></div>
-<script src="/static/app.js?v=20261017.1"></script>
+<script src="/static/app.js?v=20261017.2"></script>
 </body>
 </html>

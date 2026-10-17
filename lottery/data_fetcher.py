@@ -23,22 +23,36 @@ def save_snapshot(text: str) -> str:
 
 
 def update_from_text(text: str) -> dict:
-    """解析并增量入库，返回统计信息。"""
+    """解析并增量入库，返回统计信息。
+
+    **不只按 max_issue 追加**：源站偶尔会晚于开奖（或本地曾漏抓一期），
+    此时源站的上一期会在本地**缺失**，而 `d["issue"] > local_max` 会把它永远挡在门外。
+    V7 改为用 `upsert_draws` 全量对齐（同 issue 覆盖、缺的补齐），并用
+    `backfilled` 报出「补回了几期历史缺号」——这是「目标期号不准」的根治措施。
+    """
     draws = parser.parse_text(text)
     for draw in draws:
         draw["source"] = "17500"
     if not draws:
         raise ValueError("数据源为空")
+    local_max_before = db.max_issue()
+    n_new = db.upsert_draws(draws)
+    remote_issues = {d["issue"] for d in draws}
+    # 「补回了几期」= 源站有、而本次入库前本地本来没有的期号
+    local_before = {d["issue"] for d in db.load_draws()}
+    backfilled = sorted(remote_issues - local_before)
     local_max = db.max_issue()
-    new_draws = [d for d in draws if local_max is None or d["issue"] > local_max]
-    n_new = db.upsert_draws(new_draws) if new_draws else 0
     return {
         "remote_total": len(draws),
         "remote_last": draws[-1]["issue"],
         "remote_last_date": draws[-1]["date"],
         "local_total": db.count_draws(),
-        "local_max": db.max_issue(),
+        "local_max": local_max,
+        "local_max_before": local_max_before,
         "inserted_new": n_new,
+        # 这批里本地原先**没有**的期号（含补回的漏抓期）
+        "backfilled": backfilled,
+        "backfilled_n": len(backfilled),
     }
 
 

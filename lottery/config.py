@@ -23,8 +23,8 @@ BACKUP_DATA_URL = (os.environ.get("LOTT_BACKUP_DATA_URL") or "").strip() or None
 
 # ---------- 版本信息（前端主页 / API / GitHub 说明统一引用） ----------
 
-APP_VERSION = "2.2.0"          # v6 方案：阶段有效性（regime）+ 多维度发现 + LLM 规律工坊
-APP_BUILD = "2026-10-V6"       # 构建标识（V6 交付批次）
+APP_VERSION = "2.3.0"          # v7：AI 规律闭环（挖掘→验证→使用）+ 期号日历推算 + 预测透明化
+APP_BUILD = "2026-10-V7"       # 构建标识（V7 交付批次）
 APP_MILESTONES = {
     "M1": {"status": "done",    "desc": "前端 Tab 工作台 + 规律库扩容 29 条 + 自动挖掘管道 + 任务系统"},
     "M2": {"status": "done",    "desc": "GBDT/RF 概率模型 + 滚动 Brier 加权融合 + 概率校准 + 蓝球独立投票 + ML walk-forward 评估"},
@@ -41,6 +41,7 @@ APP_MILESTONES = {
     "U8": {"status": "done", "desc": "推理型模型输出预算自适应（含预算记忆）+ 设置页模型唯一事实来源 + 观察轮报错聚合 + 上期开奖回执列出上期推荐逐注命中"},
     "U9": {"status": "done", "desc": "历史战绩口径修正：期数取接口实际去重样本（不再是用字面量 N / 各方法相加），样本不足不给最佳方法结论；卡片下移至「上期开奖回执」之后"},
     "V4": {"status": "done", "desc": "诚实口径改造：/api/rigor/randomness + /api/rigor/signal + /api/portfolio/expected-value 三个端点（缺 rigor 模块时优雅降级 503）；前端不再把随机波动当能力展示——所有比率必须带样本量与「样本不足，不构成结论」提示，新增「随机性检验」卡展示最小可检出提升量"},
+    "V7": {"status": "done", "desc": "AI 规律闭环 + 数据对齐：①目标期号改为按真实开奖日历推算（每周二/四/日，BT.expected_issue），数据落后时明确报「缺几期/落后几天」，不再出现 2026401 这类越界期号；抓取改为全量对齐（补回漏抓期）。②本期推荐显示生成时间、数据基准、注数口径；/api/predictions/last 返回 generated_at/data_basis。③新增 lottery/patterns_runtime.py 规律运行时快照（data/patterns_runtime.json），把「阶段时效 + 维度扫描 + 假说库」压缩成低延迟可用清单，engine.predict_next 每期消费：可用规律=阶段持续有效且 A/B 验证通过，其余只监控/否决；默认 shadow 模式（记录影响不改号），LOTT_RULE_APPLY=1 生效。④票级「规律引用」由引擎按真实命中写入，不再由 LLM 自填。⑤/api/rules/{runtime,refresh,closed-loop} 与前端「本期规律使用情况」卡：挖掘→验证→注册→刷新快照→出号，一键闭环"},
     "V6": {"status": "done", "desc": "阶段有效性 + 多维度规律：新增 lottery/regime.py（9 阶段切分 + 逐阶段检验 + BH 校正 + 近 3 期加权 + 持续/新兴/衰减/陈旧/反转/伪规律状态机 + 近 150 期加权检验）、lottery/discovery.py（20 维度族 × 91 组参数的 as-of 快速筛选与阶段画像，单次扫描约数秒）、lottery/llm_lab.py（LLM 规律工坊：全历史阶段序列 + 维度表 + 搜索成本喂给模型，三轮提规律/自我质疑/修订，每条规律强制映射维度表并做 as-of 回放，映射不到判不可验证）；A/B 验证修复（两臂独立采样，结构类假说不再恒为 0 差异；对照组由 uniform 改为实际部署基线）；前端新增「规律时效」工作台（阶段热力图 + 维度扫描 + LLM 工坊 + 检索式核验）"},
     "V5": {"status": "done", "desc": "自进化系统：lottery/battle.py 方法级 walk-forward 战斗回放（红球 Wilcoxon + 蓝球 McNemar + Bonferroni/BH 校正）+ lottery/hypothesis.py LLM 规律提炼与假说库（LLM 失败必降级）+ lottery/evolution.py 进化闭环（假说→出号策略→A/B 实战验证→validated/rejected 裁决）；调度器每期开奖后自动跑一轮进化；前端「实战战绩」子页呈现战绩榜（ROI 双口径）、两两对比（未校正 N→校正 M）、规律库与进化操作"},
 }
@@ -135,6 +136,14 @@ _load_extra_body_env()
 METHOD_RECOMMENDATION_MIN_ISSUES = int(os.environ.get("LOTT_METHOD_RECOMMENDATION_MIN_ISSUES", "60"))
 METHOD_RECOMMENDATION_DISABLE_ISSUES = int(os.environ.get("LOTT_METHOD_RECOMMENDATION_DISABLE_ISSUES", "120"))
 METHOD_RECOMMENDATION_ALPHA = float(os.environ.get("LOTT_METHOD_RECOMMENDATION_ALPHA", "0.05"))
+
+# ---------- V7 规律 → 出号 ----------
+# 规律命中一个号码给该注加多少「置信度分」。刻意温和（默认 1.0/个）：
+# 规律只能在候选池内部重排，不能凌驾于概率模型之上。
+# 尺度依据（实测）：候选池内置信度区间只有约 20~35 分、极差 3~6 分，
+# 所以 1 个命中（+1.0）足以在池内挪动一两位，但打不过「整体高 4 分以上」的注——
+# 这正是"温和偏置"想要的力度。调大（如 3.0）会让规律压过概率模型，不建议。
+RULE_CONF_BOOST = float(os.environ.get("LOTT_RULE_CONF_BOOST", "1.0"))
 # LOTT_METHODS（逗号/空格分隔，未设置 = 全部启用）：可关闭/保留任意方法通道
 # （stat 各基线 / ML / LLM / uniform），令牌可写全名（stat:freq）或族名（stat）。
 # LOTT_METHOD_MODE：production（默认，严格按开关过滤）/ research（忽略开关、全部启用，
