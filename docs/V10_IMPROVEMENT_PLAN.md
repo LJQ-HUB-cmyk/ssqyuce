@@ -1,11 +1,26 @@
-# V10 改进方案 v2.0：把「找不存在的规律」彻底换成「可机器判定的工程与口径」
+# V10 改进方案 v2.1：把「找不存在的规律」彻底换成「可机器判定的工程与口径」
 
-> **版本**：**v2.0（2026-10-17，按 4 份评审裁决返工）**
+> **版本**：**v2.1（2026-10-17，二次评审 B1–B5 修复后）**
+>
+> **变更史**：v1.0 初稿 → v1.1 首轮评审事实更正 → **v2.0** 按 4 份评审裁决重做设计 → **v2.1** 按二次评审（S1/S2）修复 B1–B5
+>
+> **v2.1 修了什么（B1–B5）**：
+> - **B1（P0）新增 §3.3.5b「写者规格」**：v2.0 只在读侧用 `prereg_ok`，**从未规定谁写它** ——
+>   而 U1–U5 全部 monkeypatch `load_registry`，即使实现者永不置 True 也全绿。
+>   现补 `evaluate_prereg()` 完整签名 + 调用点写死为调度器 + 库根计数器 + **E1/E2/E3 三条 E2E 测试**（不 mock 任何内部）。
+> - **B2（P0）`var_ratio` 不再是"可为负"**：原文「n=10、Ā=0 → −3.000」三处错（算术应 −1.000；该构造需 60 个号 > 33 不可能；−3.000 对应 n=19）。
+>   真实**下界为 0**（n=11 每号 2 次），负值测试用例**不可构造**，已删除该要求。
+> - **B3（P0）`source` 层判定**：`config.py:239/267` 把生效值写回 `os.environ`，`.get` 永久分不清三层；
+>   改用「查文件优先 + `in os.environ`」+ `config.METHODS_SOURCE` import 期定值。
+> - **B4（P1）四处照抄会错**：`LEVEL_NAMES` 不存在（实为 `evaluate.PRIZE_NAME`，一/二等奖带 `(≈*)`）；
+>   `discovery_params_ok` 收**单个 dict**；T1 的 `blend` 断言与 allow-list 默认值互斥；`replay_results` 主键必须含 `mode`。
+> - **B5（P2）数字漂移**：基线 480 → **489**；字段表 12 → **16**（补 `divergence`/`registered_issue`/`prereg_reason`/`alpha`）；
+>   DDL 主键同步；§2.2/2.3/2.4 标记"已落地"。
 > **权威口径**：[`docs/reviews/V10_REVIEW_SUMMARY.md`](reviews/V10_REVIEW_SUMMARY.md)。本文件与该裁决冲突时，以裁决为准；本文件内部冲突时，以 `第零部分 删除台账` 与 `附录 B 数字来源台账` 为准。
 > **评审原文**：`docs/reviews/R1_ARCHITECTURE_REVIEW.md`（265 行）、`R2_STATISTICS_REVIEW.md`（597 行）、`R3_AI_REVIEW.md`（324 行）、`R4_RELEASE_REVIEW.md`（505 行）
 > **评审结论**：4 份评审**无一给出"认可"**（R1 2.4/5、R2 2.0/5、R3 AI 三个 P0 项全部 <3/5、R4 工程骨架可但 4 处必须前置）。
 > **本文件性质**：**重新做的设计**，不是勘误表。v1.0/v1.1 中被判定不可用的设计**已从正文移除**，只在 §0.2 删除台账里留审计痕（那不是实现指引）。
-> **适用代码库**：`/root/DSH/应用/ssqyuce`（当前 `APP_VERSION=2.5.0` / `APP_BUILD=2026-10-V9`，schema_version=2，全量基线 **480 passed**）
+> **适用代码库**：`/root/DSH/应用/ssqyuce`（当前 `APP_VERSION=2.5.0` / `APP_BUILD=2026-10-V9`，schema_version=2，全量基线 **489 passed**（V10-00 落地 485 + A1/A2 回归测试 4））
 > **读者**：本项目程序员。本文是可直接排期实现的技术规格，**每一节都以"能写出测试"为完成标准**。
 > **前置阅读**：`docs/PROJECT_CONTEXT.md`、`docs/V4_ACCURACY_DIAGNOSIS.md`、`docs/V6_REGIME_DIAGNOSIS.md`、`docs/reviews/*.md`
 
@@ -44,7 +59,7 @@
 | 断言 | "覆盖优化无实测收益" | **降级为"未检出"** | 零功效对比说明（MDE ≈ +40.7%~+101.9%） | F7 / H3 / B7 |
 | 目标函数 | `p_any_blue` 作为优化目标 | **删除**（`blue_coverage_plan` 已闭式最优） | 降级为报告项 | R1 P0-5 |
 | 数据 | `v1.0` 文件作用域表（"01–05 互不触碰同一文件"） | **重写** | §2.1.7 真实表 | F3 / R1 P1-2 |
-| 数字 | "381 passed" | **更正 480** | §5.5 | F2 / F9 |
+| 数字 | "381 passed" | **更正 480 → 现 489** | §5.5 | F2 / F9 |
 | 数字 | "σ² = 1.2254 / σ = 1.107" | **更正 0.753099 / 0.867813** | §1.2 | F1 / H5 |
 | 命名 | 裸 `ev_ratio` | **禁用** | `ev_ratio_sixth` / `ev_ratio_full` + 奖金假设表 | F8 / H4 / B6 |
 
@@ -53,7 +68,7 @@
 | # | v1.0 原文 | v2.0 正确值 | 证据来源 |
 |---|---|---|---|
 | F1 | `σ²=1.2254, σ=1.107` | **`Var(K)=0.753099174 = 729/968`，`sd=0.867812868`** | 超几何解析 + pmf 数值 + 源码 `discovery.SD_HITS` 三路一致（R2 §3.4.1） |
-| F2 | `381 passed` | **`480 passed / 0 failed`**，耗时 **84.04s / 114.29s** 两次实测 | R4 P0-A 独立实跑（四份评审一致） |
+| F2 | `381 passed` | **`480 passed / 0 failed`**（评审当时）；V10-00 落地后 **485**，A1/A2 回归测试后 **489** | R4 P0-A 独立实跑 + Lead 复核 |
 | F3 | "01–05 可 4 路并行" | **真实并行度 2 路**（`api_app.py` 三方改、`engine.py` 03/04 改同一函数、02/05 争 migration #3） | R1 P1-2；§2.1.7 重写表 |
 | F4 | "SA 在常数目标上白跑 3000 次、浪费 CPU" | **前提不成立**（候选池 8~10 注，`engine.py:1444` 已提前返回，3000 trials 实测 0.034s）。真缺陷：**`:1492-1496` 强制改写蓝球 → 目标函数蓝球项零梯度**；**`:1409` 是死代码** | R1 P0-5 第 2/4 条 |
 | F5 | "Bonferroni 只按本批注册数校正"；规范形式**含截止期号** | **漏洞**：只批内校正时 `FWER=1−(1−α)^B`（N=91 拆 7 批 → 0.297，拆 91 批 → 0.991）；截止期进 `exp_id` = "换 20 个截止期 = 20 批 = 0.642" | R2 §3.1；由 R1/R3/R6 六条约束封死（§3.3） |
@@ -160,7 +175,7 @@ R2 用**每期重抽**的正确口径复算（200 次重复）：累计红命中
 |---|---|---|---|
 | **Gate-1** | 方案文本按 §二 F1–F10 全部更正 | 本文件 §0.3 的 10 行全部落到正文；尤其 F1 方差、F2 基线、F6 `var_ratio`、F8 EV 口径 | 已完成（本文件） |
 | **Gate-2** | V10-00a 契约冻结完成，`LOTT_PREDICT_CHANNELS` **未新增/已删除**，`resolve_channels()` 落地 | §2.1 全部小节的规格已实现并有测试；`grep -rn "LOTT_PREDICT_CHANNELS" lottery/ web/ tests/` 返回空 | V10-00a |
-| **Gate-3** | V10-00b 完成：`tests/conftest.py` 存在、19 处裸 `DB_PATH` 改造完、**全量 `pytest -q` 仍 ≥ 480 passed** | 见 §2.2 验收命令 | V10-00b |
+| **Gate-3** | V10-00b 完成：`tests/conftest.py` 存在、19 处裸 `DB_PATH` 改造完、**全量 `pytest -q` 仍 ≥ 485 passed**（V10-00 后基线） | 见 §2.2 验收命令 | V10-00b |
 | **Gate-4** | V10-00c 完成：备份 cron 已安装且**恢复演练通过**（从备份还原到临时目录能 `count_draws()==3515`） | §2.3 | V10-00c |
 | **Gate-5** | V10-00d 完成：迁移有批次事务、有自动备份、`schema_version` 对外可见 | §2.4 | V10-00d |
 | **Gate-6** | V6–V9 的 7 个提交已推送 GitHub，**远端与本地 SHA 一致** | `git log --oneline -1 origin/main` == 本地 HEAD 的父提交；GitHub API 看到 `APP_VERSION==2.5.0` | 开工前置（不属 V10 任务） |
@@ -200,12 +215,59 @@ def resolve_channels(*, force_production: bool = False) -> Dict:
     """
 ```
 
+**⚠️ `source` 层必须显式判定，不能读 `os.environ`（S2 二次评审 B3 修复）**
+
+`config.py:239` 与 `config.py:267` 会把 `methods_config.json` 的生效值**写回 `os.environ`**：
+
+```python
+# config.py（现状，勿改行为，但要用它的副作用）
+os.environ["LOTT_METHODS"] = METHODS_RAW      # :239 (_apply_runtime_methods 写入时)
+os.environ["LOTT_METHODS"] = METHODS_RAW      # :267 (_load_runtime_methods_config 启动时)
+```
+
+因此 `os.environ.get("LOTT_METHODS")` **永久无法区分**「来自 json」与「来自 .env」——
+`source` 字段若照 `.get` 实现，**三层会被压成两层，T1/T3 的断言写不诚实**。
+
+**正确判定方式（判据必须按这个顺序）**：
+
+```python
+def _resolve_layer() -> str:
+    """判定生效开关来自哪一层。**不读 os.environ 判断来源**，而是查文件 + 查环境变量是否存在。"""
+    if METHODS_CONFIG_FILE.exists():
+        try:
+            conf = json.loads(METHODS_CONFIG_FILE.read_text(encoding="utf-8"))
+            if conf.get("raw") or conf.get("mode"):
+                return "methods_config.json"      # 文件存在且有值 → 它就是生效层
+        except (ValueError, OSError):
+            pass
+    # 关键：用 `in os.environ` 而不是 `.get(...) is not None`
+    # —— .get 拿到的是被 config 写回的值，`in` 只能告诉"这个键有没有在 .env 里被设置过"，
+    #    但由于上面已排除文件层，此处 `in` 为真即说明来源是 .env（进程环境）
+    if "LOTT_METHODS" in os.environ or "LOTT_METHOD_MODE" in os.environ:
+        return ".env"
+    return "default"
+```
+
+并同步在 `config.py` 增加**只读来源标记**（不改任何行为）：
+
+```python
+METHODS_SOURCE: str = "default"      # "methods_config.json" | ".env" | "default"
+# 在 _load_runtime_methods_config() 里 json 命中时置 "methods_config.json"
+# 在模块级 METHODS_RAW 初始化后，若原 env 有值且 json 未命中则置 ".env"
+```
+
+> **实现者注意**：`METHODS_SOURCE` 必须是 **import 期一次性定值**，不得在 `resolve_channels()` 里现算后回写，
+> 否则会重演"写回 env 导致来源污染"的同一类错误。
+>
+> **T1/T3 的前提**：测试必须用**临时 `LOTT_HOME`**（`monkeypatch.setenv("LOTT_HOME", tmp_path)`）构造干净的
+> `methods_config.json`，**不能**假设"生产机器上没有设置页写过的配置"——在有配置的机器上 T1 会必红。
+
 **返回值（冻结 schema，只增不改）**：
 
 ```python
 {
   "spec_raw":  str,        # 生效的原始开关串
-  "source":    "methods_config.json" | ".env" | "default",   # 命中哪一层
+  "source":    "methods_config.json" | ".env" | "default",   # 命中哪一层；取自 config.METHODS_SOURCE（import 期定值），**不得现算**
   "mode":      "production" | "research",
   "families":  {"stat": bool, "blend": bool, "ml": bool, "uniform": bool, "llm": bool},
   "llm_output_mode": "off" | "only" | "mix",
@@ -227,7 +289,7 @@ def resolve_channels(*, force_production: bool = False) -> Dict:
 
 | 例 | 断言 |
 |---|---|
-| T1 | 什么都不设 → `source=="default"`、`families=={stat,blend,ml,uniform:True,llm:False}`、`llm_output_mode=="off"`、`llm_can_pick is False` |
+| T1 | 什么都不设（**临时 `LOTT_HOME`**，无 `methods_config.json`）→ `source=="default"`、`families=={stat:True, blend:**False**, ml:True, uniform:True, llm:False}`、`llm_output_mode=="off"`、`llm_can_pick is False`。<br>⚠️ **`blend` 必须断言为 False**：代码默认是 allow-list `"stat,ml,uniform"`，`blend` **不在**其中（`methods.py:23` 的 `FAMILIES` 里确实有 `blend` 族，但 allow-list 语义是"只启用列出的"，故为 False）。T1 若断言 `blend:True` 会与默认值互斥、必红。 |
 | T2 | `LOTT_METHODS=-llm` → `source==".env"`、`llm:False`、default 与显式设置结果一致（幂等） |
 | T3 | `methods_config.json` 写 `stat,ml` + `.env` 写 `stat` → `source=="methods_config.json"`，families 反映 json（优先级链） |
 | T4 | `LOTT_LLM_ONLY_OUTPUT=1` + `LOTT_METHODS=-llm` → `llm_output_mode=="off"` + 有 warning 日志 |
@@ -294,7 +356,7 @@ CREATE TABLE IF NOT EXISTS replay_results (
   mode          TEXT    NOT NULL DEFAULT 'replay',   -- replay | research_arm
   channels_fp   TEXT    NOT NULL DEFAULT '',         -- resolve_channels().fingerprint
   created_at    REAL    NOT NULL,
-  PRIMARY KEY (method, issue)
+  PRIMARY KEY (method, mode, issue)      -- 必须含 mode：replay 与 research_arm 不得互相覆盖
 );
 CREATE INDEX IF NOT EXISTS idx_replay_issue ON replay_results(issue);
 
@@ -316,7 +378,7 @@ CREATE INDEX IF NOT EXISTS idx_llm_audit_post ON llm_audit(post, ts);
 
 | 表 | 写入语句 | 理由 |
 |---|---|---|
-| `replay_results` | `INSERT OR REPLACE` | 回放可重跑；(method, issue) 天然幂等键。v1.0 无主键 → 每跑一次多一份数据（R1 P0-3-4） |
+| `replay_results` | `INSERT OR REPLACE` | 回放可重跑；（**`method`, `mode`, `issue`**）为主键。**必须含 `mode`**（S2 B4）：同一 method 会同时以 `mode="replay"`（离线回放）与 `mode="research_arm"`（LLM 研究对照臂）写入，若主键只有 `(method, issue)`，**两者会互相覆盖**（`INSERT OR REPLACE` 直接毁掉对方那行）。 |
 | `llm_audit` | `INSERT OR IGNORE` | **仅追加**；审计判定历史不可被覆盖。`audit_id` 用 sha1 保证重试幂等 |
 
 **forward-only 声明（硬约束）**：第 3 号迁移**只允许** `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX` / `ADD COLUMN`；**禁止** `DROP` / `RENAME` / 改列类型。原因：`db.get_conn()` 在首次连库时自动 `migrations.apply()`（`db.py:164-173`），容器启动前几秒就落地，**没有回滚路径**。
@@ -348,7 +410,7 @@ CREATE INDEX IF NOT EXISTS idx_llm_audit_post ON llm_audit(post, ts);
     "union_coverage": int,
     "var_T": float,                            # Var[Σ K_i]（可为 0，但非负）
     "n_sigma1_sq": float,                      # n · 0.753099174
-    "var_ratio": float,                        # var_T / n_sigma1_sq；**可为负**
+    "var_ratio": float,                        # var_T / n_sigma1_sq；恒 ≥ 0（下界 0）
     "p_ge4_hist": float,                       # P(≥1 注 ≥4 红)
     "p_ge5_hist": float,
     "p_ge4_method": "exact_enum" | "iid_approx",
@@ -402,13 +464,13 @@ CREATE INDEX IF NOT EXISTS idx_llm_audit_post ON llm_audit(post, ts);
 
 **由此得到的真实并行度**：见 §4.2（**2 路**，不是 4 路）。
 
-### 2.2 V10-00b　测试隔离 + 慢测试闸门（0.5 人日）
+### 2.2 V10-00b　测试隔离 + 慢测试闸门（0.5 人日）— ✅ **已落地**（commit 8955d37；基线 480 → 485）
 
 **背景（这是现状缺陷，不是新需求）**：
 
 - `tests/conftest.py` **不存在**，git 历史里**从未存在**；也没有 `pytest.ini` / `pyproject.toml` / `testpaths` / 随机顺序插件。隔离完全靠每个用例自觉 `monkeypatch`。
 - 仍有 **19 处裸赋值** `config.DB_PATH = tmp_path/...`（无 `monkeypatch`、无 `finally` 还原）：`grep -rn "config\.DB_PATH = " tests/*.py | grep -v "old = \|monkeypatch" | wc -l` → **19**。
-- **当前 480 全绿纯属字母序巧合**：泄漏源按字母序都排在 `test_v4_*` 之前，唯一受害用例是 `test_v4_honest_ui.py:239`。R4 复现：`pytest tests/test_m4_5_engineering.py tests/test_v4_honest_ui.py -q` → **1 failed (400 != 503)**；单独跑 → 17 passed。
+- **改造前 480 全绿纯属字母序巧合**：泄漏源按字母序都排在 `test_v4_*` 之前，唯一受害用例是 `test_v4_honest_ui.py:239`。R4 复现：`pytest tests/test_m4_5_engineering.py tests/test_v4_honest_ui.py -q` → **1 failed (400 != 503)**；单独跑 → 17 passed。
 - **对 V10 的直接威胁**：12 个新测试文件全命名 `test_v10_*`，**字母序排在 `test_v4_*` 之后**，正好落在泄漏源下游。R4 用探针复现：`test_m4_eval.py + test_v10_*` 同会话时 `count_draws()==0` 直接失败，而单独跑通过。**而 v1.0 给的验收命令恰好全是"单独跑单个文件"** → 会形成假绿灯，直到全量回归才炸。
 
 **规格**：
@@ -455,13 +517,13 @@ def pytest_configure(config_):
 
 ```bash
 cd /root/DSH/应用/ssqyuce
-.venv/bin/python -m pytest -q                       # ≥ 480 passed, 0 failed（这是真实闸门）
+.venv/bin/python -m pytest -q                       # ≥ 489 passed, 0 failed（这是真实闸门）
 .venv/bin/python -m pytest tests/test_m4_eval.py tests/test_v4_honest_ui.py -q     # 0 failed（现状 1 failed）
 .venv/bin/python -m pytest tests/test_m4_eval.py tests/test_v10_* -q               # 0 failed
 grep -rn "config\.DB_PATH = " tests/*.py | grep -v monkeypatch | wc -l             # 0
 ```
 
-### 2.3 V10-00c　备份安装 + 恢复演练（0.5 人日）
+### 2.3 V10-00c　备份安装 + 恢复演练（0.5 人日）— ✅ **已落地**（8955d37 + A3/A4 修复 5b7f36c）
 
 **背景（F10）**：`/etc/cron.d/ssq-backup`、`/backup/`、`crontab -l | grep ssq`、`data/*.bak*` **四路实测全部不存在** → 生产库**零备份**。而 `data/` 共 **271MB**（`ml_models/` 265MB + 5 个 runtime json + `raw/`），v1.0 的"`cp data/ssq.db`"只备份 1.4MB。
 
@@ -473,7 +535,7 @@ grep -rn "config\.DB_PATH = " tests/*.py | grep -v monkeypatch | wc -l          
 
 **验收**：`ls /backup/*.tar.gz` 有文件；恢复演练命令输出 3515；`/etc/cron.d/ssq-backup` 存在。
 
-### 2.4 V10-00d　迁移加固（0.5 人日，依赖 00c）
+### 2.4 V10-00d　迁移加固（0.5 人日，依赖 00c）— ✅ **已落地**（8955d37 + A1/A2 修复 5b7f36c）
 
 **规格**：
 
@@ -537,7 +599,7 @@ grep -rn "config\.DB_PATH = " tests/*.py | grep -v monkeypatch | wc -l          
 | `n` | `len(rows_of_method)` | 整数严格相等 |
 | `red_mean` | `round(sum(red_hits)/n, 4)` | `abs(got−exp) <= 0`（先按同一 `round(...,4)` 规整再比） |
 | `blue_rate` | `round(sum(blue_hit)/n, 4)` | 同上 |
-| `best_level` | 该 method 出现次数最多的奖级（并列取**最高**奖级；无中奖则 `"无"`） | 字符串严格相等（中文奖级名表见 `engine` 的 `LEVEL_NAMES`） |
+| `best_level` | 该 method 出现次数最多的奖级（并列取**最高**奖级；无中奖则 `"无"`） | 字符串严格相等（中文奖级名表**实际在 `lottery/evaluate.py:12` 的 `PRIZE_NAME`**，且一/二等奖带 `(≈*)` 后缀，比对时必须原样包含） |
 | `window` | 输入原样回填 | 三个整数严格相等 |
 
 复算统一走 `evaluate.aggregate()` 的口径（`evaluate.py:57-`），**不得**在 `ai_audit.py` 里另写一套均值逻辑（否则"金标准"第 2 个来源，判定失去意义）。
@@ -591,10 +653,11 @@ grep -rn "config\.DB_PATH = " tests/*.py | grep -v monkeypatch | wc -l          
 
 ```python
 # lottery/ai_audit.py
-def golden_ok(key, params) -> tuple[bool, list[str], str]:
+def golden_ok(key: str, params: dict) -> tuple[bool, list[str], str]:
+    """金标准：**单一确定性函数**，与 LLM 输出逐条比对。
     """金标准 = 三项既有校验的合取（与生产同源，禁止另写一套档位表）：
          a) llm_lab._params_ok(key, params)               (lottery/llm_lab.py:325-332)
-         b) evolution.discovery_params_ok(key, params)    (lottery/evolution.py:545)
+         b) evolution.discovery_params_ok({"key": key, "params": params})   # ← 注意签名：接收**单个 dict**，不是两个位置参数（lottery/evolution.py:545）
          c) key ∈ discovery.FAMILY_BY_KEY
       返回 (ok, offending_keys, reason_zh)。
       若 a/b 结论不一致 → 保守取 False，并返回 reason="gold_disagreement"（计入分歧计数器）。
@@ -662,6 +725,14 @@ def golden_ok(key, params) -> tuple[bool, list[str], str]:
 | `prereg_status` | str | `registered/running/passed/provisional/failed/invalidated` | 状态机单向（见 3.3.4） |
 | `prereg_ok` | bool | **唯一给 `usable` 读的字段** | `= (prereg_status=="passed") and (scope=="cumulative") and (p_cumulative < alpha) and (checked_at > prereg_at)` |
 | `checked_at` | float | 判定时刻 | 可 None |
+| `divergence` | bool | **两套结论是否分歧**（`p_batch<α` 而 `p_cumulative≥α`，或反之） | **R1 必需字段**（S2 B5 补漏：v2.0 只在 `prereg` 子块里被读、从无字段定义）；供前端警示"批内看起来有效、累计口径不成立" |
+| `registered_issue` | int | 注册时的期号（先于读结果的时间锚） | 与 `evaluate_after_issue` 独立；审计用 |
+| `prereg_reason` | str | 判定结论的可读原因 | 写入 `rule.prereg.reason`；前端展示"为什么不可用" |
+| `alpha` | float | 该次判定使用的显著性水平（默认 0.05） | 记录当时的 α，防"事后换 α" |
+
+> **字段总数：16 个**（v2.0 原表 12 个 + `divergence` / `registered_issue` / `prereg_reason` / `alpha`）。
+> S2 B5 指出原表**缺 `divergence`**——而 R1 约束要求写它，属于"约束引用了不存在的字段"，
+> 实现者会卡在这里（要么自造字段名，要么 R1 落空）。
 
 #### 3.3.3 R2 的六条约束（逐条落地，**缺任一条就不算前置注册**）
 
@@ -751,6 +822,105 @@ rules.append({...,
 
 > **重要**：U1–U5 必须 mock **数据来源**（`hypothesis.load_registry`），**不得 mock `build_snapshot` 内部**，否则测的是 mock 不是接线。
 
+#### 3.3.5b **写者规格：`evaluate_prereg()` 的签名、调用点与幂等语义**（S2 二次评审 B1 修复）
+
+> **本节是 B1 的修复核心。** v2.0 的致命缺口：全仓 `grep prereg` 只在**读侧**（`patterns_runtime`）出现，
+> **没有任何地方规定 `prereg_status` / `prereg_ok` 由谁计算、何时计算**。
+> 后果：U1–U5 全部 `monkeypatch` 了 `hypothesis.load_registry`（即直接伪造一个 `prereg_ok=True` 的记录），
+> 所以**即使实现者永远不会把 `prereg_ok` 置 True，U1–U5 与 P6 依然全绿** —— 这正是方案自己警告的"白做"。
+
+##### 签名（冻结，实现在 `lottery/hypothesis.py`）
+
+```python
+def evaluate_prereg(*, registry_path: Optional[Any] = None,
+                    issue: Optional[str] = None,
+                    alpha: float = 0.05,
+                    dry_run: bool = False) -> Dict:
+    """对**已到期**的注册实验做判定，回写 prereg_* 字段并落盘。
+
+    判定对象（三个条件同时满足才进入判定，否则原样跳过）：
+      1. ``prereg_status == "registered"``（或 frozen 期后的 "running"）
+      2. ``issue >= evaluate_after_issue``（到期）
+      3. 所在 ``batch_id`` 的注册数 >= ``MIN_BATCH``（R2，不足则并入下批，不判定）
+      4. ``issue >= frozen_until_issue``（R4 冻结期已过）
+
+    对每条进入判定的实验：
+      * 用 ``discovery.make_filter(family_key, params)`` + 严格 as-of 回放算效应与 p（**只用到 issue 为止的数据**）
+      * ``p_batch``      = Bonferroni(p, m=n_tested_batch)
+      * ``p_cumulative`` = Bonferroni(p, m=n_tested_cumulative)     # R1：累计口径是唯一判定依据
+      * 两套都 < alpha            → prereg_status="passed"
+      * p_batch < alpha 但 p_cumulative >= alpha → prereg_status="provisional"   # R6
+      * 都不显著                  → prereg_status="failed"
+      * 回放不可用/档位非法       → prereg_status="invalidated"
+      * ``checked_at = time.time()``；``prereg_ok = (prereg_status=="passed"
+            and scope=="cumulative" and p_cumulative < alpha and checked_at > prereg_at)``
+
+    幂等语义（**必须**）：
+      * 同一 ``exp_id`` 重复调用**不新增记录**，只更新 prereg_* 字段（以 ``exp_id`` 为键原地改写）；
+      * ``checked_at`` 已存在且 ``prereg_status in {"passed","failed","invalidated"}`` 且
+        ``issue < frozen_until_issue`` → **直接返回，不重判**（防 optional stopping，R4）；
+      * ``provisional`` **允许**在后续调用中重新判定（可能升级为 passed），其余终态不可回退。
+
+    dry_run=True：照算并返回判定结果，但**不写盘**（供 API 预览与测试）。
+
+    返回：``{checked, skipped, passed, provisional, failed, invalidated, updated_ids, dry_run}``
+    """
+```
+
+##### 调用点（**二选一，必须写死在代码里**）
+
+| 选项 | 落点 | 触发时机 | 结论 |
+|---|---|---|---|
+| **(a) 调度器**（推荐） | `api_app._scheduler_step()` 里，紧跟 `_evolution_step()` 之后 | 每期开奖→抓取→在线对照→**evaluate_prereg**→生成预测 | ✅ 采用 (a) |
+| (b) 快照刷新 | `patterns_runtime.refresh()` 开头 | 每次刷新快照前 | ❌ 不采用（刷新可由前端触发，频率不可控，会让"判定时刻"被用户操作影响） |
+
+**写死为 (a)**。理由：判定必须是**每期一次**的确定性动作，且必须在 `predict_next` 读快照**之前**完成，
+否则会出现"某期已到期但预测仍用旧 prereg_ok"的时序错误。
+
+```python
+# api_app._scheduler_step() 内，紧跟 _evolution_step() 之后（伪码，位置必须一致）
+try:
+    _prereg = hypothesis.evaluate_prereg(issue=issue)      # 到期实验判定 + 回写
+except Exception as exc:                                    # noqa: BLE001
+    log.warning("evaluate_prereg 失败（不影响当期预测）：%s", exc)
+```
+
+> **失败必须降级而非中断**：判定失败只影响 `usable` 条数，绝不阻断当期预测生成（沿用 V6 `_evolution_step` 的既有约定）。
+
+##### 库根累计计数器（R1 的存储位置）
+
+`data/hypotheses.json` 顶层新增（与 `version` / `hypotheses` 平级）：
+
+```json
+{
+  "version": "v10-1",
+  "updated_at": "...",
+  "counters": {
+    "n_tested_cumulative": 0,      // 只增不减；每次 evaluate_prereg 判定一条就 +1
+    "last_issue": null,
+    "batches": []                  // [{batch_id, size, issue, reason}]
+  },
+  "hypotheses": [...]
+}
+```
+
+**`n_tested_cumulative` 的更新规则（唯一入口）**：只在 `evaluate_prereg` 内、**对每条真实进入判定的实验** `+1`；
+`register_hypotheses` 注册时**不加**（注册 ≠ 检验过）。这是 R1 "唯一校正分母"的实现口径。
+
+##### **证明"没白做"的 E2E 测试（替换掉不可靠的 U1 单点证明）**
+
+U1–U5 保留（它们验证**读侧接线**正确），但**不足以**证明写者存在。必须新增两条：
+
+| # | 用例 | 断言 | 为什么它能挡住"白做" |
+|---|---|---|---|
+| **E1（E2E 正例）** | **不 monkeypatch 任何 `lottery/` 内部**：① 用真实 `register_hypotheses` 注册一条可回放的假说（构造一个真实存在弱信号的合成 draws 序列）② 真实调 `evaluate_prereg(issue=..., dry_run=False)` ③ 真实调 `patterns_runtime.build_snapshot(draws)` | ① `registry["hypotheses"][i]["prereg_ok"] is True` ② `snapshot["rules"][j]["usable"] is True` ③ `snapshot["counts"]["usable"] >= 1` | 只有**写者真的被调用并真的写盘**才会通过。任何人把 `evaluate_prereg` 实现成 pass、或忘了接到调用点，E1 必红 |
+| **E2（反向用例）** | 把 `_scheduler_step` 里的 `evaluate_prereg(...)` 调用**注释掉**（用 monkeypatch 替换为 `lambda **kw: {}`），其余完全不变 | E1 的同一条链路上 `usable is False`，且 `prereg_ok` 保持 `None` | 证明 E1 的绿**确实来自那个调用点**，而不是别处顺手写的 |
+| **E3（幂等）** | 连续调 `evaluate_prereg` 三次 | `n_tested_cumulative` **只 +1**（不是 +3）；记录条数不变；`checked_at` 不被刷新 | 防"每跑一次就重复计数"——那会让累计分母虚高、校正过度 |
+
+> **构造 E1 的合成信号**：不要依赖真实开奖（它没有信号）。给 `make_draws` 造一个
+> 「某号码被系统性加权」的序列（例如 1 号在 60% 的期里出现），保证 as-of 回放能稳定检出 → `p_cumulative < alpha`。
+> 这正是项目既有的「注入偏置必须检出」传统（见 `tests/test_v4_rigor.py:269`）。
+
 #### 3.3.6 与既有 `attempts` 的关系
 
 `register_hypotheses` 的 `attempts` 累加**保留**，并在 R1 口径下作为 `n_tested_cumulative` 的**下限**校验（`attempts ≥ 该 exp_id 的累计检验次数`），防止有人绕过台账直接判定。
@@ -798,7 +968,16 @@ var_ratio   = 1 + (n−1)·(11/54)·( Ā − 12/11 ),      Ā = Σ_{i<j} A_ij / 
 
 **两个必须写进规格的坑**：
 
-1. **`var_ratio` 可以为负**（n=10、`Ā=0` → **−3.000**）。它不是"方差比"，而是协方差结构的线性泛函。规格要求：返回体**同时**给出 `var_T`、`n_sigma1_sq`（两个正数）与 `var_ratio`（派生量），UI 显示前两个并注明 `Ā` 的中性值是 12/11。
+1. **`var_ratio` 恒 ≥ 0，下界恰为 0**（S2 二次评审 B2 更正）。
+   > **v2.0 原文错误**：曾写「`var_ratio` 可以为负（n=10、`Ā=0` → −3.000）」。三处错：
+   > ① 算术应为 −1.000（`1 + 9·(11/54)·(0−12/11) = 1−9·(2/9) = −1.000`）；
+   > ② `n=10、Ā=0` 需要 60 个**互不重复**的号，超过 33 个红球，**不可能构造**；
+   > ③ −3.000 实际对应 n=19。
+   >
+   > **真实下界**：穷举 n=2..33 的可行 `Ā`，`var_ratio` 最小为 **0.0**（n=11、每号恰出现 2 次时 `var_T=0`），**永不小于 0**。
+   > 因此**§3.4.7 原要求的"负值测试用例"不可构造，已删除**；改为断言下界 0。
+
+   `var_ratio` 仍是"协方差结构的线性泛函"，所以**不能**被解读成普通方差比。规格要求：返回体**同时**给出 `var_T`、`n_sigma1_sq`（两个正数）与 `var_ratio`（派生量，`0 ≤ r`），UI 显示前两个并注明 `Ā` 的中性值是 12/11。
 2. **`redundancy` 定义为 `Ā`**，且**必须注明中性值 = 12/11，不是 0**。
 3. **测试必须用构造性票组**（相同/不相交/固定重叠），**禁止**用随机票组比较两个票组的 `var_ratio` —— 随机 10 注的 `Ā` 抽样分布是 `1.0935 ± 0.1306`（5000 次，5–95% 分位 `[0.889,1.333]`），对应 `var_ratio = 1.005 ± 0.239`、`P[ratio>1]=0.447`，**差异会被噪声完全淹没**。
 
@@ -866,7 +1045,7 @@ holdout_split(n_periods, n_folds=2, block=1, seed=0)
 
 #### 3.4.7 前端「🧾 票单分布」卡（内容冻结，实现在 V10-10）
 
-必须显示：`n` / 并集覆盖 / `Ā`（注明中性值 12/11）/ `redundancy` / `var_T` / `nσ₁²` / `var_ratio`（带"可为负"的说明）/ `P(≥4红)` / `P(≥5红)` / `ev_ratio_sixth` / `ev_ratio_full` + `prize_assumption`。
+必须显示：`n` / 并集覆盖 / `Ā`（注明中性值 12/11）/ `redundancy` / `var_T` / `nσ₁²` / `var_ratio`（带"≥0、下界 0 在 n=11 每号 2 次时取到"的说明）/ `P(≥4红)` / `P(≥5红)` / `ev_ratio_sixth` / `ev_ratio_full` + `prize_assumption`。
 **必须同时出现**"改变分布不改变 EV"提示条（与卡片同一视口）。
 
 **验收**：`tests/test_v10_ticket_distribution.py` ≥ 20 例，其中必须有 3.4.2 的三个解析值断言（±1e-9）、`var_ratio` 为负的用例、`ev_ratio` 两值断言、换假设表变化断言、枚举 vs iid 的误差断言（`|exact − iid| / exact < 5%`，n=10 实测差 2.6%）。
@@ -896,7 +1075,7 @@ holdout_split(n_periods, n_folds=2, block=1, seed=0)
 
 **规格**（三处补全，R1 P0-3-4 / P2-3 / P1-5）：
 
-1. `replay_results` 表按 §2.1.5 冻结 DDL 建（**主键 `(method, issue)` + `INSERT OR REPLACE`**）。
+1. `replay_results` 表按 §2.1.5 冻结 DDL 建（**主键 `(method, mode, issue)`** + `INSERT OR REPLACE`；`mode ∈ {"replay","research_arm"}`）。
 2. 新文件 `lottery/replay.py`：`run_replay(draws, methods, channels=None, mode="replay")`。
    - **必须显式传通道**：`offline_backtest`（`evaluate.py:99-100`）当前调 `E.predict_next(history, persist=False)` 会**按 production 口径**算 → 加 `channels=` 形参，默认 `force_production=True` 的 `resolve_channels()`，并把 `channels_fp` 写入表。
    - 全部离线回放**必须**用 `draws[:t]`，阈值用**滚动窗口**（V6 已证明全样本阈值虚高 0.0308 红球）。
