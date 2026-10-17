@@ -719,11 +719,57 @@ function toggleFav(i) {
   localStorage.setItem("favTickets", JSON.stringify(favs));
 }
 
+// V10-04b：前端设置项默认值的版本号。后端默认值变了就必须升它，
+// 否则老浏览器里持久化的旧值会"吃掉"新默认值（R1 P1-6 / R3 P0-4 的坑）。
+const CFG_LLM_VERSION = "v10";
+
 function recalcPredictConfig() {
   localStorage.setItem("cfgTickets", $("#cfgTickets")?.value || "10");
   localStorage.setItem("cfgLlm", $("#cfgLlm")?.checked ? "1" : "0");
+  // 用户显式选择后即视为"已迁移"，不再被默认值回填覆盖
+  try { localStorage.setItem("cfgLlmVersion", CFG_LLM_VERSION); } catch(e) {}
 }
+
+/**
+ * 一次性默认值迁移（V10-04b）。
+ * 背景：V10 起后端默认 ``llm_output_mode=off``（不再让 LLM 出号），但旧版本把
+ * ``localStorage.cfgLlm`` 持久化成 "1"，页面一开就勾着「启用 LLM 推理」，
+ * 于是 ``/api/predict?use_llm=true`` → ``llm_required=True`` → 503 或仍旧只出 LLM 注。
+ * 做法：版本不符即删掉旧值 + 写新版本，让后端的 channels 回填真正生效。
+ */
+function migrateCfgDefaults() {
+  let ver = null;
+  try { ver = localStorage.getItem("cfgLlmVersion"); } catch(e) { return; }
+  if (ver === CFG_LLM_VERSION) return;
+  try {
+    localStorage.removeItem("cfgLlm");
+    localStorage.setItem("cfgLlmVersion", CFG_LLM_VERSION);
+  } catch(e) {}
+}
+
+/**
+ * 用后端通道快照回填「启用 LLM 推理」的默认勾选状态。
+ * 判据唯一来自 ``/api/info`` 的 ``channels.llm_can_pick``（= resolve_channels()），
+ * 前端不写死、也不自己推。用户显式选过（localStorage 有值）则尊重用户选择。
+ */
+async function applyChannelDefaults(info) {
+  const box = $("#cfgLlm");
+  if (!box) return;
+  let stored = null;
+  try { stored = localStorage.getItem("cfgLlm"); } catch(e) {}
+  if (stored === "0" || stored === "1") return;      // 用户显式选择优先
+  let ch = (info && info.channels) || null;
+  if (!ch) {
+    try { const r = await api("/api/info"); ch = (r && r.channels) || null; } catch(e) { ch = null; }
+  }
+  if (ch && typeof ch.llm_can_pick === "boolean") {
+    box.checked = ch.llm_can_pick;
+  }
+  // 取不到快照时保持 HTML 默认（未勾选）= 后端默认 off，绝不静默打开 LLM
+}
+
 (function initConfig() {
+  migrateCfgDefaults();
   const t = localStorage.getItem("cfgTickets");
   const l = localStorage.getItem("cfgLlm");
   if (t && $("#cfgTickets")) $("#cfgTickets").value = t;
@@ -1573,6 +1619,8 @@ async function runOnline() {
   try {
     const r = await api("/api/eval/online", {method:"POST"});
     renderOnline(r.rows || []);
+    if (r.by_method) renderMethodBreakdown(r.by_method);
+    else await loadMethodBreakdown();
     await loadCumulativeEval();
     toast("已对照 " + (r.newly_checked || 0) + " 期");
   } catch(e) { toast("在线对照失败: " + e.message); }
@@ -1796,15 +1844,66 @@ function renderOnline(rows) {
   if (!area) return;
   rows = rows || [];
   const view = rows.slice(-30).reverse();
+  // V10-04b：eval_results 是**组合口径**（该期所有方法所有注），且命中数已保留浮点
+  // （旧实现 int() 截断把 1.5 抹成 1）。方法对比请看上方"方法战绩（分列）"。
   area.innerHTML = view.length
-    ? '<div class="note" style="margin-bottom:6px">在线对照记录（最近 ' + view.length + " 期，新→旧）</div>" +
+    ? '<div class="note" style="margin-bottom:6px">在线对照记录（组合口径：该期全部方法所有注；最近 ' +
+      view.length + " 期，新→旧）</div>" +
       '<div class="scroll"><table>' +
-      '<thead><tr><th>期号</th><th>红球命中(均值)</th><th>蓝球命中</th><th>奖金</th><th>注数</th></tr></thead>' +
-      '<tbody>' + view.map(r => "<tr><td class='mono'>" + r.issue + "</td><td>" + r.red_hits +
-        "</td><td>" + (r.blue_hit ? "✓" : "—") + "</td><td>¥" + Number(r.reward || 0).toFixed(0) +
+      '<thead><tr><th>期号</th><th>红球命中(均值)</th><th>蓝球命中率</th><th>奖金</th><th>注数</th></tr></thead>' +
+      '<tbody>' + view.map(r => "<tr><td class='mono'>" + r.issue + "</td><td>" + fmt(r.red_hits, 2) +
+        "</td><td>" + (r.blue_hit == null ? "-" : (Number(r.blue_hit) * 100).toFixed(1) + "%") +
+        "</td><td>¥" + Number(r.reward || 0).toFixed(0) +
         "</td><td>" + (r.ticket_count ?? "-") + "</td></tr>").join("") +
       '</tbody></table></div>'
     : '<div class="note">暂无在线对照记录（开奖后可点「在线对照」）。</div>';
+}
+
+// V10-04b（R1 P1-4）：方法战绩**按族分列**渲染。
+// 各族注数与口径不同，绝不显示"合计/加权平均"——那正是此前把 LLM 差表现
+// 平均掉的根因。数据源：/api/eval/by-method（= evaluate.method_breakdown）。
+// 族名走后端 family_names（evaluate.FAMILY_NAME_ZH 的唯一出处），前端只留兜底顺序
+const METHOD_FAMILY_FALLBACK = {llm:"LLM 推理", stat:"统计基线", blend:"融合 blend",
+  ml:"ML 模型", uniform:"均匀随机", other:"其它"};
+const METHOD_FAMILY_ORDER = ["llm", "stat", "blend", "ml", "uniform", "other"];
+
+// 0 是有效值（0% 命中率与"缺数据"必须区分），故不复用 pct()
+const _rate = (v) => (v == null || isNaN(Number(v)) ? "-" : (Number(v) * 100).toFixed(1) + "%");
+
+function renderMethodBreakdown(report) {
+  const area = $("#methodBreakdownArea");
+  if (!area) return;
+  const fams = (report && report.families) || {};
+  const keys = METHOD_FAMILY_ORDER.filter(k => fams[k]);
+  if (!keys.length) {
+    area.innerHTML = '<div class="note">方法战绩（分列）：暂无 eval_details 数据（开奖并对照后生成）。</div>';
+    return;
+  }
+  area.innerHTML =
+    '<div class="note" style="margin-bottom:6px">方法战绩（按族分列，共 ' +
+      (report.n_issues || 0) + " 期 / " + (report.n_tickets || 0) +
+      ' 注）——各族各算各的，<b>不得相加或取加权平均</b></div>' +
+    '<div class="scroll"><table>' +
+    '<thead><tr><th>通道</th><th>期数</th><th>注数</th><th>红球平均命中</th>' +
+    '<th>蓝球命中率</th><th>≥五等奖率</th><th>ROI</th></tr></thead><tbody>' +
+    keys.map(k => {
+      const f = fams[k] || {};
+      const famName = ((report && report.family_names) || {})[k] || METHOD_FAMILY_FALLBACK[k] || k;
+      return "<tr><td>" + escHtml(famName) +
+        "</td><td>" + (f.n_issues ?? "-") + "</td><td>" + (f.n_tickets ?? "-") +
+        "</td><td>" + fmt(f.red_hits_mean, 2) + "</td><td>" + _rate(f.blue_hit_rate) +
+        "</td><td>" + _rate(f.prize_rate_ge5) + "</td><td>" + _rate(f.roi) + "</td></tr>";
+    }).join("") +
+    "</tbody></table></div>" +
+    '<div class="note">' + escHtml((report && report.note) || "") + "</div>";
+}
+
+async function loadMethodBreakdown() {
+  try { renderMethodBreakdown(await api("/api/eval/by-method?limit_issues=200")); }
+  catch(e) {
+    const area = $("#methodBreakdownArea");
+    if (area) area.innerHTML = '<div class="note">方法战绩加载失败：' + escHtml(e.message) + "</div>";
+  }
 }
 
 // ==================== LLM 离线评估（M3.1） ====================
@@ -3149,6 +3248,7 @@ async function loadAll() {
     try {
       const ev = await api("/api/eval");
       renderOnline(ev);
+      loadMethodBreakdown();   // V10-04b：方法战绩按族分列
       const cumulative = await api("/api/eval/cumulative?limit=120");
       renderCumulativeEval(cumulative);
       renderTrackRecord(cumulative);   // U5/U9 历史战绩
@@ -3172,6 +3272,8 @@ async function loadAll() {
       if (info && Number(info.method_min_issues) > 0) {
         METHOD_MIN_ISSUES = Number(info.method_min_issues);
       }
+      // V10-04b：用后端 channels.llm_can_pick 回填「启用 LLM」默认值
+      await applyChannelDefaults(info);
       const cum = await api("/api/eval/cumulative?limit=120");
       renderTrackRecord(cum);   // 门槛更新后重绘，确保展示与后端一致
     } catch(e) {}

@@ -23,9 +23,17 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "METHODS_RAW", "")
     monkeypatch.setattr(config, "METHOD_MODE", "production")
     monkeypatch.setattr(config, "METHODS_SPEC", {"mode": "all", "tokens": set()})
+    # V10-04b：set_methods() 直接写 os.environ（不经 monkeypatch），必须显式还原，
+    # 否则 LOTT_METHODS / LOTT_METHOD_MODE 会永久泄漏给后续用例的 resolve_channels()。
+    monkeypatch.setenv("LOTT_METHODS", "")
+    monkeypatch.setenv("LOTT_METHOD_MODE", "production")
     db.close()
     from lottery import api_app
-    return TestClient(api_app.app)
+    client = TestClient(api_app.app)
+    yield client
+    # teardown 顺序：先把 env 拉回用例入口状态，再让 monkeypatch 统一 undo
+    os.environ["LOTT_METHODS"] = ""
+    os.environ["LOTT_METHOD_MODE"] = "production"
 
 
 def test_recommendations_endpoint(client):

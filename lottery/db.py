@@ -643,14 +643,45 @@ def method_recommendations(limit: Optional[int] = None, min_sample: Optional[int
             "note": "paired sign-test 仅作运营筛查；样本不足不自动决策，系统不会自动修改方法开关。"}
 
 
-def save_eval(issue: str, red_hits: int, blue_hit: int, reward: float, ticket_count: int):
+def save_eval(issue: str, red_hits: float, blue_hit: float, reward: float,
+              ticket_count: int):
+    """写入**组合级（portfolio）**逐期对照行。
+
+    V10-04b（R1 P1-4）：``red_hits`` / ``blue_hit`` 现在保留浮点均值，
+    不再 ``int()`` 截断（旧写法把 1.5 抹成 1，系统性低估命中）。
+    ⚠️ 本表**不含 method 列**，一行 = 该期全部方法所有注的合计，
+    因此它**不能**用于方法对比；方法战绩一律按族分列汇总
+    （``evaluate.method_breakdown()`` / ``eval_details``）。
+    """
     conn = get_conn()
     conn.execute(
         """INSERT OR REPLACE INTO eval_results (issue,red_hits,blue_hit,reward,ticket_count,created_at)
            VALUES (?,?,?,?,?,?)""",
-        (issue, red_hits, int(blue_hit), reward, ticket_count, time.time()),
+        (issue, float(red_hits), float(blue_hit), reward, ticket_count, time.time()),
     )
     conn.commit()
+
+
+def load_eval_details(limit_issues: Optional[int] = None) -> List[Dict]:
+    """读取逐注方法明细（``eval_details``，主键 ``(issue, method, seq)``）。
+
+    ``limit_issues`` 只取最近 N 期（按数值期号倒序再正序返回），
+    避免全表扫描拖慢报表。返回按 ``(issue, method, seq)`` 升序。
+    """
+    conn = get_conn()
+    if limit_issues:
+        picked = [r["issue"] for r in conn.execute(
+            "SELECT DISTINCT issue FROM eval_details "
+            "ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?", (int(limit_issues),)
+        ).fetchall()]
+        if not picked:
+            return []
+        marks = ",".join("?" for _ in picked)
+        sql = (f"SELECT * FROM eval_details WHERE issue IN ({marks}) "
+               "ORDER BY issue, method, seq")
+        return [dict(r) for r in conn.execute(sql, picked).fetchall()]
+    return [dict(r) for r in conn.execute(
+        "SELECT * FROM eval_details ORDER BY issue, method, seq").fetchall()]
 
 
 def load_eval() -> List[Dict]:

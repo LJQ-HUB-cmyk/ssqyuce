@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>双色球智能预测分析系统</title>
-<link rel="stylesheet" href="/static/style.css?v=20261018.3">
+<link rel="stylesheet" href="/static/style.css?v=20261018.4">
 <!-- ECharts CDN + 本地 fallback -->
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"
   onerror="this.src='/static/vendor/echarts.min.js?v=20260817.7'"></script>
@@ -35,7 +35,10 @@
       </label>
       <label class="switch-row" title="关闭后预测只使用统计模型">
         <span>启用 LLM 推理</span>
-        <span class="switch"><input type="checkbox" id="cfgLlm" checked onchange="recalcPredictConfig()"><span class="slider"></span></span>
+        <!-- V10-04b：**不得**硬编码 checked。默认勾选状态由后端
+             /api/info 的 channels.llm_can_pick 回填（app.js applyChannelDefaults），
+             否则前端会"吃掉"后端 V10 起的新默认值（llm_output_mode=off）。 -->
+        <span class="switch"><input type="checkbox" id="cfgLlm" onchange="recalcPredictConfig()"><span class="slider"></span></span>
       </label>
       <div class="track-note">更多设置见「更多」→ 系统 → 设置</div>
     </div>
@@ -284,6 +287,8 @@
               <span class="hint-inline">离线评估 = 最近期数 walk-forward 回测（约 30~120 秒）；在线对照 = 用已保存预测对照实际开奖</span>
             </div>
             <div id="evalArea"><div class="note">点击「离线评估」生成系统 vs 随机基线对比结果。</div></div>
+            <!-- V10-04b：方法战绩按族分列（llm / stat / blend / ml / uniform），不得相加 -->
+            <div id="methodBreakdownArea" style="margin-top:12px"></div>
             <div id="onlineEvalArea" style="margin-top:12px"></div>
           </div>
 
@@ -583,6 +588,6 @@
 </div>
 
 <div id="toast"></div>
-<script src="/static/app.js?v=20261018.3"></script>
+<script src="/static/app.js?v=20261018.4"></script>
 </body>
 </html>

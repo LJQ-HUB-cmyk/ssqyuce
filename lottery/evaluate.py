@@ -124,8 +124,105 @@ def offline_backtest(draws: List[Dict], issues: int = 120,
     }
 
 
+# ---------- V10-04b：报表口径分列（R1 P1-4） ----------
+# 方法族口径与 methods.FAMILIES 对齐；未知族一律归 "other"，**绝不**并进 stat/ml。
+METHOD_FAMILIES = ("llm", "stat", "blend", "ml", "uniform", "other")
+
+# 各族的人话名称（报表/前端直接用，避免前后端各写一份）
+FAMILY_NAME_ZH = {
+    "llm": "LLM 推理通道",
+    "stat": "统计基线",
+    "blend": "融合（blend）",
+    "ml": "ML 模型",
+    "uniform": "均匀随机对照",
+    "other": "其它/未标注",
+}
+
+
+def method_family(method: object) -> str:
+    """取方法族：``llm:minimax-m3`` → ``llm``，``ml`` → ``ml``，``stat:freq`` → ``stat``。"""
+    fam = str(method or "").strip().lower().split(":", 1)[0]
+    return fam if fam in METHOD_FAMILIES else "other"
+
+
+def _family_block(rows: List[Dict]) -> Dict:
+    """单族汇总（组内各 method 的注级合并）。返回体不含任何跨族字段。"""
+    n_tickets = len(rows)
+    reds = [float(r["red_hits"]) for r in rows]
+    blues = [float(r["blue_hit"]) for r in rows]
+    levels = [int(r["prize_level"] or 0) for r in rows]
+    rewards = [float(r["reward"] or 0.0) for r in rows]
+    costs = [float(r["ticket_cost"] or 2.0) for r in rows]
+    cost_total = float(sum(costs))
+    reward_total = float(sum(rewards))
+    return {
+        "n_issues": len({r["issue"] for r in rows}),
+        "n_tickets": n_tickets,
+        "methods": sorted({str(r["method"]) for r in rows}),
+        "red_hits_mean": float(np.mean(reds)) if reds else None,
+        "blue_hit_rate": float(np.mean(blues)) if blues else None,
+        "prize_rate_ge5": float(np.mean([1.0 if lv >= 5 else 0.0 for lv in levels])) if levels else None,
+        "best_level": max(levels) if levels else 0,
+        "reward_total": reward_total,
+        "cost_total": cost_total,
+        "roi": ((reward_total - cost_total) / cost_total) if cost_total else None,
+    }
+
+
+def method_breakdown(limit_issues: Optional[int] = None) -> Dict:
+    """按方法族**分列**汇总方法战绩（V10-04b / R1 P1-4：不得相加）。
+
+    为什么必须分列、且**不能**给"全族合计"：
+      - ``eval_results`` 一行是"该期所有方法所有注"的混合均值（旧实现还对整数
+        取均值再 ``int()`` 截断，把 1.5 抹成 1），用它做方法对比会把 LLM 的
+        差表现与统计基线平均掉 —— 这是"LLM 到底行不行"永远测不出来的根因；
+      - ``eval_details`` 本就按 ``(issue, method, seq)`` 逐注存，天然可分列。
+
+    因此本函数返回 ``families``（llm / stat / blend / ml / uniform / other 各自一块），
+    **不返回** ``all`` / ``total`` 之类跨族字段：调用方无法"顺手相加"，
+    不同注数、不同方法族的命中率没有可加的公共分母。
+    """
+    rows = db.load_eval_details(limit_issues=limit_issues)
+    by_family: Dict[str, List[Dict]] = {}
+    for r in rows:
+        by_family.setdefault(method_family(r.get("method")), []).append(r)
+    families = {fam: _family_block(by_family[fam])
+                for fam in METHOD_FAMILIES if fam in by_family}
+    # 逐 method 明细（族内细分：如 llm:minimax-m3 vs llm:glm-5.3）
+    by_method: Dict[str, List[Dict]] = {}
+    for r in rows:
+        by_method.setdefault(str(r["method"]), []).append(r)
+    methods = []
+    for method in sorted(by_method):
+        block = _family_block(by_method[method])
+        block["method"] = method
+        block["family"] = method_family(method)
+        methods.append(block)
+    return {
+        "n_issues": len({r["issue"] for r in rows}),
+        "n_tickets": len(rows),
+        "families": families,
+        "family_names": {fam: FAMILY_NAME_ZH[fam] for fam in families},
+        "methods": methods,
+        "note": ("方法战绩按族分列：llm / stat / blend / ml / uniform 各算各的，"
+                 "**不得相加或取加权平均**（各族注数与口径不同，混合后会掩盖真实差异）。"
+                 "本报表只描述历史命中，不构成中奖预测或投资建议。"),
+    }
+
+
 def online_check() -> Dict:
-    """把已保存的预测与对应实际开奖对照，写入 eval_results。"""
+    """把已保存的预测与对应实际开奖对照，写入 eval_results（组合口径）与
+    eval_details（方法口径），并按方法族分列汇总。
+
+    V10-04b（R1 P1-4）两处口径修正：
+      1. ``eval_results`` 的均值**不再 int() 截断**，保留浮点（旧写法把 1.5 抹成 1）；
+      2. ``summary`` 不再输出"跨方法混合的 avg_red_hits / blue_hit_rate"，
+         改为 ``by_family`` 分列（+ 组合级的金额字段，金额是同一期内不同方法
+         共同产生的，不属于方法比较）。
+
+    ⚠️ ``eval_results`` 一行就是该期所有方法所有注的合计，因此它只作
+    「组合级/在线对照表」使用，**不得**用于方法对比（见 ``method_breakdown()``）。
+    """
     draws = db.load_draws()
     draw_by_issue = {d["issue"]: d for d in draws}
     issues = db.recent_prediction_issues(200)
@@ -143,25 +240,28 @@ def online_check() -> Dict:
         for t in preds:
             by_method.setdefault(str(t.get("method", "mixed")), []).append(t)
         all_res = tickets_result(preds, draw_by_issue[issue])
-        db.save_eval(issue, int(np.mean(all_res["red_hits"])), int(np.mean(all_res["blue_hits"])),
+        # 组合口径：保留浮点均值（不再 int() 截断），仅供在线对照表展示
+        db.save_eval(issue, round(float(np.mean(all_res["red_hits"])), 4),
+                     round(float(np.mean(all_res["blue_hits"])), 4),
                      all_res["reward"], len(preds))
         for method, method_tickets in by_method.items():
             db.save_eval_details(issue, method, method_tickets, draw_by_issue[issue])
         checked += 1
     rows = db.load_eval()
+    summary: Dict = {"checked": len(rows)}
     if rows:
-        reds = [r["red_hits"] for r in rows]
-        blues = [r["blue_hit"] for r in rows]
-        rewards = [r["reward"] for r in rows]
-        cost = sum(r["ticket_count"] for r in rows) * 2.0
-        summary = {
-            "checked": len(rows),
-            "avg_red_hits": float(np.mean(reds)),
-            "blue_hit_rate": float(np.mean(blues)),
+        rewards = [float(r["reward"] or 0.0) for r in rows]
+        cost = sum(int(r["ticket_count"] or 0) for r in rows) * 2.0
+        breakdown = method_breakdown()
+        # 金额/ROI 是同一期内的组合合计（非方法比较），与分列口径并列给出
+        summary.update({
+            "scope": "portfolio",          # 明确这是组合口径，不是方法口径
+            "tickets": sum(int(r["ticket_count"] or 0) for r in rows),
             "reward_total": float(np.sum(rewards)),
             "cost_total": cost,
             "roi": (float(np.sum(rewards)) - cost) / max(1.0, cost),
-        }
-    else:
-        summary = {"checked": 0}
+            "by_family": breakdown["families"],
+            "mixed_note": ("avg_red_hits / blue_hit_rate 已移除：混算 llm 与 stat/ml "
+                           "的命中率会把差异平均掉。方法战绩请看 by_family 分列。"),
+        })
     return {"newly_checked": checked, "summary": summary, "rows": rows[-30:]}

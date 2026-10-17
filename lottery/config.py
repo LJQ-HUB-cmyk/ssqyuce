@@ -280,6 +280,9 @@ def set_methods(raw: Optional[str] = None, mode: Optional[str] = None) -> Dict:
     METHODS_SPEC = _methods.implement_spec(METHODS_RAW)
     if not _save_methods_config():
         raise OSError("方法配置持久化失败")
+    # V10-04b：出号通道快照必须同步刷新，否则 engine 读到的还是启动时的旧口径
+    # （settings 页刚关掉 llm，引擎却仍按 llm_can_pick=True 出号）。
+    refresh_channels()
     print(f"[config] 方法开关已更新: mode={METHOD_MODE}, raw='{METHODS_RAW}'")
     return methods_status()
 

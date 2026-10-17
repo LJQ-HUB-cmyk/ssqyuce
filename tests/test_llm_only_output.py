@@ -1,4 +1,10 @@
-"""LLM 实际生成注数模式（LOTT_LLM_ONLY_OUTPUT，默认 1）。
+"""LLM 实际生成注数模式（``llm_output_mode == "only"``，V10 起默认 off）。
+
+V10-04b 起判据**不再是** ``config.LLM_ONLY_OUTPUT``，而是
+``methods.resolve_channels()`` 的 ``llm_can_pick`` + ``llm_output_mode``
+（快照落在 ``config.CHANNELS``）。本文件保留为 only 模式的语义回归，
+``_channels()`` 负责按需构造通道快照；其余模式（off/mix/拒绝列表）见
+``tests/test_v10_channel_wiring.py``。
 
 背景：引擎原本把 LLM 候选与统计/ML 候选混在一起，再按“蓝球覆盖优先”补齐到
 N_TICKETS。当 1 轮 LLM 只产出 4 注时，用户会看到 10 注，但只有 4 注真正来自
@@ -51,8 +57,30 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "METHODS_RAW", "")
     monkeypatch.setattr(config, "METHOD_MODE", "production")
     monkeypatch.setattr(config, "METHODS_SPEC", {"mode": "all", "tokens": set()})
+    # V10-04b：出号通道判据改由 resolve_channels() 快照给出（默认 production/off）
+    monkeypatch.setattr(config, "CHANNELS", _channels("off", llm_can_pick=False))
     db.close()
     return config
+
+
+def _channels(llm_output_mode: str, *, llm_can_pick: bool) -> dict:
+    """构造一份与 ``methods.resolve_channels()`` 同 schema 的通道快照。"""
+    return {
+        "spec_raw": "stat,ml,uniform,llm",
+        "source": "default",
+        "mode": "production",
+        "families": {"stat": True, "blend": False, "llm": True, "ml": True, "uniform": True},
+        "llm_output_mode": llm_output_mode,
+        "llm_can_pick": llm_can_pick,
+        "research_arm": {"stat": True, "llm_probe": False},
+        "fingerprint": "testfingerprint",
+    }
+
+
+def _set_mode(config, monkeypatch, mode: str) -> None:
+    """把配置快照切到指定出号模式（only / mix / off）。"""
+    monkeypatch.setattr(config, "CHANNELS",
+                        _channels(mode, llm_can_pick=mode in ("only", "mix")))
 
 
 def test_llm_only_returns_actual_count_without_padding(env, monkeypatch):
@@ -63,7 +91,7 @@ def test_llm_only_returns_actual_count_without_padding(env, monkeypatch):
     assert len(produced) == 4
 
     monkeypatch.setattr(E, "llm_tickets", lambda *a, **k: [dict(t) for t in produced])
-    monkeypatch.setattr(env, "LLM_ONLY_OUTPUT", True)
+    _set_mode(env, monkeypatch, "only")
 
     res = E.predict_next(draws, use_llm=True, use_ml=False, n_tickets=10,
                          persist=False, rng=random.Random(1))
@@ -83,7 +111,7 @@ def test_llm_only_no_duplicate_tickets(env, monkeypatch):
     draws = _mk_draws(400)
     produced = [_llm_ticket(i * 3 + 1, b) for i, b in enumerate([3, 5, 8])]
     monkeypatch.setattr(E, "llm_tickets", lambda *a, **k: [dict(t) for t in produced])
-    monkeypatch.setattr(env, "LLM_ONLY_OUTPUT", True)
+    _set_mode(env, monkeypatch, "only")
 
     res = E.predict_next(draws, use_llm=True, use_ml=False, n_tickets=10,
                          persist=False, rng=random.Random(2))
@@ -98,7 +126,7 @@ def test_llm_only_respects_n_tickets_cap(env, monkeypatch):
     draws = _mk_draws(400)
     produced = [_llm_ticket(i * 2 + 1, (i % 15) + 1) for i in range(6)]
     monkeypatch.setattr(E, "llm_tickets", lambda *a, **k: [dict(t) for t in produced])
-    monkeypatch.setattr(env, "LLM_ONLY_OUTPUT", True)
+    _set_mode(env, monkeypatch, "only")
 
     res = E.predict_next(draws, use_llm=True, use_ml=False, n_tickets=3,
                          persist=False, rng=random.Random(3))
@@ -111,7 +139,7 @@ def test_pure_stat_mode_still_fills_to_n_tickets(env, monkeypatch):
     """LLM 未参与时，行为不变：统计候选池补齐到 n_tickets。"""
     from lottery import engine as E
     draws = _mk_draws(400)
-    monkeypatch.setattr(env, "LLM_ONLY_OUTPUT", True)
+    _set_mode(env, monkeypatch, "only")
 
     res = E.predict_next(draws, use_llm=False, use_ml=False, n_tickets=10,
                          persist=False, rng=random.Random(4))
@@ -122,12 +150,12 @@ def test_pure_stat_mode_still_fills_to_n_tickets(env, monkeypatch):
 
 
 def test_llm_only_disabled_restores_padding(env, monkeypatch):
-    """LOTT_LLM_ONLY_OUTPUT=0 时恢复旧行为：混选补齐到 n_tickets。"""
+    """``llm_output_mode == "mix"`` 时恢复旧行为：混选补齐到 n_tickets。"""
     from lottery import engine as E
     draws = _mk_draws(400)
     produced = [_llm_ticket(i * 3 + 1, b) for i, b in enumerate([1, 9, 10, 2])]
     monkeypatch.setattr(E, "llm_tickets", lambda *a, **k: [dict(t) for t in produced])
-    monkeypatch.setattr(env, "LLM_ONLY_OUTPUT", False)
+    _set_mode(env, monkeypatch, "mix")
 
     res = E.predict_next(draws, use_llm=True, use_ml=False, n_tickets=10,
                          persist=False, rng=random.Random(5))
@@ -143,7 +171,7 @@ def test_coverage_mode_unaffected_by_llm_only(env, monkeypatch):
     draws = _mk_draws(400)
     produced = [_llm_ticket(i * 3 + 1, b) for i, b in enumerate([1, 9, 10, 2])]
     monkeypatch.setattr(E, "llm_tickets", lambda *a, **k: [dict(t) for t in produced])
-    monkeypatch.setattr(env, "LLM_ONLY_OUTPUT", True)
+    _set_mode(env, monkeypatch, "only")
 
     res = E.predict_next(draws, use_llm=True, use_ml=False, n_tickets=8,
                          persist=False, rng=random.Random(6), coverage=True)

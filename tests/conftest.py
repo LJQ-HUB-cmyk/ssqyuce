@@ -49,6 +49,11 @@ _ISOLATED_CONFIG_ATTRS = (
     "METHODS_CONFIG_FILE",
     "ADAPTIVE_STATE_FILE",
     "LLM_CONFIG_FILE",
+    # V10-04b：CHANNELS 是 resolve_channels() 的派生快照，config.set_methods() 会刷新它。
+    # 不隔离的话，某个用例调过 set_methods 之后，后续用例看到的 CHANNELS 就与
+    # 「当前 env + methods_config.json」不一致（test_v10_channels 的
+    # "快照 == 现算" 断言会随机红）。
+    "CHANNELS",
 )
 
 _MISSING = object()

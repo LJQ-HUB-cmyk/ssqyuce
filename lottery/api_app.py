@@ -104,6 +104,10 @@ def app_info():
         "adaptive": METH.adaptive_status(),
         # V4：前端样本量门槛的唯一出处（避免前后端各写一个数）
         "method_min_issues": config.METHOD_RECOMMENDATION_MIN_ISSUES,
+        # V10-04b：本期出号通道（resolve_channels() 是唯一判据）。前端用它回填
+        # 「启用 LLM」复选框的默认值 —— HTML 里**不再**硬编码 checked，
+        # 否则前端会吃掉后端默认 off。这里用无副作用的现算，不改全局快照。
+        "channels": METH.resolve_channels(),
         "honesty_boundary": "双色球为独立随机事件，本系统不承诺中奖率",
     }
 
@@ -384,6 +388,11 @@ def eval_coverage(issues: int = Query(60, ge=5, le=200), n: int = Query(10),
 def eval_online():
     from . import evaluate, notify
     result = evaluate.online_check()
+    # V10-04b（R1 P1-4）：方法战绩按族分列，与组合口径的 rows/summary 并列返回
+    try:
+        result["by_method"] = evaluate.method_breakdown()
+    except Exception:  # noqa: BLE001 - 报表失败不影响对照本身
+        result["by_method"] = None
     # U3：开奖对照后刷新方法自适应降权决策
     from . import methods as METH
     try:
@@ -410,6 +419,17 @@ def eval_cumulative(method: Optional[str] = Query(None), limit: int = Query(120,
     except Exception:  # noqa: BLE001
         report["adaptive"] = None
     return report
+
+
+@app.get("/api/eval/by-method")
+def eval_by_method(limit_issues: int = Query(200, ge=1, le=5000)):
+    """V10-04b（R1 P1-4）：方法战绩按族**分列**（llm / stat / blend / ml / uniform）。
+
+    与 /api/eval（``eval_results``，组合口径）严格区分：本接口不返回任何跨族
+    合计/加权平均，不同方法族的注数口径不同，相加即失去意义。
+    """
+    from . import evaluate
+    return evaluate.method_breakdown(limit_issues=limit_issues)
 
 
 @app.get("/api/eval/meta")

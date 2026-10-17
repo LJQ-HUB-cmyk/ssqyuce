@@ -2187,6 +2187,24 @@ def coverage_optimize_compare(pool: List[Dict], n_tickets: int, r: int = 3,
     }
 
 
+def channels_snapshot(*, force_production: bool = False) -> Dict:
+    """本期出号通道快照（V10-04b：出号决策的**唯一**读口）。
+
+    为什么不再直读 `config.LLM_ONLY_OUTPUT`（R3 P0-4 / R1 P0-1）：
+    出号口径散落在 6 层开关里（LOTT_METHODS / LOTT_METHOD_MODE /
+    LOTT_LLM_ONLY_OUTPUT / LOTT_LLM_DISABLED / methods_config.json / .env），
+    引擎自己再判一次必然与 `methods.resolve_channels()` 漂移——
+    "族被关掉但 only 仍生效"、"research 模式偷偷出 LLM 注"都来自这种二次判定。
+
+    取值顺序：优先用 `config.CHANNELS` 的冻结快照（设置页保存后由
+    `config.refresh_channels()` 刷新）；快照缺失或不含 V10 字段时才现算。
+    """
+    snap = getattr(config, "CHANNELS", None)
+    if force_production or not isinstance(snap, dict) or "llm_can_pick" not in snap:
+        return METH.resolve_channels(force_production=force_production)
+    return snap
+
+
 def predict_next(draws: List[Dict], use_llm: Optional[bool] = None,
                  n_tickets: Optional[int] = None, persist: bool = True,
                  use_ml: Optional[bool] = None,
@@ -2362,13 +2380,21 @@ def predict_next(draws: List[Dict], use_llm: Optional[bool] = None,
         scored.sort(key=lambda t: order.get((tuple(t["reds"]), t["blue"]), 10 ** 6))
     _rule_refs = _rule_info.get("evidence_by_ticket") or {}
 
-    # LLM 实际生成注数模式（默认开，LOTT_LLM_ONLY_OUTPUT=0 关闭）：
-    # 当 LLM 通道产出了有效候选时，最终注数以 LLM **实际返回**的注数为准，
-    # 不再用统计/ML 候选补齐到 N_TICKETS——保证“显示注数 = LLM 真实产出注数”。
+    # LLM 出号通道（V10-04b：判据一律来自 resolve_channels() 快照，不再直读
+    # config.LLM_ONLY_OUTPUT）。三种模式：
+    #   off  → LLM 只提供候选，最终出号由确定性排序 + 蓝球覆盖计划决定；
+    #   only → LLM 通道产出有效候选时，最终注数以 LLM **实际返回**的注数为准，
+    #          不再用统计/ML 候选补齐到 N_TICKETS（"显示注数 = LLM 真实产出"）；
+    #   mix  → LLM 与 stat/ml 候选同池混合排序后补齐到 N_TICKETS（= 默认路径）。
+    # 且必须 `llm_can_pick`（族启用 + 非 off + production）：族被关掉时即使
+    # 兼容开关 LOTT_LLM_ONLY_OUTPUT=1 也**绝不**走 LLM 出号（拒绝列表优先）。
     # 仅在 single + 非 coverage 的标准路径生效；coverage / blue_compound / dan_tuo
-    # 是显式的组合策略模式，其“展开成 k 注”语义与本模式冲突，故保持原逻辑。
+    # 是显式的组合策略模式，其"展开成 k 注"语义与本模式冲突，故保持原逻辑。
+    _channels = channels_snapshot()
+    _llm_mode = str(_channels.get("llm_output_mode") or "off")
     llm_only = bool(
-        config.LLM_ONLY_OUTPUT
+        _channels.get("llm_can_pick")
+        and _llm_mode == "only"
         and llm_cands
         and not coverage
         and bet_mode == "single"
@@ -2453,6 +2479,17 @@ def predict_next(draws: List[Dict], use_llm: Optional[bool] = None,
         "actual_tickets": len(picked),
         "shortfall_reason": shortfall_reason,
         "llm_only_output": llm_only,
+        # V10-04b（§2.1.6）：把本期生效通道一并回传，前端与审计据此渲染/核对，
+        # 不再各自猜"LLM 到底能不能出号"。
+        "channels": {
+            "spec_raw": _channels.get("spec_raw"),
+            "source": _channels.get("source"),
+            "mode": _channels.get("mode"),
+            "families": _channels.get("families"),
+            "llm_output_mode": _llm_mode,
+            "llm_can_pick": bool(_channels.get("llm_can_pick")),
+            "fingerprint": _channels.get("fingerprint"),
+        },
         "generated_at": __import__("time").strftime("%Y-%m-%d %H:%M:%S"),
         "target_draw": {"issue": draws[-1]["issue"], "date": draws[-1]["date"],
                         "reds": draws[-1]["reds"], "blue": draws[-1]["blue"]},
