@@ -174,3 +174,64 @@ def test_n_tested_equals_declared_space(seeded_db):
     assert result["n_tested"] > declared * 0.95, (
         f"n_tested={result['n_tested']} 远小于声明空间 {declared}，"
         "疑似又有族被静默跳过")
+
+
+# --------------------------------------------------------------------------
+# ⑥ 性能护栏：切片不得整条历史重建（V12-01b 回归）
+# --------------------------------------------------------------------------
+#
+# 初版实现一次性把所有期还原成 dict 并缓存，但 `advance()` 每期都会让缓存失效，
+# 于是「30 个形态档 × 3315 期」每次都各重建 3315 条 dict：
+#   实测 0.23ms/次 × 30 档 × 3315 期 ≈ 23 秒
+#   -> discover() 从 ~1s 拖到 106s
+#   -> 线上 /api/rules/runtime 从毫秒级退化到 3 分 45 秒
+# 修复：按 slice 的 indices() 只构造被请求的窗口。
+#
+# 本例用「切片越大越慢」的相对关系来锁，而不是绝对秒数（避免机器快慢导致假红）。
+
+def test_slice_cost_is_proportional_to_window_not_history(make_draws):
+    """小窗口切片不得随历史长度线性变慢。"""
+    import time
+
+    long_hist = make_draws(3000, seed=71)
+    ctx = DIS.ScanContext.new(long_hist)
+
+    # 预热
+    for _ in range(3):
+        ctx[-30:]
+
+    def _time(fn, reps=300):
+        t0 = time.perf_counter()
+        for _ in range(reps):
+            fn()
+        return time.perf_counter() - t0
+
+    small = _time(lambda: ctx[-30:])          # 窗口 30
+    large = _time(lambda: ctx[-600:])         # 窗口 600（20 倍）
+
+    # 若实现「整条历史重建」，两者成本几乎相同（都重建 3000 条）；
+    # 若实现正确（只建窗口），large 应显著慢于 small。
+    assert large > small * 1.8, (
+        f"窗口 600 的耗时({large:.4f}s)未显著大于窗口 30({small:.4f}s)，"
+        "疑似退回到「每次切片重建整条历史」的实现 —— 那会把 discover() 拖慢 7 倍")
+
+
+def test_discover_does_not_scale_with_history_squared(make_draws):
+    """discover 全 124 档的耗时不得随历史长度平方增长。"""
+    import time
+
+    h1 = make_draws(400, seed=73)
+    h2 = make_draws(800, seed=75)
+
+    t0 = time.perf_counter()
+    DIS.discover(h1, top=2, use_cache=False)
+    t1 = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    DIS.discover(h2, top=2, use_cache=False)
+    t2 = time.perf_counter() - t0
+
+    # 期数翻倍时，正确实现的耗时约 2 倍；O(N²) 实现会约 4 倍。
+    assert t2 < t1 * 3.2, (
+        f"期数翻倍（400→800）耗时增长 {t2 / max(t1, 1e-9):.1f} 倍，"
+        "疑似 O(N²)：切片在每次 advance 后重建整条历史")

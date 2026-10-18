@@ -158,9 +158,16 @@ class ScanContext(dict):
     # 修法：切片返回「按时间升序的 draw 字典列表」，语义与 ``list(draws)[a:b]``
     # 完全一致，使选择器无需感知自己拿到的是 list 还是 ScanContext。
     # 只拦 slice，键访问（ctx["n"] 等）行为不变。
+    #
+    # ⚠️ 性能要点（V12-01b）：**只构造被请求的那一段**，绝不整条历史重建。
+    # 初版曾一次性把所有期还原成 dict 并缓存，但 ``advance()`` 每期都会让缓存失效，
+    # 于是「30 个形态档 × 3315 期」每次都各重建 3315 条 dict（实测 0.23ms/次
+    # × 30 档 × 3315 期 ≈ 23 秒），把 discover() 从 ~1s 拖到 106s，
+    # 线上 /api/rules/runtime 一度从毫秒级退化到 3 分 45 秒。
+    # 现在按 slice 的 ``indices()`` 只取需要的窗口（典型 w=30/100，开销可忽略）。
     def __getitem__(self, key):
         if isinstance(key, slice):
-            return self._rows_as_draws()[key]
+            return self._slice_rows(key)
         return super().__getitem__(key)
 
     # 注意：**不要**重写 __len__。
@@ -168,23 +175,26 @@ class ScanContext(dict):
     # 「len(ctx) 是键数量，不能当历史期数用」——那是 dict 子类的固有语义，改动它
     # 会让 ``len(ctx)==100`` 与 ``ctx.n==100`` 巧合相等，从而掩盖真正的误用。
     # 选择器里若需要期数，请用 ``ctx.n`` 或对切片取 ``len(ctx[-w:])``。
-    def _rows_as_draws(self) -> List[Dict]:
-        """把增量缓存还原成与 ``db.load_draws()`` 同形状的 draw 列表（升序）。
+    def _slice_rows(self, sl: slice) -> List[Dict]:
+        """按 slice 语义还原**仅该窗口**的 draw 列表（升序，与 list 完全一致）。"""
+        rows = self["red_rows"]
+        n = len(rows)
+        start, stop, step = sl.indices(n)
+        idx = range(start, stop, step)
+        blues, issues, dates = self["blue_rows"], self["issues"], self["dates"]
+        return [{"reds": list(rows[i]), "blue": blues[i],
+                 "issue": issues[i], "date": dates[i]}
+                for i in idx]
 
+    def _rows_as_draws(self) -> List[Dict]:
+        """把**全部**历史还原成与 ``db.load_draws()`` 同形状的 draw 列表（升序）。
+
+        仅供确实需要全量的调用方使用；选择器的 ``history[-w:]`` 走
+        ``_slice_rows``，不会走到这里（见上面的性能说明）。
         ``red_rows`` 在 ``new()`` 时空列表、每 ``advance`` 追加一期，与 draws
         一一对应，因此下标可直接对齐，无需另存原始 dict。
         """
-        key = "_draws_view"
-        rows = self["red_rows"]
-        cached = self.get(key)
-        if cached is not None and cached[0] == len(rows):
-            return cached[1]
-        blues, issues, dates = self["blue_rows"], self["issues"], self["dates"]
-        out = [{"reds": list(rows[i]), "blue": blues[i],
-                "issue": issues[i], "date": dates[i]}
-               for i in range(len(rows))]
-        self[key] = (len(rows), out)
-        return out
+        return self._slice_rows(slice(None))
 
     def clone(self, keep_derived: bool = False) -> "ScanContext":
         """复制当前状态（分支回放用）。
