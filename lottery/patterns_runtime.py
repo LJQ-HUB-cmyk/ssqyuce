@@ -56,6 +56,17 @@ MIN_DRAWS_FOR_SNAPSHOT = 500
 # 早期版本把 noise 也归入 rejected，界面上就出现「5 条不可用」这种
 # 看起来像"全被判死"的误导性计数（用户反馈第 3 条）。
 USABLE_STATUSES = ("persistent",)
+
+# V11「阶段可用」档（默认关闭，见 config.LOTT_PHASE_USABLE）：
+# 「长期持续」之外的**阶段类**状态。用户明确要求"阶段性规律只要当前可用就应该能指导预测"，
+# 而 docs/reviews/PHASE_USABLE_STUDY.md 的四组检验显示该假设未获数据支持
+# （关键：相邻窗口无持续性 r=0.124 < 容差 0.151，即"当前有效"预测不了"下期有效"）。
+# 因此实现为「可选档 + 强制度量」：打开后阶段类可进入候选，但必须同时满足
+#   prereg_ok（前置注册通过）且最近阶段 A/B 不劣于基线，
+# 且界面对两类**分别**披露实测配对 Δ / t 值，效果自我暴露；
+# 累计显著劣于基线时自动关闭（config.PHASE_USABLE_AUTO_OFF_T）。
+PHASE_STATUSES = ("emerging", "fading")
+
 MONITOR_STATUSES = ("emerging", "fading", "stale", "reversed", "insufficient", "noise")
 REJECTED_STATUSES = ("flipped",)
 
@@ -113,12 +124,24 @@ def build_snapshot(draws: Sequence[Dict], scan: Optional[Dict] = None,
         #         缺字段即视为 False（安全默认），否则"前置注册"就白做了。
         # 【关键】source=="llm" 永不 usable：llm 不可回放 + 规律本不存在，
         #         "llm 且 passed" 的集合恒为空；放行会让死锁从后门复活（V10 G1）。
-        usable = (
+        _src = (h.get("source") or "stat")
+        _long_term_ok = (
             (status in USABLE_STATUSES)
             and h.get("status") == "validated"
             and h.get("prereg_ok") is True
-            and (h.get("source") or "stat") != "llm"
+            and _src != "llm"
         )
+        # V11 阶段可用档：默认关闭；打开后 emerging/fading 也进候选，
+        # 但必须过前置注册、且 A/B 未被判负（status 不是 rejected）。
+        _phase_ok = False
+        if (not _long_term_ok) and bool(getattr(config, "LOTT_PHASE_USABLE", False)):
+            _phase_ok = (
+                status in PHASE_STATUSES
+                and h.get("status") in ("validated", "proposed")
+                and h.get("prereg_ok") is True
+                and _src != "llm"
+            )
+        usable = bool(_long_term_ok or _phase_ok)
         rules.append({
             "id": h.get("id"), "source": h.get("source") or "stat",
             "statement": h.get("statement"), "dim": spec,
@@ -140,10 +163,15 @@ def build_snapshot(draws: Sequence[Dict], scan: Optional[Dict] = None,
                 "reason": h.get("prereg_reason"),
             },
             "usable": bool(usable),
-            "tier": ("usable" if usable
-                     else ("rejected" if (status in REJECTED_STATUSES
-                                          or h.get("status") == "rejected")
-                           else "monitor")),
+            # V11：usable_kind 让前端/统计能区分「长期规律」与「阶段规律」，
+            # 二者必须分开度量效果 —— 混在一起算就再也说不清是哪类在起作用。
+            "usable_kind": ("long_term" if _long_term_ok
+                            else ("phase" if _phase_ok else None)),
+            "tier": ("usable_long_term" if _long_term_ok
+                     else ("usable_phase" if _phase_ok
+                           else ("rejected" if (status in REJECTED_STATUSES
+                                                or h.get("status") == "rejected")
+                                 else "monitor"))),
             "evidence_text": _evidence_text(h, rep),
         })
     # 2) 维度扫描里**任何**有阶段证据的线索（含 noise）都进快照，只是分层不同。
@@ -170,14 +198,26 @@ def build_snapshot(draws: Sequence[Dict], scan: Optional[Dict] = None,
             "evidence_text": f"{f.get('name_zh')} {f.get('params')}：{it.get('status_zh')}；"
                              f"近窗效应 {q.get('delta')}，BH p={q.get('p_adjusted')}",
         })
-    counts = {"usable": sum(1 for r in rules if r["tier"] == "usable"),
-              "monitor": sum(1 for r in rules if r["tier"] == "monitor"),
-              "rejected": sum(1 for r in rules if r["tier"] == "rejected"),
-              "tier_legend": {
-                  "usable": "可用：阶段持续有效 + A/B 验证通过",
-                  "monitor": "仅监控：证据不足（各阶段未检出）或阶段曾显著但未复现",
-                  "rejected": "已否决：方向反转或被 A/B 判负",
-              }}
+    _n_long = sum(1 for r in rules if r.get("tier") == "usable_long_term")
+    _n_phase = sum(1 for r in rules if r.get("tier") == "usable_phase")
+    counts = {
+        # usable = 两类之和（长期 + 阶段），与旧口径兼容
+        "usable": _n_long + _n_phase,
+        # V11：必须分开计数 —— 混在一起就说不清"当前在用的是什么"
+        "usable_long_term": _n_long,
+        "usable_phase": _n_phase,
+        "monitor": sum(1 for r in rules if r["tier"] == "monitor"),
+        "rejected": sum(1 for r in rules if r["tier"] == "rejected"),
+        "phase_usable_enabled": bool(getattr(config, "LOTT_PHASE_USABLE", False)),
+        "tier_legend": {
+            "usable_long_term": "可用（长期）：阶段持续有效 + A/B 验证 + 前置注册通过",
+            "usable_phase": "可用（阶段）：仅当前阶段有效 —— 该档默认关闭；"
+                            "3515 期研究未支持其可预测性，请以实测 Δ 为准",
+            "usable": "可用：以上两类之和",
+            "monitor": "仅监控：证据不足（各阶段未检出）或阶段曾显著但未复现",
+            "rejected": "已否决：方向反转或被 A/B 判负",
+        },
+    }
     return {
         "version": SNAPSHOT_VERSION,
         "generated_at": _now(),

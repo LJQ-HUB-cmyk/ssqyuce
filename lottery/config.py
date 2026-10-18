@@ -211,6 +211,29 @@ DAN_TUO_DANS = int(os.environ.get("LOTT_DAN_TUO_DANS", "4"))
 DAN_TUO_TUOS = int(os.environ.get("LOTT_DAN_TUO_TUOS", "5"))
 
 # ---------- U3 方法自适应降权 ----------
+# ---------- V11「阶段可用」档（phase_usable）----------
+# 用户诉求（2026-10-18）：「不要只用一套极严标准把一切判死，也要能看见阶段性规律，
+# 只要当前可用、能指导预测就行。」
+#
+# 诚实前提（docs/reviews/PHASE_USABLE_STUDY.md 四组独立检验）：
+#   ① 3515 期上当前连 emerging 级别规律都没有（0/91）；
+#   ② 最近窗口 6/8 维度同向，但随机窗口 15% 就能出现；
+#   ③ 滚动用「最近 150 期最佳」出号 3165 期：Δ=+0.010，t=0.64 **不显著**；
+#   ④ **相邻窗口无持续性**（r=0.124，容差 ±0.151）—— 这是最致命的一条：
+#      「当前阶段有效」不能预测「下一期有效」，所以该档**不可用于出号的理论依据**。
+#
+# 但仍然提供该档，因为用户有权选择，且系统会**用实测数据说话**：
+#   * 默认关闭（0）；
+#   * 打开后只有「长期 persistent」与「阶段 emerging/fading」两类进入候选；
+#   * 阶段类必须同时满足：前置注册通过 + 最近阶段 A/B 不劣于基线；
+#   * 界面对两类**分别**统计真实的配对 Δ 与 t 值，让效果自我暴露；
+#   * 累计配对检验显示明显劣于基线（t < -PHASE_USABLE_AUTO_OFF_T）→ 自动关闭。
+LOTT_PHASE_USABLE = os.environ.get("LOTT_PHASE_USABLE", "0") == "1"
+# 自动关闭阈值：阶段类规律的累计配对 t 值低于此值即自动关闭（默认 -2.0）
+PHASE_USABLE_AUTO_OFF_T = float(os.environ.get("LOTT_PHASE_USABLE_AUTO_OFF_T", "-2.0"))
+# 阶段类规律进入候选所需的最小配对期数（样本不足不统计、也不自动关闭）
+PHASE_USABLE_MIN_PAIRS = int(os.environ.get("LOTT_PHASE_USABLE_MIN_PAIRS", "60"))
+
 # LOTT_ADAPTIVE_ENABLED：1=开（默认），0=关（保留人工 A/B 开关语义）
 ADAPTIVE_ENABLED = os.environ.get("LOTT_ADAPTIVE_ENABLED", "1") == "1"
 # 连续 LOTT_ADAPTIVE_K 期命中低于随机基线 → 自动降权 50%（0.5）或移出候选池

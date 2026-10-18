@@ -119,7 +119,10 @@ def test_snapshot_tiers_only_persistent_and_validated_is_usable(monkeypatch):
     _fake_hyps(monkeypatch, hyps)
     snap = PR.build_snapshot(_draws(), scan={"n_tested": 1, "items": [], "verdict": "x"})
     by_id = {r["id"]: r for r in snap["rules"]}
-    assert by_id["u1"]["tier"] == "usable"
+    # V11：tier 细化为 usable_long_term / usable_phase（两类必须分开度量），
+    # 长期规律（persistent + validated + prereg_ok）应为 usable_long_term。
+    assert by_id["u1"]["tier"] == "usable_long_term"
+    assert by_id["u1"]["usable"] is True
     # V10-02：缺 prereg_ok → 不能 usable（否则前置注册白做）
     assert by_id["u2"]["tier"] == "monitor", "缺 prereg_ok 必须降级为 monitor"
     # 只有一个阶段显著（emerging）→ 永远不能用于出号，即使 A/B 已验证
