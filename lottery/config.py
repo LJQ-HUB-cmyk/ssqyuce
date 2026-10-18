@@ -74,7 +74,14 @@ except (json.JSONDecodeError, TypeError):
 
 LLM_SAMPLES = int(os.environ.get("LOTT_LLM_SAMPLES", "3"))          # LLM 多轮采样次数（并发）
 TICKETS_PER_LLM_CALL = int(os.environ.get("LOTT_TICKETS_PER_CALL", "5"))
-N_TICKETS = int(os.environ.get("LOTT_N_TICKETS", "10"))             # 最终输出注数
+# 最终输出注数（V11 用户要求：默认 5 注，可配置手动改个数）
+N_TICKETS = int(os.environ.get("LOTT_N_TICKETS", "5"))              # 最终输出注数（默认 5）
+# V11 严格模式（用户 2026-10-18 指令）：
+#   1=开：出号**必须**由 LLM 分析规律完成；LLM 不可用或可用规律数为 0 时
+#       **拒绝出号**并返回明确错误（绝不静默降级到统计基线）。
+#   0=关（默认）：保持 V10 诚实边界，stat/ml 兜底出号。
+# 注意：开启前请确认 LLM 网关可用（data/llm_config.json），否则系统将出不了号。
+STRICT_MODE = os.environ.get("LOTT_STRICT_MODE", "0") == "1"
 # LLM_ONLY_OUTPUT（V10 起默认 **0**；历史上默认 1）
 #   =1（only）：LLM 通道产出候选时，最终注数以 LLM 实际返回的注数为准，不用统计/ML 补齐。
 #   =0（off，**当前默认**）：LLM 只提供候选，最终出号仍由确定性排序 + 蓝球覆盖计划决定。

@@ -819,6 +819,144 @@ _FEATURE_TABLES: Dict[str, Callable[[Sequence[int]], int]] = {
     "span": lambda r: (max(r) - min(r)) // 5,
 }
 
+# ---- V12 新增：结构 / 形态 / 组合维度（用户 2026-10-18 要求"从各维度发掘"）----
+
+def _sel_sum_range(params: Dict) -> Callable[[Sequence[Dict]], set]:
+    """和值区间：近 W 期和值落入 [lo,hi) 的历史期之后，哪些号码最常开出。"""
+    w, lo, hi, k = int(params["window"]), int(params.get("lo") or 0),         int(params.get("hi") or 999), int(params.get("k") or 6)
+    def fn(history):
+        rows = history[-w:]
+        n = len(rows)
+        if n == 0:
+            return set()
+        cnt = np.zeros(33)
+        for d in rows:
+            sm = sum(d.get("reds") or [])
+            if lo <= sm < hi:
+                for r in d["reds"]:
+                    cnt[r - 1] += 1
+        return set((np.argsort(-cnt)[:k] + 1).tolist())
+    return fn
+
+
+def _sel_span_range(params: Dict) -> Callable[[Sequence[Dict]], set]:
+    """跨度档：近 W 期跨度落入 [lo,hi) 的历史期之后，哪些号码最常开出。"""
+    w, lo, hi, k = int(params["window"]), int(params.get("lo") or 0),         int(params.get("hi") or 999), int(params.get("k") or 6)
+    def fn(history):
+        rows = history[-w:]
+        cnt = np.zeros(33)
+        for d in rows:
+            rs = d.get("reds") or []
+            if not rs:
+                continue
+            sp = max(rs) - min(rs)
+            if lo <= sp < hi:
+                for r in rs:
+                    cnt[r - 1] += 1
+        return set((np.argsort(-cnt)[:k] + 1).tolist())
+    return fn
+
+
+def _sel_parity_ratio(params: Dict) -> Callable[[Sequence[Dict]], set]:
+    """奇偶配置：近 W 期奇数个数=o 的历史期之后，选高频号码。"""
+    w, o, k = int(params["window"]), int(params.get("odd") or 3), int(params.get("k") or 6)
+    def fn(history):
+        cnt = np.zeros(33)
+        for d in history[-w:]:
+            rs = d.get("reds") or []
+            n_odd = sum(1 for r in rs if r % 2 == 1)
+            if n_odd == o:
+                for r in rs:
+                    cnt[r - 1] += 1
+        return set((np.argsort(-cnt)[:k] + 1).tolist())
+    return fn
+
+
+def _sel_big_small(params: Dict) -> Callable[[Sequence[Dict]], set]:
+    """大小配置：近 W 期大号(>16)个数=b 的历史期之后，选高频号码。"""
+    w, b, k = int(params["window"]), int(params.get("big") or 3), int(params.get("k") or 6)
+    def fn(history):
+        cnt = np.zeros(33)
+        for d in history[-w:]:
+            rs = d.get("reds") or []
+            n_big = sum(1 for r in rs if r > 16)
+            if n_big == b:
+                for r in rs:
+                    cnt[r - 1] += 1
+        return set((np.argsort(-cnt)[:k] + 1).tolist())
+    return fn
+
+
+def _sel_route012(params: Dict) -> Callable[[Sequence[Dict]], set]:
+    """012路配置：近 W 期 0路个数=z0 的历史期之后，选高频号码。"""
+    w, z0, k = int(params["window"]), int(params.get("route0") or 2), int(params.get("k") or 6)
+    def fn(history):
+        cnt = np.zeros(33)
+        for d in history[-w:]:
+            rs = d.get("reds") or []
+            n0 = sum(1 for r in rs if r % 3 == 0)
+            if n0 == z0:
+                for r in rs:
+                    cnt[r - 1] += 1
+        return set((np.argsort(-cnt)[:k] + 1).tolist())
+    return fn
+
+
+def _sel_consecutive(params: Dict) -> Callable[[Sequence[Dict]], set]:
+    """连号：近 W 期出现连号对(x,x+1)中的号码，选高频的 k 个。"""
+    w, k = int(params["window"]), int(params.get("k") or 6)
+    def fn(history):
+        cnt = np.zeros(33)
+        for d in history[-w:]:
+            rs = sorted(d.get("reds") or [])
+            for i in range(len(rs) - 1):
+                if rs[i + 1] == rs[i] + 1:
+                    cnt[rs[i] - 1] += 1
+                    cnt[rs[i + 1] - 1] += 1
+        return set((np.argsort(-cnt)[:k] + 1).tolist())
+    return fn
+
+
+def _sel_ac_value(params: Dict) -> Callable[[Sequence[Dict]], set]:
+    """AC值（复杂度）：近 W 期 AC 值=av 的历史期之后，选高频号码。"""
+    w, av, k = int(params["window"]), int(params.get("ac") or 8), int(params.get("k") or 6)
+    def fn(history):
+        cnt = np.zeros(33)
+        for d in history[-w:]:
+            rs = sorted(d.get("reds") or [])
+            diffs = {rs[j] - rs[i] for i in range(len(rs)) for j in range(i + 1, len(rs))}
+            ac = len(diffs) - (len(rs) - 1)
+            if ac == av:
+                for r in rs:
+                    cnt[r - 1] += 1
+        return set((np.argsort(-cnt)[:k] + 1).tolist())
+    return fn
+
+
+def _sel_hot_cold_mix(params: Dict) -> Callable[[Sequence[Dict]], set]:
+    """冷热混合：热号 top(a) ∪ 冷号 top(b)，检验"一热配一冷"民间说法。"""
+    w, a, b = int(params["window"]), int(params.get("hot") or 3), int(params.get("cold") or 3)
+    def fn(history):
+        cnt = red_count(history, w)
+        hot = set((np.argsort(-cnt)[:a] + 1).tolist())
+        cold = set((np.argsort(cnt)[:b] + 1).tolist())
+        return hot | cold
+    return fn
+
+
+def _sel_same_tail_group(params: Dict) -> Callable[[Sequence[Dict]], set]:
+    """尾数连出：近 W 期各尾数出现次数，选最热的 k 个尾数对应的号码。"""
+    w, k = int(params["window"]), int(params.get("k") or 5)
+    def fn(history):
+        tail_cnt = np.zeros(10)
+        for d in history[-w:]:
+            for r in d.get("reds") or []:
+                tail_cnt[r % 10] += 1
+        top_tails = set((np.argsort(-tail_cnt)[:k]).tolist())
+        return {r for r in range(1, 34) if r % 10 in top_tails}
+    return fn
+
+
 FAMILIES: List[Dict] = [
     # ---- 红球：频率维度（时间尺度） ----
     {"key": "hot", "name_zh": "热度延续", "dim_zh": "红球频率(热)",
@@ -896,6 +1034,58 @@ FAMILIES: List[Dict] = [
     {"key": "blue_parity", "name_zh": "蓝球奇偶/大小轮动", "dim_zh": "蓝球形态轮动",
      "ratio": "上期蓝球奇则本期选偶（或大小反向）", "target": "blue", "selector": _blue_parity,
      "params": [{"mode": "parity"}, {"mode": "size"}]},
+
+    # ---- V12 新增：结构 / 形态 / 组合维度（用户 2026-10-18 要求"从各维度发掘"）----
+    {"key": "sum_range", "name_zh": "和值区间条件", "dim_zh": "和值区间",
+     "ratio": "近 W 期和值处于某区间的历史期之后，哪些号码最常开出",
+     "target": "red", "selector": _sel_sum_range,
+     "params": [{"window": 30, "lo": 45, "hi": 75},
+                {"window": 30, "lo": 75, "hi": 105},
+                {"window": 30, "lo": 105, "hi": 135},
+                {"window": 30, "lo": 135, "hi": 165},
+                {"window": 100, "lo": 75, "hi": 105},
+                {"window": 100, "lo": 105, "hi": 135}]},
+    {"key": "span_range", "name_zh": "跨度档条件", "dim_zh": "跨度档",
+     "ratio": "近 W 期跨度为某范围的历史期之后，哪些号码最常开出",
+     "target": "red", "selector": _sel_span_range,
+     "params": [{"window": 30, "lo": 0, "hi": 15},
+                {"window": 30, "lo": 15, "hi": 25},
+                {"window": 30, "lo": 25, "hi": 33},
+                {"window": 100, "lo": 10, "hi": 25}]},
+    {"key": "parity_cfg", "name_zh": "奇偶个数条件", "dim_zh": "奇偶配置",
+     "ratio": "近 W 期奇数个数为 o 的历史期之后，哪些号码最常开出",
+     "target": "red", "selector": _sel_parity_ratio,
+     "params": [{"window": 30, "odd": 2}, {"window": 30, "odd": 3},
+                {"window": 30, "odd": 4}, {"window": 100, "odd": 3}]},
+    {"key": "big_small_cfg", "name_zh": "大小个数条件", "dim_zh": "大小配置",
+     "ratio": "近 W 期大号个数为 b 的历史期之后，哪些号码最常开出",
+     "target": "red", "selector": _sel_big_small,
+     "params": [{"window": 30, "big": 2}, {"window": 30, "big": 3},
+                {"window": 30, "big": 4}, {"window": 100, "big": 3}]},
+    {"key": "route012_cfg", "name_zh": "012路个数条件", "dim_zh": "012路配置",
+     "ratio": "近 W 期 0路个数为 z 的历史期之后，哪些号码最常开出",
+     "target": "red", "selector": _sel_route012,
+     "params": [{"window": 30, "route0": 1}, {"window": 30, "route0": 2},
+                {"window": 30, "route0": 3}, {"window": 100, "route0": 2}]},
+    {"key": "consecutive_hot", "name_zh": "连号热码", "dim_zh": "连号",
+     "ratio": "近 W 期出现过连号对的号码中，最常开的 k 个",
+     "target": "red", "selector": _sel_consecutive,
+     "params": [{"window": 30, "k": 6}, {"window": 100, "k": 6}]},
+    {"key": "ac_value", "name_zh": "AC值条件", "dim_zh": "AC值",
+     "ratio": "近 W 期 AC 值为某档的历史期之后，哪些号码最常开出",
+     "target": "red", "selector": _sel_ac_value,
+     "params": [{"window": 100, "ac": 7}, {"window": 100, "ac": 8},
+                {"window": 100, "ac": 9}, {"window": 100, "ac": 10}]},
+    {"key": "hot_cold_mix", "name_zh": "冷热混合", "dim_zh": "冷热混合",
+     "ratio": "热号 top(a) ∪ 冷号 top(b)（民间「一热配一冷」说法）",
+     "target": "red", "selector": _sel_hot_cold_mix,
+     "params": [{"window": 30, "hot": 3, "cold": 3},
+                {"window": 100, "hot": 3, "cold": 3},
+                {"window": 30, "hot": 4, "cold": 2}]},
+    {"key": "tail_group", "name_zh": "尾数连出", "dim_zh": "尾数",
+     "ratio": "近 W 期最热的 k 个尾数对应的所有号码",
+     "target": "red", "selector": _sel_same_tail_group,
+     "params": [{"window": 30, "k": 5}, {"window": 100, "k": 5}]},
 ]
 
 FAMILY_BY_KEY: Dict[str, Dict] = {f["key"]: f for f in FAMILIES}

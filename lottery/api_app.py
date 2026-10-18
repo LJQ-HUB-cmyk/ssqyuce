@@ -184,7 +184,8 @@ def run_backtests():
 # ---------- 预测 ----------
 
 @app.api_route("/api/predict", methods=["GET", "POST"])
-def predict(use_llm: Optional[bool] = None, n_tickets: int = 10,
+def predict(use_llm: Optional[bool] = None,
+            n_tickets: Optional[int] = Query(None),
             regenerate: bool = False,
             bet_mode: Optional[str] = None,
             coverage: bool = False,
@@ -249,8 +250,43 @@ def predict(use_llm: Optional[bool] = None, n_tickets: int = 10,
     _decision_disabled = bool(_channels_now.get("decision_disabled"))
     if _decision_disabled:
         use_llm = False
+    # 出号注数：显式传参数 > 环境配置 > 默认 5（用户要求默认 5 注、可配置）
+    _n_req = int(n_tickets) if n_tickets is not None else int(config.N_TICKETS)
+
+    # ============ V11 严格模式门控（用户 2026-10-18 指令）============
+    # 出号**必须**由 LLM 分析规律完成；LLM 不可用或可用规律为 0 时拒绝出号。
+    # 绝不静默降级到统计基线 —— 这是与默认模式的本质区别。
+    _strict_notes = []
+    if bool(getattr(config, "STRICT_MODE", False)):
+        _strict_notes.append("严格模式：出号强制依赖 LLM + 规律")
+        # ①规律必须可用
+        try:
+            from . import patterns_runtime as _PR
+            _psnap = _PR.load_snapshot(current_issue=issue) or _PR.build_snapshot(draws)
+            _usable_n = int((_psnap.get("counts") or {}).get("usable") or 0)
+        except Exception as _e:                       # noqa: BLE001
+            _usable_n = 0
+        if _usable_n == 0:
+            return JSONResponse(
+                {"ok": False, "strict_mode": True,
+                 "error": ("严格模式下不出号：当前**无可用规律**（usable=0）。"
+                           "本模式要求必须用规律经 LLM 分析出号；"
+                           "请在「规律库」确认有 usable 规律，或关闭严格模式（LOTT_STRICT_MODE=0）。"),
+                 "usable": 0},
+                status_code=422)
+        # ②LLM 通道必须可用
+        if not bool(_channels_now.get("llm_can_pick")):
+            return JSONResponse(
+                {"ok": False, "strict_mode": True,
+                 "error": ("严格模式下不出号：LLM 出号通道不可用（llm_can_pick=False）。"
+                           "请检查 LOTT_METHODS 是否包含 llm、LOTT_LLM_ONLY_OUTPUT，"
+                           "或 LLM 网关（data/llm_config.json）。"),
+                 "llm_can_pick": False},
+                status_code=422)
+        use_llm = True                                   # 严格模式强制走 LLM
+        _strict_notes.append(f"可用规律 {_usable_n} 条，LLM 通道可用")
     try:
-        res = engine.predict_next(draws, use_llm=use_llm, n_tickets=n_tickets,
+        res = engine.predict_next(draws, use_llm=use_llm, n_tickets=_n_req,
                                   llm_required=(use_llm is True),
                                   bet_mode=bet_mode, coverage=coverage,
                                   coverage_r=coverage_r)
@@ -267,6 +303,9 @@ def predict(use_llm: Optional[bool] = None, n_tickets: int = 10,
     res.setdefault("data_basis", _exp)
     # 让前端能明确解释「为什么勾了使用大模型却没有 LLM 注」
     res["decision_channel_disabled"] = _decision_disabled
+    res["strict_mode"] = bool(getattr(config, "STRICT_MODE", False))
+    if _strict_notes:
+        res["strict_notes"] = _strict_notes
     if _decision_disabled:
         res["decision_channel_note_zh"] = (
             "LLM 决策通道已被自动关停（决策技能 Wilson 下界 ≤ 随机基线 0.5），"
@@ -2069,6 +2108,22 @@ def _scheduler_step():
         print("[scheduler] 规律快照:", patterns_runtime.refresh(db.load_draws()))
     except Exception as e:  # noqa: BLE001
         print("[scheduler] 规律快照刷新失败（不影响预测）:", e)
+
+    # V11：每期自动推进规律生命周期（退居二线判定）。
+    # 顺序：在快照刷新**之后**、生成预测**之前** —— 这样本期被判定为
+    # 退居二线（monitor）的规律，会通过下一轮 build_snapshot 注入的
+    # lifecycle 状态立即从 usable_rules() 里消失，本期出号就不再使用它。
+    # 失败只降级（沿用既定约定），绝不影响当期预测生成。
+    try:
+        from . import rule_lifecycle as _RL
+        _cycle = _RL.run_cycle(db.load_draws(), use_llm=False, persist=True)
+        _mig = _cycle.get("migrated") or []
+        print("[scheduler] 生命周期:", "迁移", len(_mig),
+              "条" if _mig else "无需迁移", "|",
+              {k: v for k, v in (_cycle.get("counts") or {}).items()
+               if k in ("active", "monitor", "unmanaged")})
+    except Exception as e:  # noqa: BLE001
+        print("[scheduler] 生命周期推进失败（不影响预测）:", e)
 
     draws = db.load_draws()
     exp = BT.expected_issue(draws)
