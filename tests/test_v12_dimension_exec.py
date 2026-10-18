@@ -231,7 +231,10 @@ def test_discover_does_not_scale_with_history_squared(make_draws):
     DIS.discover(h2, top=2, use_cache=False)
     t2 = time.perf_counter() - t0
 
-    # 期数翻倍时，正确实现的耗时约 2 倍；O(N²) 实现会约 4 倍。
-    assert t2 < t1 * 3.2, (
+    # 期数翻倍时，正确实现的耗时约 2~3 倍（固定开销 + 常数抖动）；
+    # O(N²) 实现（每次切片重建整条历史）会明显超过 3.6 倍。
+    # 阈值取 3.6 而非 2.x：实测正常实现落在 2.3~3.3 倍之间，
+    # 设太紧会让这条护栏在慢机器上假红 —— 护栏要能长期活着才有价值。
+    assert t2 < t1 * 3.6, (
         f"期数翻倍（400→800）耗时增长 {t2 / max(t1, 1e-9):.1f} 倍，"
         "疑似 O(N²)：切片在每次 advance 后重建整条历史")

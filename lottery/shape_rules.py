@@ -281,8 +281,16 @@ def check_shape(reds: Sequence[int], ctx: Dict) -> bool:
 # 4. 形态规律报告（供前端卡片；理论 vs 实测吻合度）
 # ---------------------------------------------------------------------------
 
+_ZONES_TOP10_CACHE: Optional[float] = None
+
+
 def _zones_top10_rate() -> float:
     """三区配置的覆盖率（**动态口径**，V12-12 说明）。
+
+    ⚠️ 性能：这个值**不依赖任何数据**（枚举的是全空间 C(33,6)，取前 10 个
+    最常见三区形状），因此是**常量**，必须缓存。初版每次调用都全枚举 110 万注
+    （实测约 1.5~2 秒），/api/shape/rules 被前端轮询时会把容器 CPU 打满。
+    
 
     为什么这一维不能像其它四维一样用固定全枚举值：
     生产 `engine.constraint_ctx` 取的是「最近 500 期出现最多的 **top-10** 三区配置」，
@@ -293,6 +301,10 @@ def _zones_top10_rate() -> float:
     由于三区形状总共只有 C(8,2)=28 种，top-10 覆盖的比例很高，
     这比原先手写的 0.90 有据可依。
     """
+    global _ZONES_TOP10_CACHE
+    if _ZONES_TOP10_CACHE is not None:
+        return _ZONES_TOP10_CACHE
+
     from itertools import combinations
     shapes: Dict[Tuple[int, int, int], int] = {}
     for c in combinations(range(1, R_MAX_FOR_ENUM + 1), 6):
@@ -302,7 +314,8 @@ def _zones_top10_rate() -> float:
         shapes[(z1, z2, z3)] = shapes.get((z1, z2, z3), 0) + 1
     total = sum(shapes.values())
     top10 = sorted(shapes.values(), reverse=True)[:10]
-    return sum(top10) / total
+    _ZONES_TOP10_CACHE = sum(top10) / total
+    return _ZONES_TOP10_CACHE
 
 
 def shape_rules_report(draws: Sequence[Dict]) -> Dict[str, Any]:
