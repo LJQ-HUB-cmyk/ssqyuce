@@ -2185,7 +2185,7 @@ async function loadMultiScaleMde() {
 
 function _verdictMeta(v) {
   if (v === "credible") return { txt: "可信", cls: "ok", icon: "★" };
-  if (v === "noise-level") return { txt: "显著但不可信", cls: "warn", icon: "⚠" };
+  if (v === "underpowered") return { txt: "功效不足", cls: "warn", icon: "⚠" };
   if (v === "insufficient") return { txt: "样本不足", cls: "mute", icon: "–" };
   return { txt: "不显著", cls: "mute", icon: "·" };
 }

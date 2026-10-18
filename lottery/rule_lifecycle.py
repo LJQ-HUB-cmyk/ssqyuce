@@ -297,7 +297,8 @@ def step_lifecycle(decision: Dict, state_rec: Optional[Dict],
                        [f"首次纳入生命周期管理，建立基线（当前 {current}）；本次不迁移"])
 
     if dwell < min_dwell:
-        rec["dwell"] = dwell
+        # 冷却期**必须递增** dwell：否则计数永远停在 0，冷却永不到期（冻结 bug）。
+        rec["dwell"] = dwell + 1
         rec["last_eval"] = {"issue": issue, "direction": direction, "action": "dwell"}
         rec["eval_count"] = int(rec.get("eval_count") or 0) + 1
         return _finish(rec, current, False,
@@ -420,6 +421,11 @@ def apply_states(snapshot: Optional[Dict], states: Optional[Dict],
         return snapshot or {}
     if not states:
         return snapshot
+    # 「无匹配」直通：states 非空但没有命中任何 rule -> 完全原样返回。
+    # （t8：apply_states(snap, {"unknown": ...}) == snap 必须成立。）
+    rule_ids = {str(r.get("id")) for r in (snapshot.get("rules") or []) if isinstance(r, dict)}
+    if not (rule_ids & set(states.keys())):
+        return snapshot
     out = dict(snapshot)
     rules: List[Dict] = []
     n_active = n_demoted = 0
@@ -430,7 +436,13 @@ def apply_states(snapshot: Optional[Dict], states: Optional[Dict],
             continue
         st = states.get(str(r.get("id")) or "")
         state = _norm_state((st or {}).get("state")) if isinstance(st, dict) else "unmanaged"
-        r["lifecycle_state"] = state if state != "unmanaged" else None
+        # 没有对应状态条目（未纳管）：**原样保留**，不注入任何 lifecycle 字段。
+        # 否则快照多出 lifecycle_state:null，前端/测试的"直通"语义被破坏
+        # （t8 回归：states 非空但无匹配 rule 时，out == snapshot 必须成立）。
+        if state == "unmanaged":
+            rules.append(r)
+            continue
+        r["lifecycle_state"] = state
         if state == "active":
             n_active += 1
         if state == "monitor" and r.get("usable"):

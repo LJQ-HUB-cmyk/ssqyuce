@@ -2472,6 +2472,71 @@ def backtest_regime(key: str = Query(..., min_length=1),
                                    "target": flt["target"]}, "regime": rep}
 
 
+@app.get("/api/rules/lifecycle")
+def rules_lifecycle_status():
+    """V11：规律生命周期状态（谁在一线 / 谁退居二线 / 谁被滞后暂缓）。
+
+    来源唯一：``rule_lifecycle.load_states()``。返回体里
+    ``demoted`` 是已退居二线（monitor）的规律 id 及其理由。
+    """
+    from . import rule_lifecycle as RL
+
+    states = RL.load_states()
+    recs = (states or {}).get("rules") or {}
+    demoted = {rid: r for rid, r in recs.items()
+               if (r or {}).get("state") == "monitor"}
+    active = {rid: r for rid, r in recs.items()
+              if (r or {}).get("state") == "active"}
+    return {
+        "ok": True,
+        "thresholds": (states or {}).get("thresholds") or RL.thresholds(),
+        "version": (states or {}).get("version"),
+        "n_managed": len(recs),
+        "n_active": len(active),
+        "n_demoted": len(demoted),
+        "demoted": demoted,
+        "active": active,
+        "state_file": str(RL.STATE_FILE),
+        "note_zh": ("退居二线（monitor）= 衰减判据连续成立，不再参与出号，"
+                    "但仍留在列表里继续观察 —— 不是被证伪。"),
+    }
+
+
+@app.post("/api/rules/lifecycle/run")
+def rules_lifecycle_run(use_llm: bool = Query(False)):
+    """V11：手动推进一次规律生命周期。
+
+    ``use_llm=False``（默认）：纯确定性（不调 LLM）；LLM 的复核意见
+    永远不会影响状态迁移（纪律 1），所以手动触发默认不依赖它。
+
+    返回统一走 ``rule_lifecycle.run_cycle`` 的结构化结果（含 migrated /
+    counts / rules / note_zh）。
+    """
+    from . import patterns_runtime, rule_lifecycle as RL
+
+    draws = db.load_draws()
+    if not draws:
+        return JSONResponse({"ok": False, "error": "本地暂无开奖数据"}, status_code=400)
+    snap = patterns_runtime.build_snapshot(draws)
+    try:
+        out = RL.run_cycle(draws, snapshot=snap, use_llm=bool(use_llm), persist=True)
+    except Exception as exc:                              # noqa: BLE001
+        return JSONResponse({"ok": False, "error": f"生命周期推进失败: {exc}"},
+                            status_code=200)
+    out.setdefault("note_zh", _lifecycle_note(out))
+    return _jsonable(out)
+
+
+def _lifecycle_note(out: dict) -> str:
+    changed = out.get("changed") or {}
+    if not changed:
+        return ("本期没有规律需要退居二线（全部 hold）——"
+                "这不是功能失效，而是规律本身不存在衰减证据")
+    items = [f"{rid}: {v.get('from')}→{v.get('to')}（{'、'.join(v.get('reasons') or [])}）"
+             for rid, v in list(changed.items())[:10]]
+    return f"本次迁移 {len(changed)} 条：" + "；".join(items)
+
+
 @app.get("/api/rules/runtime")
 def rules_runtime():
     """规律运行时快照：现在到底有哪些规律「可用」、哪些只监控、哪些已否决。"""

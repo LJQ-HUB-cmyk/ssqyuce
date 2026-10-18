@@ -32,3 +32,5 @@ data/patterns_runtime.json
 # D-3：ML 诊断结果缓存（运行时状态，可重算）
 data/ml_diag_cache.json
 data/ml_diag_cache.json.tmp
+data/rule_lifecycle.json
+data/rule_lifecycle.json.tmp

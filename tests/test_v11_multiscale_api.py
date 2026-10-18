@@ -141,7 +141,7 @@ def test_scan_result_entries_carry_verdict_and_mde(client_with_data):
             if v.get("verdict") == "insufficient":
                 continue
             assert "verdict" in v and "mde_abs" in v, (item.get("key"), k, v)
-            assert v["verdict"] in ("credible", "noise-level", "not-significant")
+            assert v["verdict"] in ("credible", "underpowered", "not-significant")
             checked += 1
     assert checked > 0
 
@@ -169,11 +169,11 @@ def test_frontend_discloses_mde_reason():
 
 
 def test_frontend_renders_verdict_states():
-    """前端必须区分 credible / noise-level 三种判定（否则用户看不出"不可信"）。"""
+    """前端必须区分 credible / underpowered 三种判定（否则用户看不出"不可信"）。"""
     js = _read("web/static/app.js")
     assert "credible" in js
-    assert "noise-level" in js
-    assert "显著但不可信" in js
+    assert "underpowered" in js
+    assert "功效不足" in js
 
 
 def test_frontend_mde_table_is_fetched():

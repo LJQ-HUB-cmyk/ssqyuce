@@ -5,7 +5,8 @@
 本模块要守住的**核心语义**（每条都要有测试）：
 1. **MDE 随窗口变短而放大** —— 这是「短窗口不等于更容易找规律」的数学基础；
 2. **``credible`` 必须同时满足"显著"与"效应达到 MDE"** —— 这是防止把噪声当发现的关键；
-3. **短窗口的"显著"应被标成 ``noise-level``，而不是可信发现**；
+3. **短窗口的"显著"应被标成 ``underpowered``（功效不足），而不是可信发现**；
+   **注意不是 ``noise``**——可能真实，只是样本量不足（r2 评审 bug#3）。
 4. **推荐值语义正确**（``short-noise`` 用于"只有短档显著、长档不显著"这种典型假象）。
 
 诚实边界：本模块**不承诺**能找到规律。在真实数据上正确的输出通常是
@@ -155,7 +156,7 @@ def test_pure_noise_credible_rate_is_calibrated_not_zero():
 
 
 def test_pure_noise_prefers_not_significant_verdicts():
-    """纯噪声下多数档应是 not-significant（而不是 noise-level）。"""
+    """纯噪声下多数档应是 not-significant（而不是 underpowered）。"""
     r = MS.scale_scan(_draws(2000, seed=13), "repeat", {"back": 1})
     verdicts = [v.get("verdict") for v in r["scales"].values()
                 if v.get("verdict") != "insufficient"]
@@ -184,11 +185,14 @@ def test_credible_requires_effect_above_mde():
             assert abs(v["delta"]) >= v["mde_abs"] - 1e-9, (k, v)
 
 
-def test_noise_level_verdict_means_significant_but_below_mde():
-    """verdict == 'noise-level' 必须满足：显著但效应 < MDE。"""
+def test_underpowered_verdict_means_significant_but_below_mde():
+    """verdict == 'underpowered' 必须满足：显著但效应 < MDE。
+
+    语义：功效不足（可能真实但样本不足），不是噪声。
+    """
     r = MS.scale_scan(_draws(2000, seed=17), "hot", {"window": 50, "k": 6})
     for k, v in r["scales"].items():
-        if v.get("verdict") == "noise-level":
+        if v.get("verdict") == "underpowered":
             assert v["significant"] is True, (k, v)
             assert abs(v["delta"]) < v["mde_abs"], (k, v)
 

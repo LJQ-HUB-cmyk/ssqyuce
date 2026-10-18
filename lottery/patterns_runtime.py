@@ -218,6 +218,7 @@ def build_snapshot(draws: Sequence[Dict], scan: Optional[Dict] = None,
             "rejected": "已否决：方向反转或被 A/B 判负",
         },
     }
+    _lifecycle_meta, _lifecycle_rules = _apply_lifecycle(rules)
     return {
         "version": SNAPSHOT_VERSION,
         "generated_at": _now(),
@@ -232,8 +233,38 @@ def build_snapshot(draws: Sequence[Dict], scan: Optional[Dict] = None,
         "eras": [e.get("name") for e in regime.eras_for(draws)],
         "era_mode": regime.ERA_MODE,
         "era_block": regime.ERA_BLOCK,
-        "rules": rules,
+        "rules": _lifecycle_rules,
+        # V11 生命周期注入（只做降级，不做放行）：把 monitor 状态的规律
+        # 强制置 usable=False，即"退居二线、只观察不使用"。engine 只读
+        # usable_rules()，因此这里改 usable 后该规律自动退出出号链路。
+        # 注入失败时保持原 rules（降级），绝不影响出号。
+        "lifecycle": _lifecycle_meta,
     }
+
+
+def _apply_lifecycle(rules: list):
+    """把 rule_lifecycle 状态应用到快照 rules 上（V11），返回 ``(meta, new_rules)``。
+
+    独立成函数的原因：build_snapshot 是**热路径**，而 apply_states 要读
+    状态文件（IO）；即使状态文件损坏/缺失也必须静默降级，不能让快照为空。
+    """
+    try:
+        from . import rule_lifecycle as RL
+        states = RL.load_states()
+        recs = (states or {}).get("rules") or {}
+        if not recs:
+            return ({"applied": False, "n_demoted_now": 0,
+                     "note_zh": "无生命周期状态（尚未纳管任何规律）"},
+                    list(rules))
+        res = RL.apply_states({"rules": rules}, states)
+        new_rules = list(res.get("rules") or rules)
+        demoted = res.get("demoted") or []
+        return ({"applied": True, "n_demoted_now": len(demoted),
+                 "demoted": demoted[:20],
+                 "note_zh": res.get("note_zh") or ""}, new_rules)
+    except Exception as exc:                                      # noqa: BLE001
+        return ({"applied": False, "error": f"{type(exc).__name__}: {exc}",
+                 "note_zh": "生命周期注入失败（不影响出号）"}, list(rules))
 
 
 def _evidence_text(h: Dict, rep: Dict) -> str:

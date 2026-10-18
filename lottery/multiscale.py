@@ -66,10 +66,21 @@ import numpy as np
 
 from . import discovery
 
-# 单注红球命中标准差（超几何 N=33,K=6,n=6；已用 pmf 数值验证）
-SIGMA1 = 0.8678
-# 理论基线：每注命中期望 6*6/33
-BASELINE_MEAN = 6 * 6 / 33
+# 各 target 的单注命中标准差 —— 这是 MDE 的分母，**必须按 target 分流**。
+# 红球（target="red"）：单注红球命中 K ~ Hypergeometric(N=33,K=6,n=6)，σ≈0.8678
+#   （pmf 数值验证：E=1.0909, Var=0.7531, sd=0.8678）
+# 蓝球（target="blue"）：命中是 0/1 伯努利（P=1/16），σ=sqrt(p(1-p))≈0.242
+# 此前把两者混用 σ=0.8678，导致蓝球 MDE 被放大 3.58 倍、且 rel 分母错
+# （r2 统计评审 MULTISCALE_DESIGN.md §2 指出）。
+SIGMA_BY_TARGET = {
+    "red": 0.8678,
+    "blue": float(__import__("math").sqrt((1.0 / 16.0) * (15.0 / 16.0))),
+}
+# 理论基线（每注命中期望），按 target 分流
+BASELINE_BY_TARGET = {"red": 6 * 6 / 33, "blue": 1.0 / 16.0}
+# 兼容旧引用：默认红球口径
+SIGMA1 = SIGMA_BY_TARGET["red"]
+BASELINE_MEAN = BASELINE_BY_TARGET["red"]
 # 双侧 α=0.05 + power=0.8 的临界常数
 _Z_ALPHA = 1.959964
 _Z_POWER = 0.841621
@@ -91,17 +102,24 @@ SCALES: List[Dict[str, Any]] = [
 SCALE_BY_KEY = {s["key"]: s for s in SCALES}
 
 
-def mde_for(n: int) -> Dict[str, float]:
+def mde_for(n: int, target: str = "red") -> Dict[str, float]:
     """窗口 n 期在 α=0.05 / power=0.8 下能检出的最小效应。
 
     返回 ``{abs, rel, z_crit}``：绝对 Δ、相对基线比例、名义临界 z。
+    ``target`` 决定 σ 与基线（red 用超几何 σ=0.8678/基线 1.0909；
+    blue 用伯努利 σ≈0.242/基线 0.0625）。**必须分流**，
+    否则蓝球 MDE 会被红球 σ 放大 3.58 倍（r2 评审 bug#1）。
     """
     n = max(2, int(n))
-    abs_mde = (_Z_ALPHA + _Z_POWER) * SIGMA1 / np.sqrt(n)
+    sigma = SIGMA_BY_TARGET.get(target, SIGMA1)
+    base = BASELINE_BY_TARGET.get(target, BASELINE_MEAN)
+    abs_mde = (_Z_ALPHA + _Z_POWER) * sigma / np.sqrt(n)
     return {
         "n": int(n),
+        "target": target,
+        "sigma": sigma,
         "abs": float(abs_mde),
-        "rel": float(abs_mde / BASELINE_MEAN),
+        "rel": float(abs_mde / base),
         "z_crit": float(_Z_ALPHA),
     }
 
@@ -151,7 +169,9 @@ def scale_scan(draws: Sequence[Dict], key: str, params: Dict,
         z = float(mean / (sd / np.sqrt(ser["n"]))) if sd > 0 else 0.0
         # 双侧 p（正态近似；大样本下 t 与 z 差异可忽略）
         p_raw = float(2 * (1 - _norm_cdf(abs(z))))
-        m = mde_for(ser["n"])
+        # target 分流（r2 评审 bug#1 修复）：蓝球用伯努利 σ 与基线
+        target = str(flt.get("target") or "red")
+        m = mde_for(ser["n"], target=target)
         significant = p_raw < 0.05
         # 关键：显著 **且** 效应量达到该档 MDE 才算"可信的发现"
         credible = bool(significant and abs(mean) >= m["abs"])
@@ -161,7 +181,7 @@ def scale_scan(draws: Sequence[Dict], key: str, params: Dict,
             "mde_abs": round(m["abs"], 4), "mde_rel": round(m["rel"], 4),
             "significant": bool(significant), "credible": credible,
             "verdict": ("credible" if credible else
-                        ("noise-level" if significant else "not-significant")),
+                        ("underpowered" if significant else "not-significant")),
             "reason_zh": _scale_reason(mean, m, significant, credible),
         }
 
@@ -180,8 +200,12 @@ def _scale_reason(mean: float, mde: Dict, significant: bool, credible: bool) -> 
         return (f"效应 {mean:+.4f} 达到该档检出下限 {mde['abs']:.4f}，"
                 f"是本档可信的发现（仍需前置注册 + A/B 确认）")
     if significant:
-        return (f"p<0.05 但效应 {mean:+.4f} 未达该档检出下限 {mde['abs']:.4f} —— "
-                f"属『靠样本波动凑出来的显著』，不可信")
+        # underpowered：效应在统计上是显著的，但它小于该档能可靠检出的下限。
+        # 这不是"噪声"——它可能是真实的，只是样本量不足以确认。
+        # 用 underpowered 而非 noise（r2 评审 bug#3：noise 标签把真实中等效应
+        # 错标成"噪声凑的"，38% 概率误伤 +22% 的真实效应）。
+        return (f"p<0.05 但效应 {mean:+.4f} 低于该档可靠检出下限 {mde['abs']:.4f} "
+                f"—— 属「功效不足（underpowered）」：可能真实，但样本量尚不足以确认")
     return (f"未达显著（效应 {mean:+.4f} vs 本档需检测到 {mde['abs']:.4f}）")
 
 
