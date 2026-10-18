@@ -31,7 +31,13 @@ services:
       - LOTT_LLM_TOTAL_TIMEOUT=${LOTT_LLM_TOTAL_TIMEOUT:-75}
       - LOTT_LLM_EXTRA_BODY=${LOTT_LLM_EXTRA_BODY:-}
       - LOTT_LLM_EXTRA_BODY_MAP=${LOTT_LLM_EXTRA_BODY_MAP:-}
-      - LOTT_N_TICKETS=${LOTT_N_TICKETS:-10}
+      - LOTT_N_TICKETS=${LOTT_N_TICKETS:-5}
+      # ---- V11/V12：严格模式必须透传，否则改 .env 不生效 ----
+      - LOTT_STRICT_MODE=${LOTT_STRICT_MODE:-0}
+      - LOTT_BOOT_REFRESH_RULES=${LOTT_BOOT_REFRESH_RULES:-1}
+      - LOTT_LIFECYCLE_K_DEMOTE=${LOTT_LIFECYCLE_K_DEMOTE:-2}
+      - LOTT_LIFECYCLE_K_UPGRADE=${LOTT_LIFECYCLE_K_UPGRADE:-2}
+      - LOTT_LIFECYCLE_MIN_DWELL=${LOTT_LIFECYCLE_MIN_DWELL:-3}
       # ---- V10：方法开关必须透传，否则「按文档改 .env 不生效」----
       # compose 只注入此处列出的变量；此前 LOTT_METHODS 等从未列出，
       # 导致用户改 .env 后容器内仍用代码默认（V10 前默认还是"全部启用"）。

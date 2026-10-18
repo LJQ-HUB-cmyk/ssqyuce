@@ -576,16 +576,33 @@ def resolve_channels(*, force_production: bool = False) -> Dict:
     effective = effective_spec(mode, spec)
     families = {fam: bool(is_enabled(fam, effective)) for fam in FAMILIES}
 
+    # V12 严格模式：强制启用 llm 族（用户指令「必须 LLM 出号」）。
+    # methods 配置（.env LOTT_METHODS）默认不含 llm（V10 起 stat,ml,uniform），
+    # 非严格模式保持原样；严格模式下必须放行，否则 llm_family=False 直接否决。
+    if os.environ.get("LOTT_STRICT_MODE", "0") == "1":
+        families["llm"] = True
+
     llm_output_mode = _resolve_llm_output_mode(conf, families["llm"])
     # V10-11：技能关停（决策技能 Wilson 下界 ≤ 随机基线 → 关掉"LLM 出号决策通道"）。
     # **只影响 llm_can_pick**：预测链路照常出号（统计/ML/uniform），不会像
     # LLM_DISABLED 那样让 Web 预测 503。状态来自 data/llm_config.json。
     _decision = decision_state()
     decision_disabled = bool(_decision["disabled"])
+    # V12 严格模式豁免（用户 2026-10-18 指令：「必须 LLM 出号，否则不出号」）：
+    # 严格模式开启时强制 llm_can_pick=True —— 覆盖 V10 的默认 off（"LLM 无信息"）
+    # 与决策技能关停（decision_disabled）。这是用户明确选择的严格语义；
+    # 非严格模式仍走 V10 诚实默认。
+    # 不在此处判断 LLM 是否"已配置"：配置判定交给出号时的 llm_tickets
+    # （缺配置则拒绝/降级，Web 路径走 LLMChannelError → 503 明确报错，
+    # 仍符合"LLM 不可用则不出号"的严格语义）。
+    _strict = os.environ.get("LOTT_STRICT_MODE", "0") == "1"
     llm_can_pick = bool(
         families["llm"] and llm_output_mode != "off" and mode == "production"
         and not decision_disabled
     )
+    if _strict and families["llm"]:
+        llm_can_pick = True
+
     research_arm = {
         "stat": bool(families["stat"]),
         "llm_probe": bool(families["llm"] and mode == "research"),
