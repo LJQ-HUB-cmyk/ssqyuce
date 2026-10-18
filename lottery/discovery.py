@@ -145,6 +145,47 @@ class ScanContext(dict):
     # 派生缓存：clone 时不复制（数值上无影响，按需重建比深拷贝 4096 槽的共现表更便宜）
     _DERIVED = ("_slide", "_wd_slide", "_pair_slide", "_pat")
 
+    # ---- V12-01：支持切片，修「形态族 30 档全部 KeyError 被静默吞掉」----
+    #
+    # 背景（docs/analysis/LEAD_VERDICT.md §1.2）：V11/V12 新增的 8 个形态族选择器
+    # 统一写成 ``history[-w:]`` 再遍历 dict 取 ``d.get("reds")``。但 as-of 回放传进来
+    # 的是 ``ScanContext``（dict 子类），``ctx[-30:]`` 会走 dict.__getitem__(slice)
+    # → ``KeyError: slice(-30, None, None)``；该异常被 asof_scan 的
+    # ``except Exception: chosen = set()`` 吞成空集，于是 k≡0、exp≡0，最后被
+    # ``discover()`` 的 ``if sd <= 0: continue`` 二次跳过 —— 这 30 档因此
+    # **从未被检验**，却让系统对外声称「124 维全搜过」。
+    #
+    # 修法：切片返回「按时间升序的 draw 字典列表」，语义与 ``list(draws)[a:b]``
+    # 完全一致，使选择器无需感知自己拿到的是 list 还是 ScanContext。
+    # 只拦 slice，键访问（ctx["n"] 等）行为不变。
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            return self._rows_as_draws()[key]
+        return super().__getitem__(key)
+
+    # 注意：**不要**重写 __len__。
+    # tests/test_v6_regime.py::test_scan_context_n_does_not_use_dict_len 明确守护
+    # 「len(ctx) 是键数量，不能当历史期数用」——那是 dict 子类的固有语义，改动它
+    # 会让 ``len(ctx)==100`` 与 ``ctx.n==100`` 巧合相等，从而掩盖真正的误用。
+    # 选择器里若需要期数，请用 ``ctx.n`` 或对切片取 ``len(ctx[-w:])``。
+    def _rows_as_draws(self) -> List[Dict]:
+        """把增量缓存还原成与 ``db.load_draws()`` 同形状的 draw 列表（升序）。
+
+        ``red_rows`` 在 ``new()`` 时空列表、每 ``advance`` 追加一期，与 draws
+        一一对应，因此下标可直接对齐，无需另存原始 dict。
+        """
+        key = "_draws_view"
+        rows = self["red_rows"]
+        cached = self.get(key)
+        if cached is not None and cached[0] == len(rows):
+            return cached[1]
+        blues, issues, dates = self["blue_rows"], self["issues"], self["dates"]
+        out = [{"reds": list(rows[i]), "blue": blues[i],
+                "issue": issues[i], "date": dates[i]}
+               for i in range(len(rows))]
+        self[key] = (len(rows), out)
+        return out
+
     def clone(self, keep_derived: bool = False) -> "ScanContext":
         """复制当前状态（分支回放用）。
 
@@ -1123,6 +1164,63 @@ def make_filter(key: str, params: Optional[Dict] = None) -> Dict:
         "selector": fam["selector"](params),
         "label": f"{fam['name_zh']}{params or ''}",
     }
+
+
+def complement_filter(flt: Dict) -> Dict:
+    """返回一个筛选条件的**补集**（V12-21 补集反转，裁决 R-8）。
+
+    数学前提（`docs/analysis/P2_STATS_WHY_ZERO.md` §4.2b，Lead 与 P6 各自实测）：
+
+        hits(S) + hits(complement(S)) ≡ 6     （红球，每期 6 个号必落其内）
+        delta_S + delta_{comp(S)} ≡ 0          （``X_S + X_comp = 6`` 恒等式）
+
+    也就是说，**一个「显著为负」的过滤器，其补集就是「显著为正」的过滤器**。
+    而历史实现把 ``delta < 0`` 判为「反对」→ ``status="rejected"``（见
+    ``hypothesis.resolve_registry``），等于把一半信号当失败销毁。
+
+    关键：补集与原本是**同一次检验的两种写法**，不是新的一次检验。因此
+    调用方**不得**把补集计入 ``n_tested``（FWER 不变）；返回体里的
+    ``complement_of`` 就是给调用方的显式标记。
+
+    蓝色同理（``blue`` 域用 1..16 的补集）。
+    """
+    if not flt:
+        return {}
+    target = flt.get("target") or "red"
+    universe = set(range(1, (B_MAX if target == "blue" else R_MAX) + 1))
+    inner = flt.get("selector")
+
+    def _comp_selector(history):
+        seen = set(int(x) for x in (inner(history) if inner else ()) or ())
+        return universe - seen
+
+    out = dict(flt)
+    out["selector"] = _comp_selector
+    out["complement_of"] = flt.get("label") or flt.get("key")
+    out["is_complement"] = True
+    base_zh = flt.get("name_zh") or flt.get("label") or "筛选"
+    out["name_zh"] = f"〔补集〕{base_zh}"
+    out["label"] = f"〔补集〕{flt.get('label') or base_zh}"
+    return out
+
+
+def complement_of_filter(flt: Dict) -> Optional[Dict]:
+    """若该筛选条件是一次显著的**负**效应，返回其补集；否则 None。
+
+    判定用 ``delta``（本期命中均值 − 期望）。``delta >= 0`` 时补集只会更差，
+    没有登记价值，返回 None。
+    """
+    if not flt:
+        return None
+    delta = flt.get("delta")
+    if delta is None:
+        return None
+    try:
+        if float(delta) >= 0:
+            return None
+    except (TypeError, ValueError):
+        return None
+    return complement_filter(flt)
 
 
 def combine(filters: Sequence[Dict], mode: str = "union") -> Dict:

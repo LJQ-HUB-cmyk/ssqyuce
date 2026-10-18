@@ -201,11 +201,30 @@ def build_snapshot(draws: Sequence[Dict], scan: Optional[Dict] = None,
     _n_long = sum(1 for r in rules if r.get("tier") == "usable_long_term")
     _n_phase = sum(1 for r in rules if r.get("tier") == "usable_phase")
     counts = {
-        # usable = 两类之和（长期 + 阶段），与旧口径兼容
-        "usable": _n_long + _n_phase,
+        # V12-04（裁决 R-2）：**拆分跨层求和**。
+        #
+        # 旧写法 ``"usable": _n_long + _n_phase``（注释「与旧口径兼容」）把两种
+        # **证据强度完全不同**的东西加在一起：
+        #   usable_long_term —— 阶段持续有效 + A/B 验证 + 前置注册通过（真规律）
+        #   usable_phase     —— 仅当前阶段有效，默认关闭，3515 期研究未支持其可预测性
+        # 相加会让首屏出现「5 条可用，其中 0 条有预测力」，比「0 条」更误导
+        # （docs/analysis/LEAD_VERDICT.md §五）。
+        #
+        # 现在：按层分列于 ``by_layer``，``usable`` 保留为**兼容字段**但语义收紧为
+        # 「长期可用条数」= 旧口径里的 usable_long_term。真正的跨层合计不再提供。
+        "by_layer": {
+            "usable_long_term": _n_long,
+            "usable_phase": _n_phase,
+            "monitor": sum(1 for r in rules if r["tier"] == "monitor"),
+            "rejected": sum(1 for r in rules if r["tier"] == "rejected"),
+        },
+        # 兼容字段：等于 usable_long_term，**不是**两类之和
+        "usable": _n_long,
         # V11：必须分开计数 —— 混在一起就说不清"当前在用的是什么"
         "usable_long_term": _n_long,
         "usable_phase": _n_phase,
+        # 跨层合计单独给出，字段名自带警告，供需要总量的人显式取用
+        "all_tiers_sum": _n_long + _n_phase,
         "monitor": sum(1 for r in rules if r["tier"] == "monitor"),
         "rejected": sum(1 for r in rules if r["tier"] == "rejected"),
         "phase_usable_enabled": bool(getattr(config, "LOTT_PHASE_USABLE", False)),
@@ -213,7 +232,7 @@ def build_snapshot(draws: Sequence[Dict], scan: Optional[Dict] = None,
             "usable_long_term": "可用（长期）：阶段持续有效 + A/B 验证 + 前置注册通过",
             "usable_phase": "可用（阶段）：仅当前阶段有效 —— 该档默认关闭；"
                             "3515 期研究未支持其可预测性，请以实测 Δ 为准",
-            "usable": "可用：以上两类之和",
+            "usable": "兼容字段 = 长期可用条数；**不含阶段可用**（禁止跨层相加）",
             "monitor": "仅监控：证据不足（各阶段未检出）或阶段曾显著但未复现",
             "rejected": "已否决：方向反转或被 A/B 判负",
         },

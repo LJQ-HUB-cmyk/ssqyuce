@@ -463,9 +463,13 @@ function renderRuleUsage(res) {
   let h = '<div class="track-metrics">' +
     metricItem("可用规律", Number(r.usable || 0), "阶段持续有效 + A/B 通过") +
     metricItem("本轮受规律影响的候选", Number(r.n_resorted || 0), r.mode === "active" ? "已按规律重排" : "影子模式：仅记录") +
-    metricItem("快照可用/监控/否决",
-      (counts.usable || 0) + " / " + (counts.monitor || 0) + " / " + (counts.rejected || 0),
-      snap.generated_at ? "快照 " + snap.generated_at : "未生成快照") +
+    // V12-04（裁决 R-2）：**禁止跨层相加**。usable 只显示长期可用，
+    // 阶段可用单独列出并标注「未获支持」，避免出现「N 条可用其中大部分没预测力」。
+    metricItem("长期可用 / 监控 / 否决",
+      (counts.usable_long_term || 0) + " / " + (counts.monitor || 0) + " / " + (counts.rejected || 0),
+      counts.usable_phase
+        ? "另：阶段可用 " + counts.usable_phase + " 条（3515 期未获支持，仅观察）"
+        : (snap.generated_at ? "快照 " + snap.generated_at : "未生成快照")) +
     '</div>';
   h += '<div class="rule-shadow">' + escHtml(r.note_zh || "") + '</div>';
   const rules = r.usable_rules || [];
@@ -572,7 +576,13 @@ async function runClosedLoop() {
     freeText: "🤖 AI 规律闭环（挖掘→验证→使用）",
     onDone: async (r) => {
       const rt = r.runtime || {};
-      toast("闭环完成：可用规律 " + ((rt.counts || {}).usable || 0) + " 条");
+      {
+        // V12-04：只用长期可用数，不把阶段可用混进来
+        const _c = rt.counts || {};
+        const _ph = Number(_c.usable_phase || 0);
+        toast("闭环完成：长期可用规律 " + (Number(_c.usable_long_term || 0)) + " 条" +
+              (_ph ? "（另阶段可用 " + _ph + " 条，仅观察）" : ""));
+      }
       if (typeof renderLab === "function" && r.claims) renderLab(r);
       await loadLastPrediction();
       if (typeof loadRegimeOverview === "function") loadRegimeOverview(false);
@@ -2090,8 +2100,13 @@ function renderRegistry(rep) {
     '<div class="note">' + escHtml(rep.note_zh || "") + "</div>" +
     (snap.available
       ? '<div class="note">规律快照基准 ' + escHtml(String(snap.base_issue || "-")) +
-        " · 快照内 usable/monitor/rejected = " +
-        JSON.stringify(snap.counts || {}) + (snap.stale ? " · ⚠ 快照已过期" : "") + "</div>"
+        " · 快照计数 = " +
+        JSON.stringify((snap.counts || {}).by_layer || {
+          usable_long_term: (snap.counts || {}).usable_long_term,
+          usable_phase: (snap.counts || {}).usable_phase,
+          monitor: (snap.counts || {}).monitor,
+          rejected: (snap.counts || {}).rejected,
+        }) + (snap.stale ? " · ⚠ 快照已过期" : "") + "</div>"
       : '<div class="note">规律快照尚未生成（前端只看已登记实验）。</div>');
 }
 
@@ -3722,7 +3737,7 @@ async function loadAll() {
       if (health.version) {
         const ver = "v" + health.version;
         const vb = $("#verBadge"), vt = $("#verText");
-        if (vb) { vb.textContent = ver; vb.title = "系统版本 " + ver + " · v3.0 极简首页"; }
+        if (vb) { vb.textContent = ver; vb.title = "系统版本 " + ver + " · v4.0 V12"; }
         if (vt) vt.textContent = ver;
       }
     }

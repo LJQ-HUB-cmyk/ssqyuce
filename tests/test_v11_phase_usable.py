@@ -159,7 +159,14 @@ def test_phase_switch_does_not_relax_long_term_requirements(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_counts_separate_long_term_and_phase(monkeypatch):
-    """同时存在长期与阶段类时，计数必须分开且 usable = 两者之和。"""
+    """同时存在长期与阶段类时，计数必须分开。
+
+    V12-04（裁决 R-2）：``usable`` 改为**兼容字段 = 长期可用条数**，
+    **禁止**跨层相加。理由：usable_long_term（阶段持续 + A/B + 前置注册通过）
+    与 usable_phase（仅当前阶段、默认关闭、3515 期未获支持）证据强度完全不同，
+    相加会让首屏出现「4 条可用，其中 3 条没有预测力」，比「0 条」更误导。
+    需要总量时只能显式取 ``all_tiers_sum`` 或 ``by_layer``。
+    """
     hyps = [
         _hyp("L1", "persistent", params={"window": 10, "k": 5}),
         _hyp("E1", "emerging", params={"window": 10, "k": 6}),
@@ -170,7 +177,13 @@ def test_counts_separate_long_term_and_phase(monkeypatch):
     c = snap["counts"]
     assert c["usable_long_term"] == 1, c
     assert c["usable_phase"] == 3, c
-    assert c["usable"] == c["usable_long_term"] + c["usable_phase"], c
+    # 兼容字段不得跨层相加
+    assert c["usable"] == c["usable_long_term"], c
+    assert c["usable"] != c["usable_long_term"] + c["usable_phase"], c
+    # 跨层合计必须只在显式命名的字段里出现
+    assert c["all_tiers_sum"] == c["usable_long_term"] + c["usable_phase"], c
+    assert c["by_layer"]["usable_long_term"] == c["usable_long_term"]
+    assert c["by_layer"]["usable_phase"] == c["usable_phase"]
     assert c["phase_usable_enabled"] is True
 
 

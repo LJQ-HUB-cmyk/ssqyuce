@@ -1454,6 +1454,96 @@ def score_hypothesis(hyp: Optional[Dict], replay_result: Optional[Dict]) -> Dict
     return out
 
 
+# ---------------------------------------------------------------------------
+# V12-21 补集反转（complement inversion）辅助函数
+# ---------------------------------------------------------------------------
+#
+# 依据：hits(S) + hits(complement(S)) ≡ 6（红球每期 6 个号必落其内）
+#       ⇒ delta_S + delta_comp ≡ 0
+# 所以「显著为负」≡「其补集显著为正」。历史实现把负 delta 判 rejected 后直接丢弃，
+# 使假设类对补集不封闭（half-open under complement）。以下三个函数负责把
+# 负效应**无损地**转成补集候选，同时保证 FWER 不变（不计入独立检验数）。
+
+def _hyp_filter_spec(hyp: Dict) -> Optional[Dict]:
+    """取出假说绑定的维度规格 ``{key, params, target}``；没有则 None。"""
+    act = hyp.get("action") if isinstance(hyp.get("action"), dict) else {}
+    spec = act.get("filter") if isinstance(act.get("filter"), dict) else None
+    if not spec:
+        # 结构类假说走 evolution 的映射（与 patterns_runtime 同口径）
+        try:
+            from . import evolution
+            spec = evolution.hypo_structure_filter(hyp)
+        except Exception:  # noqa: BLE001
+            spec = None
+    if not isinstance(spec, dict) or not spec.get("key"):
+        return None
+    return spec
+
+
+def _build_complement_hypothesis(hyp: Dict, score: Dict) -> Optional[Dict]:
+    """由一条「显著为负」的假说，构造其补集候选（纯函数，不落盘）。
+
+    返回已带 ``status="proposed"``、``complement_of`` 标记的假说 dict；
+    若该假说没有可识别的维度规格（无法构造补集），返回 None。
+    """
+    spec = _hyp_filter_spec(hyp)
+    if not spec:
+        return None
+    from . import discovery as DIS
+    try:
+        flt = DIS.make_filter(str(spec.get("key")),
+                              spec.get("params") if isinstance(spec.get("params"), dict) else None)
+    except KeyError:
+        return None
+    comp = DIS.complement_filter(flt)
+    delta = score.get("delta")
+    base_id = str(hyp.get("id"))
+    stmt = str(hyp.get("statement") or "")
+    out = {
+        "id": f"{base_id}__comp",
+        "family": hyp.get("family") or "complement",
+        "source": "stat",
+        "statement": (f"〔补集〕{stmt}（原假说显著为负 Δ={delta}，其补集等价于"
+                      f"显著为正 Δ={(-float(delta)) if delta is not None else None}；"
+                      f"由 hits(S)+hits(Sᶜ)≡6 恒等式得出，不是新增检验）"),
+        "action": {"type": "prefer_red_filter" if (flt.get("target") or "red") == "red"
+                   else "prefer_blue_filter",
+                   "filter": {"key": comp["key"], "params": comp.get("params") or {},
+                              "target": comp.get("target") or "red",
+                              "complement": True}},
+        "target": comp.get("target") or "red",
+        "hyp_status": None,
+        # 与 patterns_runtime 的 usable 门同口径：补集候选不自动可用，
+        # 仍需 A/B（status=validated）+ 前置注册（prereg_ok）三道门。
+        "status": "proposed",
+        "supports": 0,
+        "refutes": 0,
+        "prereg_status": None,
+        "prereg_ok": False,
+        "complement_of": base_id,
+        "is_complement": True,
+        "complement_delta": (-float(delta)) if delta is not None else None,
+        "evidence": dict(hyp.get("evidence") or {}),
+        "created_at": _now_iso(),
+    }
+    return out
+
+
+def _upsert_complement(reg: Dict, comp: Dict) -> bool:
+    """把补集候选幂等写入登记簿。已存在（同 id）则只刷新，不新增。"""
+    hyps = reg.setdefault("hypotheses", [])
+    cid = comp["id"]
+    for i, h in enumerate(hyps):
+        if str(h.get("id")) == cid:
+            # 保留已有的状态推进（supports/refutes/status），只刷新叙述与 delta
+            for k in ("statement", "complement_delta", "evidence"):
+                if comp.get(k) is not None:
+                    h[k] = comp[k]
+            return False
+    hyps.append(comp)
+    return True
+
+
 def resolve_registry(replay_results: Optional[Sequence[Dict]],
                      registry_path: Optional[Any] = None) -> Dict:
     """按实战回放结果更新假说库状态（**本模块仅有的两个落盘入口之一**）。
@@ -1476,6 +1566,7 @@ def resolve_registry(replay_results: Optional[Sequence[Dict]],
     validated: List[str] = []
     rejected: List[str] = []
     insufficient: List[str] = []
+    comps: List[Dict] = []
     unchanged = 0
     scored = 0
     for hyp in hyps:
@@ -1520,10 +1611,30 @@ def resolve_registry(replay_results: Optional[Sequence[Dict]],
             validated.append(str(hyp.get("id")))
             continue
         if verdict == "反对":
+            # V12-21 补集反转（裁决 R-8）：**不要**把负效应直接埋掉。
+            #
+            # hits(S) + hits(complement(S)) ≡ 6  ⇒  delta_S + delta_comp ≡ 0
+            # 一个「显著为负」的过滤器，其补集就是「显著为正」的过滤器。历史实现
+            # 在这里直接判 rejected，等于把一半信号当失败销毁（P2 §4.2b 实测：
+            # 注入 6 号 +10% 偏置时，唯一被检出的通道正是 cold 的**负** delta）。
+            #
+            # 处理：原假说仍记 rejected（它作为「正向断言」确实被数据否定了，
+            # 这一点必须诚实保留），同时**登记一条补集候选**，再由同一套
+            # p_adjusted 口径判定它是否成立。补集与原本是同一次检验的两种写法，
+            # 故**不计入 n_tested**，FWER 不变（返回体见 complements / n_tested_delta）。
             hyp["status"] = "rejected"
             rejected.append(str(hyp.get("id")))
+            comp = _build_complement_hypothesis(hyp, s)
+            if comp:
+                comps.append(comp)
             continue
         unchanged += 1  # 无显著差异：维持原状态
+
+    # 补集候选并入登记簿：同 spec 幂等（重复出现只更新计数，不新增条目）
+    added_comps = 0
+    for comp in comps:
+        if _upsert_complement(reg, comp):
+            added_comps += 1
 
     _save_registry(reg, registry_path)
     return {
@@ -1532,6 +1643,10 @@ def resolve_registry(replay_results: Optional[Sequence[Dict]],
         "insufficient": insufficient,
         "unchanged": unchanged,
         "scored": scored,
+        "complements": [c["id"] for c in comps],
+        "complements_added": added_comps,
+        # FWER 不变：补集是同一次检验的另一种写法，不得计入独立检验数
+        "n_tested_delta": 0,
         "registry_path": str(_registry_path(registry_path)),
     }
 

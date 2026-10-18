@@ -458,12 +458,19 @@ def apply_states(snapshot: Optional[Dict], states: Optional[Dict],
     out["rules"] = rules
     counts = dict(out.get("counts") or {})
     if n_demoted:
-        # 重新计数：usable 两类之和必须与 rules 里真正的 usable 一致
+        # 重新计数：必须与 rules 里真正的 usable 一致。
+        # V12-04（裁决 R-2）：**不再跨层相加** —— ``usable`` 是兼容字段，
+        # 语义收紧为「长期可用条数」；跨层合计只放在 ``all_tiers_sum``。
         counts["usable_long_term"] = sum(1 for r in rules if isinstance(r, dict)
                                          and r.get("usable_kind") == "long_term")
         counts["usable_phase"] = sum(1 for r in rules if isinstance(r, dict)
                                      and r.get("usable_kind") == "phase")
-        counts["usable"] = counts["usable_long_term"] + counts["usable_phase"]
+        counts["usable"] = counts["usable_long_term"]
+        counts["all_tiers_sum"] = counts["usable_long_term"] + counts["usable_phase"]
+        if isinstance(counts.get("by_layer"), dict):
+            counts["by_layer"] = dict(counts["by_layer"])
+            counts["by_layer"]["usable_long_term"] = counts["usable_long_term"]
+            counts["by_layer"]["usable_phase"] = counts["usable_phase"]
     counts["lifecycle_active"] = n_active
     counts["lifecycle_demoted"] = n_demoted
     out["counts"] = counts

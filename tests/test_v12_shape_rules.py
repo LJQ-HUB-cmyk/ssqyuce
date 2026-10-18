@@ -226,10 +226,19 @@ def test_frontend_loads_shape_rules():
 
 
 def test_frontend_version_bumped_shape():
+    """同 test_v11_multiscale_api::test_frontend_version_bumped 的口径。
+
+    V12 起改为「一致性 + 下限」，不再钉死某个日期号。
+    """
+    import re as _re
     from pathlib import Path
     html = Path(__file__).resolve().parent.parent.joinpath("web/index.html").read_text(encoding="utf-8")
-    assert "20261018.9" in html
-    assert "20261018.8" not in html
+    tokens = _re.findall(r"\?v=(\d{8})\.(\d+)", html)
+    assert tokens, "index.html 里找不到任何 ?v= 令牌"
+    assert len({t for t in tokens}) == 1, f"多个不一致的 ?v= 令牌: {sorted(set(tokens))}"
+    major, minor = tokens[0]
+    assert (int(major), int(minor)) >= (20261018, 12), (
+        f"?v={major}.{minor} 落后于基线 20261018.12")
 
 
 # ---------------------------------------------------------------------------

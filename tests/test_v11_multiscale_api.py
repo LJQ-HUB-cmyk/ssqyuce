@@ -183,7 +183,17 @@ def test_frontend_mde_table_is_fetched():
 
 
 def test_frontend_version_bumped():
-    """?v= 必须是最新（20261018.9，否则用户拿到的是缓存里的旧前端）。"""
+    """?v= 令牌必须存在、全部一致，且不落后于基线（否则用户拿到缓存旧前端）。
+
+    V12 起改为「一致性 + 下限」断言，不再钉死具体日期号：
+    每次升版都要改测试会让这条护栏变成形式主义，而它真正要防的是
+    **多个令牌不一致**（同一批改动里 css/js/echarts 版本不同步）。
+    """
+    import re as _re
     html = _read("web/index.html")
-    assert "20261018.9" in html
-    assert "20261018.8" not in html
+    tokens = _re.findall(r"\?v=(\d{8})\.(\d+)", html)
+    assert tokens, "index.html 里找不到任何 ?v= 令牌"
+    assert len({t for t in tokens}) == 1, f"多个不一致的 ?v= 令牌: {sorted(set(tokens))}"
+    major, minor = tokens[0]
+    assert (int(major), int(minor)) >= (20261018, 12), (
+        f"?v={major}.{minor} 落后于基线 20261018.12，用户会拿到缓存旧前端")

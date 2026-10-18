@@ -602,8 +602,14 @@ def test_resolve_registry_matches_by_method_name(reg_path):
 def test_resolve_registry_handles_empty_and_missing(reg_path, tmp_path):
     """空回放结果 / 不存在的库路径都不崩。"""
     empty = H.resolve_registry([], reg_path)
+    # V12-21 补集反转（裁决 R-8）新增三个字段：
+    #   complements / complements_added —— 负效应转成的补集候选
+    #   n_tested_delta —— 恒为 0（补集是同一次检验的另一种写法，FWER 不变）
     assert empty == {"validated": [], "rejected": [], "insufficient": [],
-                     "unchanged": 0, "scored": 0, "registry_path": str(reg_path)}
+                     "unchanged": 0, "scored": 0,
+                     "complements": [], "complements_added": 0,
+                     "n_tested_delta": 0,
+                     "registry_path": str(reg_path)}
     H.register_hypotheses([_hyp("无匹配")], reg_path)
     assert H.resolve_registry(None, reg_path)["unchanged"] == 1
     assert H.resolve_registry([{"n_issues": 300}], tmp_path / "nope.json")["scored"] == 0

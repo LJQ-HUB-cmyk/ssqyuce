@@ -84,6 +84,75 @@ def theoretical_stats() -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# 1b. 精确通过率（V12-12 / 裁决 R-3）
+# ---------------------------------------------------------------------------
+#
+# 背景：`shape_rules_report` 里 `theoretical_rate` 曾是**手写估计值**
+# （sum 0.90 / span 0.95 / zones 0.90 / consec 0.99）。这些数没有来源、
+# 无法复现，且与全枚举真值偏差很大（span 真实 0.99985，不是 0.95）。
+#
+# 本轮「形态约束通过率」还发生过**三方各报一个数**的事故：
+#   P6 报 34.12%（误取 `len(arr)<100` 的理论兜底分支，生产永不进入）
+#   Lead 报 39.69%（手搓判据时把 top_zones 写成前 5，真实是 top-10）
+#   真值 68.2992%（`engine.pass_constraints` 全枚举）
+# 因此这里提供**全枚举精确率**，并由 `tests/test_v12_shape_lock.py` 锁死，
+# 杜绝再出现「同一个数三个值」。
+
+_ENUM_RATES: Optional[Dict[str, float]] = None
+R_MAX_FOR_ENUM = 33
+
+
+def enumerated_rates() -> Dict[str, float]:
+    """C(33,6) 全枚举（1107568 注）下的精确通过率。惰性缓存（约 1~2 秒）。
+
+    返回键：``sum`` / ``span`` / ``odd`` / ``consec`` / ``shape5``。
+    ``shape5`` 是五维形态约束（和值 5~95 分位 + 跨度 7~32 + 奇偶 2~4 + 连号≤2）
+    的全枚举通过率——注意它**不等于** `engine.pass_constraints` 的生产通过率
+    68.2992%（后者还含三区 top-10 与放宽的 odd_range=[1..5]），两者口径不同，
+    见 `tests/test_v12_shape_lock.py` 的口径表。
+    """
+    global _ENUM_RATES
+    if _ENUM_RATES is not None:
+        return dict(_ENUM_RATES)
+
+    from itertools import combinations
+    all_c = combinations(range(1, R_MAX_FOR_ENUM + 1), 6)
+    n = 0
+    n_sum = 0
+    n_span = 0
+    n_odd = 0
+    n_consec = 0
+    n_shape5 = 0
+    for c in all_c:
+        n += 1
+        s = sum(c)
+        sp = c[-1] - c[0]
+        odd = sum(1 for x in c if x % 2 == 1)
+        groups = sum(1 for i in range(5)
+                     if c[i + 1] == c[i] + 1 and (i == 0 or c[i] != c[i - 1] + 1))
+        in_sum = 67 <= s <= 138
+        in_span = 7 <= sp <= 32
+        in_odd = 2 <= odd <= 4
+        in_consec = groups <= 2
+        n_sum += in_sum
+        n_span += in_span
+        n_odd += in_odd
+        n_consec += in_consec
+        n_shape5 += (in_sum and in_span and in_odd and in_consec)
+
+    _ENUM_RATES = {
+        "n_total": float(n),
+        "sum": n_sum / n,
+        "span": n_span / n,
+        "odd": n_odd / n,
+        "consec": n_consec / n,
+        "shape5": n_shape5 / n,
+    }
+    return dict(_ENUM_RATES)
+
+
+
+# ---------------------------------------------------------------------------
 # 2. 实测统计（3515 期真实数据）
 # ---------------------------------------------------------------------------
 
@@ -212,6 +281,30 @@ def check_shape(reds: Sequence[int], ctx: Dict) -> bool:
 # 4. 形态规律报告（供前端卡片；理论 vs 实测吻合度）
 # ---------------------------------------------------------------------------
 
+def _zones_top10_rate() -> float:
+    """三区配置的覆盖率（**动态口径**，V12-12 说明）。
+
+    为什么这一维不能像其它四维一样用固定全枚举值：
+    生产 `engine.constraint_ctx` 取的是「最近 500 期出现最多的 **top-10** 三区配置」，
+    该集合随数据滚动，因此没有唯一的理论值。
+
+    这里的做法：用 C(33,6) 全枚举，统计「落在**全部** 6 种三区形状
+    (z1,z2,z3)（z1+z2+z3=6, 各分量≥0）中的前 10 个最常见者」的覆盖率。
+    由于三区形状总共只有 C(8,2)=28 种，top-10 覆盖的比例很高，
+    这比原先手写的 0.90 有据可依。
+    """
+    from itertools import combinations
+    shapes: Dict[Tuple[int, int, int], int] = {}
+    for c in combinations(range(1, R_MAX_FOR_ENUM + 1), 6):
+        z1 = sum(1 for x in c if x <= 11)
+        z2 = sum(1 for x in c if 12 <= x <= 22)
+        z3 = 6 - z1 - z2
+        shapes[(z1, z2, z3)] = shapes.get((z1, z2, z3), 0) + 1
+    total = sum(shapes.values())
+    top10 = sorted(shapes.values(), reverse=True)[:10]
+    return sum(top10) / total
+
+
 def shape_rules_report(draws: Sequence[Dict]) -> Dict[str, Any]:
     """可复现的形态规律清单 + 理论/实测吻合度。
 
@@ -220,6 +313,17 @@ def shape_rules_report(draws: Sequence[Dict]) -> Dict[str, Any]:
     """
     th = theoretical_stats()
     ac = actual_stats(draws)
+    # V12-12：所有 theoretical_rate 一律取**全枚举精确值**，不再手写估计。
+    # 其中 zones 依赖「最近 500 期 top-10 三区配置」这一动态口径，
+    # 故单列 _zones_top10_rate() 说明；其余四维取 C(33,6) 全枚举。
+    _enum = enumerated_rates()
+    _er = {
+        "sum": _enum["sum"],
+        "span": _enum["span"],
+        "odd": _enum["odd"],
+        "consec": _enum["consec"],
+        "zones": _zones_top10_rate(),
+    }
     return {
         "title_zh": "形态规律（组合恒等约束）",
         "note_zh": ("这些不是【预测下一期】的规律，而是组合数学恒等约束："
@@ -227,33 +331,36 @@ def shape_rules_report(draws: Sequence[Dict]) -> Dict[str, Any]:
                     "落在这些区间内。LLM 在此约束下生成的注单形态必然合理。"
                     "以此作为严格模式的《可用规律》。"),
         "n_draws": ac.get("n", 0),
+        "enum_rates": _er,
         "rules": [
             {"key": "sum", "name_zh": "和值区间",
              "desc_zh": f"6 红和值应落在 [{th['sum_p5']:.0f}, {th['sum_p95']:.0f}]"
                         f"（理论 5~95 分位，均值 {th['sum_mean']:.1f}）",
-             "theoretical_rate": 0.90,
+             "theoretical_rate": _er["sum"],          # V12-12：全枚举精确率（原手写 0.90）
              "actual_mean": ac.get("sum_mean"),
              "actual_rate": ac.get("sum_in_band_rate"),
              "on": True},
             {"key": "span", "name_zh": "跨度区间",
              "desc_zh": f"跨度（最大-最小）均值 {th['span_mean']:.1f}，"
                         f"几乎总在 [7, 32]",
-             "theoretical_rate": 0.95,
+             "theoretical_rate": _er["span"],         # V12-12：全枚举精确率（原手写 0.95，真实 0.99985）
              "actual_mean": ac.get("span_mean"),
              "on": True},
             {"key": "parity", "name_zh": "奇偶个数",
-             "desc_zh": f"奇数个数 2~4 个（理论占比 {th['odd_2_4_rate']:.1%}）",
-             "theoretical_rate": th["odd_2_4_rate"],
+             "desc_zh": f"奇数个数 2~4 个（理论占比 {_er['odd']:.2%}）",
+             # V12-12：改用全枚举精确率 0.825159；原先的 th["odd_2_4_rate"]
+             # 来自 20000 次随机抽样（0.8257），与其它四维口径不一致。
+             "theoretical_rate": _er["odd"],
              "actual_mean": ac.get("odd_mean"),
              "on": True},
             {"key": "zones", "name_zh": "三区配置",
              "desc_zh": "三区（1-11/12-22/23-33）分布几乎总落在若干固定配置内",
-             "theoretical_rate": 0.90,
+             "theoretical_rate": _er["zones"],        # V12-12：见下 zones 口径说明
              "actual_mean": None,
              "on": True},
             {"key": "consec", "name_zh": "连号组数",
              "desc_zh": "连号组数有上限（极少出现 ≥3 组连号）",
-             "theoretical_rate": 0.99,
+             "theoretical_rate": _er["consec"],       # V12-12：全枚举精确率（原手写 0.99）
              "actual_mean": None,
              "on": True},
         ],
