@@ -1570,6 +1570,71 @@ def llm_arm(limit_issues: Optional[int] = Query(None, ge=1, le=1000),
     return _jsonable(payload)
 
 
+@app.get("/api/multiscale/mde-table")
+def multiscale_mde_table():
+    """V11：各窗口期数的**检出能力对照表**（MDE = 最小可检出效应）。
+
+    为什么单独给这张表（这是 V11 多尺度卡存在的意义）：
+    用户直觉是「窗口越短越容易找到规律」，但数学上是**反的** ——
+    窗口越短，能检出的效应必须越大。把这张表摆在明面上，用户看到
+    「40 期需 +35% 才算显著」就不会被短窗口的"显著"骗到。
+    """
+    from . import multiscale as MS
+
+    rows = []
+    for n in (30, 40, 60, 80, 100, 150, 300, 500, 1000, 3515):
+        m = MS.mde_for(n)
+        rows.append({
+            "n": m["n"],
+            "mde_abs": round(m["abs"], 4),
+            "mde_rel": round(m["rel"], 4),
+            "mde_rel_pct": f"{m['rel'] * 100:.1f}%",
+            "in_use": any(sc["window"] == n for sc in MS.SCALES),
+        })
+    return {
+        "ok": True,
+        "baseline_mean": round(MS.BASELINE_MEAN, 4),
+        "sigma1": MS.SIGMA1,
+        "alpha": 0.05, "power": 0.8,
+        "rows": rows,
+        "scales": [{"key": s["key"], "label_zh": s["label_zh"],
+                    "window": s["window"], "role_zh": s["role_zh"]}
+                   for s in MS.SCALES],
+        "note_zh": ("MDE = (z_α + z_β)·σ/√n，表示该窗口在 α=0.05、power=0.8 下"
+                    "**能检出的最小效应**。窗口越短 MDE 越大：40 期需 +35%，"
+                    "全部 3515 期只需 +3.8%。"
+                    "短窗口的『显著』若未达到该档 MDE，属样本波动，不可信。"),
+    }
+
+
+@app.get("/api/multiscale/scan")
+def multiscale_scan(only_interesting: bool = Query(True),
+                    scales: Optional[str] = Query(None)):
+    """V11：多尺度规律扫描（长期 / 中长期 / 中期 / 短中期 / 短期 五个尺度）。
+
+    ``scales`` 为逗号分隔的档位 key 子集（如 ``all,long``）；省略=全部五档。
+    ``only_interesting=True``（默认）时只返回 recommendation != none 的条目，
+    避免界面全是"不显著"。
+    """
+    from . import multiscale as MS
+
+    draws = db.load_draws()
+    if not draws:
+        return JSONResponse({"ok": False, "error": "本地暂无开奖数据"}, status_code=400)
+    scale_keys = None
+    if scales:
+        scale_keys = [x.strip() for x in str(scales).split(",") if x.strip()]
+        scale_keys = [k for k in scale_keys if k in MS.SCALE_BY_KEY] or None
+    try:
+        res = MS.multi_scale_scan(draws, scales=scale_keys,
+                                  only_interesting=bool(only_interesting))
+    except Exception as exc:                                   # noqa: BLE001
+        return JSONResponse({"ok": False, "error": f"多尺度扫描失败: {exc}"}, status_code=200)
+    res["ok"] = True
+    res["mode"] = "multiscale"
+    return _jsonable(res)
+
+
 @app.get("/api/samples/side-by-side")
 def samples_side_by_side(mode: str = Query("replay")):
     """V10-10：真实交战样本 vs 离线回放样本**并排**（``mixable=False``，禁止相加）。
@@ -2709,12 +2774,19 @@ def _boot_refresh_rules_snapshot():
         print("[rules] 启动后规律快照刷新失败（不影响出号）:", e)
 
 
-try:
-    import threading as _threading
-    _threading.Thread(target=_boot_refresh_rules_snapshot, daemon=True,
-                      name="boot-rules-refresh").start()
-except Exception:  # noqa: BLE001
-    pass
+# 启动后异步补刷规律快照。**必须可关闭**：
+#   ① pytest 会话会反复 import 本模块，若每次都在导入期起线程，
+#      多个 boot-rules-refresh 线程会并发连同一个 SQLite 连接（check_same_thread=False），
+#      与 joblib 的多进程后端叠加后实测触发 **Segmentation fault**（2026-10-18）；
+#   ② 调度器/CLI 等非 Web 场景也不需要这个补刷。
+# 因此由 config.BOOT_REFRESH_RULES 控制（默认 1=开，pytest 下由 conftest 置 0）。
+if getattr(config, "BOOT_REFRESH_RULES", True) and os.environ.get("LOTT_BOOT_REFRESH_RULES", "1") == "1":
+    try:
+        import threading as _threading
+        _threading.Thread(target=_boot_refresh_rules_snapshot, daemon=True,
+                          name="boot-rules-refresh").start()
+    except Exception:  # noqa: BLE001
+        pass
 
 if config.SCHEDULER_ENABLED:
     import threading

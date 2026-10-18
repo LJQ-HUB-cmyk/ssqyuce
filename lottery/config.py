@@ -234,6 +234,12 @@ PHASE_USABLE_AUTO_OFF_T = float(os.environ.get("LOTT_PHASE_USABLE_AUTO_OFF_T", "
 # 阶段类规律进入候选所需的最小配对期数（样本不足不统计、也不自动关闭）
 PHASE_USABLE_MIN_PAIRS = int(os.environ.get("LOTT_PHASE_USABLE_MIN_PAIRS", "60"))
 
+# 启动期后台补刷规律快照：默认开。
+# 关闭它用于「pytest / CLI / 任何会反复 import api_app 的场景」——
+# 每次 import 都起一个后台线程会累积并发连 SQLite，叠加 joblib 多进程后
+# 实测触发 Segmentation fault（2026-10-18）。测试由 conftest.py 置 0。
+BOOT_REFRESH_RULES = os.environ.get("LOTT_BOOT_REFRESH_RULES", "1") == "1"
+
 # LOTT_ADAPTIVE_ENABLED：1=开（默认），0=关（保留人工 A/B 开关语义）
 ADAPTIVE_ENABLED = os.environ.get("LOTT_ADAPTIVE_ENABLED", "1") == "1"
 # 连续 LOTT_ADAPTIVE_K 期命中低于随机基线 → 自动降权 50%（0.5）或移出候选池
@@ -422,6 +428,28 @@ ML_CAL_CV = int(os.environ.get("LOTT_ML_CAL_CV", "2"))              # 概率校�
 # `ml_model.prune_model_cache`）。仅调整超参（树数/深度/CV 折数）无需递增，
 # 但若要让改动立刻生效也应递增，否则会继续命中旧缓存。
 MODEL_SCHEMA_VERSION = "2"        # v2：V10-08 首版带版本号的缓存键（此前无版本，v1 仅指历史）
+
+# ---------- V11 S5：规律生命周期（衰减 → 退居二线 monitor）----------
+# 用户诉求（2026-10-18）：「用 AI 来判断哪些规律可能掉下去，适时把这些规律预测
+# 退居二线，只观察不使用了。」
+#
+# 设计见 docs/reviews/AI_DEMOTION_DESIGN.md。三条纪律固化在这里：
+#   ① **动作权归确定性状态机**（rule_lifecycle.decide_rule_state，纯函数、零 LLM），
+#      LLM 只做「复核意见 + 解释」，其 Skill 可度量、可自动降级；因此本模块**任何**
+#      故障都不会让规律无法使用，也不会让衰减的规律赖在一线。
+#   ② **目标态只能是 monitor**（证据不足、继续观察），绝不自动写 rejected
+#      （rejected 只来自 hypothesis.resolve_registry 的「反对」判定）。
+#   ③ **必须有滞后**：连续 K 次同向判定才迁移，迁移后 MIN_DWELL 期内不再评估，
+#      避免噪声让状态每期来回跳。
+#
+# 为什么这三个数是 2/2/3：连续 2 次同向的误触发率 ≈ 单次误触发率²，再叠加 3 期
+# 冷却，每周误切换率 <1%（蒙特卡洛验收见 tests/test_v11_rule_lifecycle.py）。
+LIFECYCLE_STATE_FILE = DATA_DIR / "rule_lifecycle.json"
+LIFECYCLE_K_DEMOTE = max(1, int(os.environ.get("LOTT_LIFECYCLE_K_DEMOTE", "2")))
+LIFECYCLE_K_UPGRADE = max(1, int(os.environ.get("LOTT_LIFECYCLE_K_UPGRADE", "2")))
+LIFECYCLE_MIN_DWELL = max(0, int(os.environ.get("LOTT_LIFECYCLE_MIN_DWELL", "3")))
+# 单次周期最多评估多少条规律（防止规律库膨胀后一个周期跑太久）
+LIFECYCLE_MAX_RULES = max(1, int(os.environ.get("LOTT_LIFECYCLE_MAX_RULES", "60")))
 
 # 调度（开奖日：周二/四/日 21:35 后自动 抓取+评估+预测）
 SCHEDULER_ENABLED = os.environ.get("LOTT_SCHEDULER", "0") == "1"

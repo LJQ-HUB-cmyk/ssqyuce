@@ -2166,6 +2166,94 @@ async function runMlDiagnosis(force) {
   }
 }
 
+// ----- 卡 5：多尺度规律扫描（V11）-----
+// 这张卡的存在意义：把每档的「检出下限 MDE」摆在明面上。
+// 用户直觉是"窗口越短越容易找规律"，数学上却是反的 —— 40 期需 +35% 才算显著。
+// 不标 MDE，用户就会被短窗口的"显著"骗到。
+let _multiScaleMdeRows = null;
+
+async function loadMultiScaleMde() {
+  if (_multiScaleMdeRows) return _multiScaleMdeRows;
+  try {
+    const d = await api("/api/multiscale/mde-table");
+    _multiScaleMdeRows = d && d.rows ? d.rows : [];
+  } catch (_) {
+    _multiScaleMdeRows = [];
+  }
+  return _multiScaleMdeRows;
+}
+
+function _verdictMeta(v) {
+  if (v === "credible") return { txt: "可信", cls: "ok", icon: "★" };
+  if (v === "noise-level") return { txt: "显著但不可信", cls: "warn", icon: "⚠" };
+  if (v === "insufficient") return { txt: "样本不足", cls: "mute", icon: "–" };
+  return { txt: "不显著", cls: "mute", icon: "·" };
+}
+
+function renderMultiScale(rep, mdeRows) {
+  const body = $("#multiScaleBody"), mdeBox = $("#multiScaleMde"), tag = $("#multiScaleTag");
+  if (!body) return;
+  if (!rep || rep.ok === false) {
+    if (tag) tag.textContent = "失败";
+    body.innerHTML = '<div class="note">多尺度扫描失败：' + escHtml((rep && rep.error) || "未知错误") + "</div>";
+    return;
+  }
+  // MDE 对照条：让"窗口越短下限越高"一眼可见
+  if (mdeBox && mdeRows && mdeRows.length) {
+    mdeBox.innerHTML = '<div class="note" style="margin-bottom:8px">' +
+      "<b>各档检出下限（MDE）</b>：" +
+      mdeRows.filter((r) => r.in_use || r.n === 3515 || r.n === 100)
+        .map((r) => '<span class="tag">' + r.n + " 期 " + r.mde_rel_pct + "</span>").join(" ") +
+      "</div>";
+  }
+  const scales = (rep.scales || []).slice().reverse();   // 从短到长，便于对照
+  const rows = rep.results || [];
+  if (tag) tag.textContent = "扫描 " + (rep.n_scanned || 0) + " 个维度";
+  if (!rows.length) {
+    body.innerHTML = '<div class="note">没有需要关注的维度（全部不显著）——' +
+      "这在随机开奖数据上是<b>正常且预期</b>的结果。</div>";
+    return;
+  }
+  const head = "<tr><th>维度</th>" + scales.map((sc) =>
+    "<th>" + escHtml(sc.label_zh) + "<br><span class=\"hint-inline\">MDE " +
+    (sc.window ? (sc.window + "期") : "全期") + "</span></th>").join("") +
+    "<th>建议</th></tr>";
+  const bodyRows = rows.map((r) => {
+    const name = escHtml(r.key + " " + JSON.stringify(r.params || {}));
+    const cells = scales.map((sc) => {
+      const v = (r.scales || {})[sc.key];
+      if (!v || v.verdict === "insufficient") return "<td class=\"mute\">–</td>";
+      const m = _verdictMeta(v.verdict);
+      const dv = (v.delta >= 0 ? "+" : "") + Number(v.delta).toFixed(3);
+      return "<td class=\"" + m.cls + "\" title=\"" + escHtml(v.reason_zh || "") + "\">" +
+        m.icon + " " + dv + "<br><span class=\"hint-inline\">" + m.txt + "</span></td>";
+    }).join("");
+    const recTxt = { watch: "值得观察", "short-noise": "短档噪声", "regime-shift": "疑似结构变化",
+                     weak: "弱", none: "无" }[r.recommendation] || r.recommendation;
+    return "<tr><td>" + name + "</td>" + cells + "<td>" + escHtml(recTxt) + "</td></tr>";
+  }).join("");
+  body.innerHTML = '<div class="table-wrap"><table class="data-table"><thead>' + head +
+    "</thead><tbody>" + bodyRows + "</tbody></table></div>" +
+    '<div class="note" style="margin-top:8px">' + escHtml(rep.note_zh || "") + "</div>";
+}
+
+async function runMultiScale(force) {
+  const tag = $("#multiScaleTag"), btn = $("#btnMultiScale");
+  if (tag) tag.textContent = "扫描中…";
+  if (btn) btn.disabled = true;
+  try {
+    const mdeRows = await loadMultiScaleMde();
+    const rep = await api("/api/multiscale/scan" + (force ? "?only_interesting=false" : ""));
+    renderMultiScale(rep, mdeRows);
+  } catch (e) {
+    if (tag) tag.textContent = "失败";
+    const body = $("#multiScaleBody");
+    if (body) body.innerHTML = '<div class="note">多尺度扫描失败：' + escHtml(e.message) + "</div>";
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 // ----- 卡 4：两套样本并排（禁止相加） -----
 function renderSamplesSideBySide(rep) {
   const body = $("#samplesBody"), tag = $("#samplesTag");

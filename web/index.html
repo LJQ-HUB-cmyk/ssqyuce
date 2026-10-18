@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>双色球智能预测分析系统</title>
-<link rel="stylesheet" href="/static/style.css?v=20261018.6">
+<link rel="stylesheet" href="/static/style.css?v=20261018.7">
 <!-- ECharts CDN + 本地 fallback -->
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"
   onerror="this.src='/static/vendor/echarts.min.js?v=20260817.7'"></script>
@@ -317,6 +317,25 @@
               <div id="mlDiagBody"><div class="note">尚未诊断。真实彩票数据上 trusted=False 是预期结论。</div></div>
             </div>
 
+            <!-- 卡 5：多尺度规律扫描（V11）——
+                 存在的意义：把每档的"检出下限 MDE"摆在明面上。
+                 用户直觉是"窗口越短越容易找规律"，但数学上是反的：40 期需 +35% 才算显著，
+                 全部 3515 期只需 +3.8%。不标 MDE，用户就会被短窗口的"显著"骗到。 -->
+            <div class="card" id="multiScaleCard" style="margin-top:16px">
+              <h2>📏 多尺度规律扫描 <span class="tag" id="multiScaleTag">加载中…</span></h2>
+              <div class="note" style="margin-bottom:8px">
+                <b>短窗口看似更容易显著，其实是它的检出下限更高</b>：40 期需 <b>+35%</b> 的效应才算显著，
+                全部期数只需 <b>+3.8%</b>。只有效应达到该档下限（可信）才值得进一步验证；
+                标「显著但不可信」的，是靠样本波动凑出来的。
+              </div>
+              <div class="eval-actions">
+                <button id="btnMultiScale" onclick="runMultiScale(true)">重新扫描</button>
+                <span class="hint-inline">5 档：全部 / 150期(1年) / 300期(2年) / 60期 / 40期</span>
+              </div>
+              <div id="multiScaleMde"></div>
+              <div id="multiScaleBody"><div class="note">扫描中…</div></div>
+            </div>
+
             <!-- 卡 4：两套样本并排（replay.samples_side_by_side，mixable=False，禁止相加） -->
             <div class="card" id="samplesCard" style="margin-top:16px">
               <h2>📐 样本并排 <span class="tag" id="samplesTag">加载中…</span></h2>
@@ -620,6 +639,6 @@
 </div>
 
 <div id="toast"></div>
-<script src="/static/app.js?v=20261018.6"></script>
+<script src="/static/app.js?v=20261018.7"></script>
 </body>
 </html>

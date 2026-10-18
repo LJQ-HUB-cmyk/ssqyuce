@@ -34,8 +34,16 @@
 from __future__ import annotations
 
 import datetime as _dt
+import os as _os
 import random
 from types import SimpleNamespace
+
+# 必须在任何 lottery.* 模块被 import **之前**设好：
+# api_app 在导入期会启动 `boot-rules-refresh` 后台线程（sleep 20 后连 SQLite）。
+# pytest 会话会反复 import 该模块，累积的线程与 joblib 多进程后端叠加后
+# 实测导致 **Segmentation fault**（2026-10-18，全量跑挂）。
+# 因此测试环境统一关掉这个「启动期补刷」，改用显式调用来测试相关逻辑。
+_os.environ.setdefault("LOTT_BOOT_REFRESH_RULES", "0")
 
 import pytest
 
