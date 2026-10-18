@@ -35,27 +35,45 @@ def constraint_ctx(draws: List[Dict]) -> Dict:
     odd_range = sorted(
         (k for k, v in odd_hist.items() if v / max(1, len(oc)) >= 0.02)
     )
+    from . import shape_rules as _SR
+    _sc = _SR.shape_constraint_ctx(draws)
     return {
         "sum_min": float(np.percentile(s, 5)),
         "sum_max": float(np.percentile(s, 95)),
         "top_zones": top_zones,
         "odd_range": odd_range if odd_range else [2, 3, 4],
+        # V12：跨度 / 连号 —— 组合恒等带（理论兜底，不随历史波动）
+        "span_min": float(_sc.get("span_min", 17.0)),
+        "span_max": float(_sc.get("span_max", 31.0)),
+        "max_consecutive": int(_sc.get("max_consecutive", 2)),
     }
 
 
 def pass_constraints(reds: List[int], blue: int, ctx: Dict) -> bool:
+    """形态硬约束：和值 / 三区 / 奇偶（既有）+ 跨度 / 连号（V12 扩展）。
+
+    ctx 来自 ``constraint_ctx``（三维）或 ``shape_rules.shape_constraint_ctx``
+    （五维）。缺 span/max_consecutive 键时跳过对应维度（向后兼容）。
+    """
     s = sum(reds)
-    if not (ctx["sum_min"] <= s <= ctx["sum_max"]):
+    if not (ctx.get("sum_min", -1e9) <= s <= ctx.get("sum_max", 1e9)):
         return False
     z1 = sum(1 for r in reds if 1 <= r <= 11)
     z2 = sum(1 for r in reds if 12 <= r <= 22)
     z3 = 6 - z1 - z2
-    if (z1, z2, z3) not in ctx["top_zones"]:
+    if (z1, z2, z3) not in ctx.get("top_zones", [(1, 3, 2), (2, 2, 2)]):
         return False
     odd = sum(1 for r in reds if r % 2 == 1)
-    if odd not in ctx["odd_range"]:
+    if odd not in ctx.get("odd_range", [2, 3, 4]):
         return False
-    return True
+    # V12：跨度与连号（shape_rules 提供）
+    sp = max(reds) - min(reds)
+    if not (ctx.get("span_min", -1e9) <= sp <= ctx.get("span_max", 1e9)):
+        return False
+    rs = sorted(reds)
+    ngroups = sum(1 for i in range(len(rs) - 1)
+                  if rs[i + 1] == rs[i] + 1 and (i == 0 or rs[i] != rs[i - 1] + 1))
+    return ngroups <= int(ctx.get("max_consecutive", 9))
 
 
 # ---------- 统计采样 ----------

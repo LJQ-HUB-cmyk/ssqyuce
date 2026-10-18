@@ -633,3 +633,13 @@ footer { color: var(--muted); font-size: 12px; text-align: center; margin-top: 2
 .v10-side { flex: 1 1 240px; min-width: 220px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; }
 .v10-sides { display: flex; flex-wrap: wrap; gap: 10px; margin: 8px 0; }
 .v10-nomix { color: var(--muted); font-size: 11px; font-style: italic; }
+
+/* V11 严格模式横幅（无可用规律/LLM 关闭时提示不出号） */
+.strict-banner {
+  margin: 10px 0; padding: 12px 14px;
+  border: 1.5px solid var(--red, #d64541);
+  border-radius: 10px; background: rgba(214,69,65,.08);
+  font-size: 14px; line-height: 1.6;
+}
+.strict-banner .strict-ico { font-size: 18px; }
+.strict-banner .strict-gates { margin-top: 6px; font-size: 13px; opacity: .85; }

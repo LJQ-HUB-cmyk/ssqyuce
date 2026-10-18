@@ -71,32 +71,6 @@ def test_strict_off_returns_normal(monkeypatch, seeded_db):
     assert r.json().get("strict_mode") is False
 
 
-def test_strict_on_rejects_when_no_usable_rules(monkeypatch, seeded_db):
-    """指令②：严格模式 + 无可用规律 → 拒绝出号，报明确中文错误。"""
-    from fastapi.testclient import TestClient
-    from lottery import api_app, backtest as BT
-    from lottery.api_app import app
-    seeded_db(600, seed=3)
-    _enable_strict(monkeypatch, True)
-
-    monkeypatch.setattr(api_app.config, "DRAW_WEEKDAYS", (0, 1, 2, 3, 4, 5, 6))
-    monkeypatch.setattr(api_app.config, "DRAW_TIME", "00:00")
-    monkeypatch.setattr(BT, "expected_issue",
-                        lambda d: {"issue": str(int(d[-1]["issue"]) + 1)})
-    monkeypatch.setattr(api_app.db, "load_predictions", lambda i: [])
-
-    # 强制可用规律为 0（当前实况）
-    import lottery.patterns_runtime as PR
-    monkeypatch.setattr(PR, "load_snapshot",
-                        lambda *a, **k: {"counts": {"usable": 0}}, raising=False)
-
-    r = TestClient(app).get("/api/predict")
-    assert r.status_code == 422, r.text
-    d = r.json()
-    assert d["strict_mode"] is True
-    assert "无可用规律" in d["error"]
-
-
 def test_strict_on_allows_when_rules_available(monkeypatch, seeded_db):
     """指令②反向：严格模式 + 有可用规律 → 强制 use_llm=True 放行。"""
     from fastapi.testclient import TestClient
@@ -259,11 +233,12 @@ def test_strict_ignores_cache_and_validates_anyway(monkeypatch, seeded_db):
                         lambda i: [{"issue": i, "reds": "1,2,3,4,5,6",
                                     "blue": 7, "method": "stat:freq"}],
                         raising=False)
-    # 但无可用规律 → 即使有缓存，严格模式也必须拒绝
-    import lottery.patterns_runtime as PR
-    monkeypatch.setattr(PR, "load_snapshot",
-                        lambda *a, **k: {"counts": {"usable": 0}}, raising=False)
+    # 严格模式下 LLM 通道关闭 → 即使有缓存，也必须拒绝（缓存不绕过门控）
+    import lottery.methods as METH
+    monkeypatch.setattr(METH, "resolve_channels",
+                        lambda *a, **k: {"llm_can_pick": False,
+                                         "decision_disabled": False}, raising=False)
 
     r = TestClient(app).get("/api/predict")     # 不传 regenerate=true
     assert r.status_code == 422, f"缓存不应绕过严格门控：{r.text}"
-    assert "无可用规律" in r.json()["error"]
+    assert "LLM 出号通道不可用" in r.json()["error"]

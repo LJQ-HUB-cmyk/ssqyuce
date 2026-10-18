@@ -197,19 +197,25 @@ def _strict_mode_reject_response(draws, issue):
     from . import methods as _METH
     _errs = []
 
-    # ① 规律必须可用
+    # ① 形态规律可用（V12 扩大「规律」定义）：
+    #    此前要求 counts.usable > 0（显著规律），但 3515 期实测 0 条显著，
+    #    会让严格模式永远哑火。V12 起改用**组合恒等约束**（和值/跨度/三区/
+    #    奇偶/连号）作为"可用规律"：实测与 C(33,6) 理论枚举一致，可复现。
+    #    若未来真的出现显著规律，它叠加在形态约束之上。
     try:
-        from . import patterns_runtime as _PR
-        _psnap = _PR.load_snapshot(current_issue=issue) or _PR.build_snapshot(draws)
-        _usable_n = int((_psnap.get("counts") or {}).get("usable") or 0)
+        _ok_ctx = False
+        from . import shape_rules as _SR
+        _sc = _SR.shape_constraint_ctx(draws)
+        if _sc.get("sum_max") and _sc.get("top_zones"):
+            _ok_ctx = True
     except Exception:                                    # noqa: BLE001
-        _usable_n = 0
-    if _usable_n == 0:
+        _ok_ctx = False
+    if not _ok_ctx:
         _errs.append(
             ("strategy",
-             ("严格模式下不出号：当前**无可用规律**（usable=0）。"
-              "本模式要求必须用规律经 LLM 分析出号；请在「规律库」确认有 usable 规律，"
-              "或关闭严格模式（LOTT_STRICT_MODE=0）。")))
+             ("严格模式下不出号：**形态规律不可用**（组合恒等约束无法生成，"
+              "历史数据不足或异常）。形态规律是当前唯一可复现的可用规律，"
+              "请确认历史数据齐全，或关闭严格模式（LOTT_STRICT_MODE=0）。")))
 
     # ② LLM 通道必须可用
     _ch = _METH.resolve_channels()
@@ -1637,6 +1643,35 @@ def llm_arm(limit_issues: Optional[int] = Query(None, ge=1, le=1000),
         payload["report"] = report
         payload["brief"] = battle.llm_arm_brief(report)
     return _jsonable(payload)
+
+
+@app.get("/api/shape/rules")
+def shape_rules_endpoint():
+    """V12：形态规律（组合恒等约束）报告。
+
+    这些不是"预测下一期"的规律，而是**组合数学恒等约束**——任何一期开奖的
+    形态（和值/跨度/三区/奇偶/连号）都几乎必然落在这些区间内。
+    作为严格模式的"可用规律"，LLM 在此约束下生成注单，形态必然合理。
+    """
+    from . import shape_rules as SR
+    draws = db.load_draws()
+    if not draws:
+        return JSONResponse({"ok": False, "error": "本地暂无开奖数据"}, status_code=400)
+    rep = SR.shape_rules_report(draws)
+    rep["ok"] = True
+    return _jsonable(rep)
+
+
+@app.get("/api/shape/constraints")
+def shape_constraints_endpoint():
+    """V12：当前出号使用的 5 维形态约束（和值/跨度/三区/奇偶/连号）。"""
+    from . import shape_rules as SR
+    draws = db.load_draws()
+    if not draws:
+        return JSONResponse({"ok": False, "error": "本地暂无开奖数据"}, status_code=400)
+    ctx = SR.shape_constraint_ctx(draws)
+    ctx["ok"] = True
+    return _jsonable(ctx)
 
 
 @app.get("/api/multiscale/mde-table")

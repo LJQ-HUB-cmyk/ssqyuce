@@ -55,15 +55,20 @@ const pendingTasks = {};
 async function api(path, opts = {}) {
   const r = await fetch(path, opts);
   if (!r.ok) {
-    // 优先展示后端 JSON 里的 error 详情（如“大模型不可用或超时(...)”），
-    // 解析失败（如 Cloudflare 524 HTML）时退回 HTTP 状态码。
+    // 优先展示后端 JSON 里的 error 详情（如“大模型不可用或超时(...)”、
+    // 严格模式“无可用规律/LLM 通道不可用”等）；解析失败时退回 HTTP 状态码。
     let msg = "HTTP " + r.status;
+    let payload = null;
     try {
       const t = await r.text();
       const j = JSON.parse(t);
       if (j && j.error) msg = j.error;
+      payload = j;
     } catch (_) {}
-    throw new Error(msg);
+    const err = new Error(msg);
+    err.status = r.status;
+    err.payload = payload || null;
+    throw err;
   }
   return r.json();
 }
@@ -306,8 +311,27 @@ async function runPredict(regenerate, btnId) {
     }
   } catch (e) {
     toast("预测失败: " + e.message);
-    $("#predStatus").textContent = "❌ 预测失败: " + e.message;
+    $("#predStatus").textContent = "❌ " + e.message;
     $("#predStatus").style.color = "var(--red)";
+    // V11 严格模式：422 且 strict_mode 时展示专门横幅（无规律/LLM 关）
+    const b = $("#strictBanner");
+    const p = e.payload || {};
+    if (b) {
+      if (e.status === 422 && p.strict_mode) {
+        b.classList.remove("hidden");
+        b.innerHTML = '<span class="strict-ico">⛔</span> <b>严格模式 · 未出号</b><br>' +
+          escHtml(p.error || e.message) +
+          (p.strict_gates && p.strict_gates.length
+            ? '<div class="strict-gates">未通过：' +
+              p.strict_gates.map((g) =>
+                g === "strategy" ? "规律为 0 条" : g === "llm" ? "LLM 通道不可用" : g
+              ).join(" / ") + "</div>"
+            : "");
+        b.style.color = "var(--red)";
+      } else {
+        b.classList.add("hidden");
+      }
+    }
   }
   setFree(btnId, regenerate ? "🔄 强制重新生成" : "🎯 生成预测");
 }
@@ -2166,6 +2190,48 @@ async function runMlDiagnosis(force) {
   }
 }
 
+// ----- 卡 6：形态规律（组合恒等约束，V12）-----
+// 这些不是"预测下一期"的规律，而是组合数学恒等约束：
+// 和值/跨度/三区/奇偶/连号几乎必然落在这些区间内（实测 vs C(33,6) 理论一致）。
+// 作为严格模式的"可用规律"，LLM 在此约束下生成注单，形态必然合理。
+async function loadShapeRules(force) {
+  const body = document.querySelector("#shapeRuleBody");
+  const tag = document.querySelector("#shapeRuleTag");
+  if (body && !force) {
+    const dl = body.getAttribute("data-loaded");
+    if (dl === "1") return;
+  }
+  if (!body) return;
+  if (tag) tag.textContent = "加载中…";
+  try {
+    const rep = await api("/api/shape/rules?_ts=" + Date.now());
+    body.setAttribute("data-loaded", "1");
+    if (!rep || rep.ok === false || !rep.rules) {
+      body.innerHTML = '<div class="note">形态规律加载失败：' + escHtml((rep && rep.error) || "未知") + "</div>";
+      if (tag) tag.textContent = "失败";
+      return;
+    }
+    if (tag) tag.textContent = rep.n_draws + " 期实测";
+    const rows = (rep.rules || []).map((r) => {
+      const am = (r.actual_mean !== null && r.actual_mean !== undefined)
+        ? "实测均值 " + Number(r.actual_mean).toFixed(2) : "";
+      const ar = (r.actual_rate !== undefined && r.actual_rate !== null)
+        ? "实测在带 " + (r.actual_rate * 100).toFixed(1) + "%" : "";
+      return '<tr><td><b>' + escHtml(r.name_zh) + "</b><br>" +
+        '<span class="hint-inline">' + escHtml(r.desc_zh || "") + "</span></td>" +
+        "<td>" + (r.theoretical_rate * 100).toFixed(0) + "%</td>" +
+        "<td>" + escHtml(am) + " " + escHtml(ar) + "</td></tr>";
+    }).join("");
+    body.innerHTML = '<div class="table-wrap"><table class="data-table">' +
+      "<thead><tr><th>形态规律</th><th>理论覆盖率</th><th>实测</th></tr></thead>" +
+      "<tbody>" + rows + "</tbody></table></div>" +
+      '<div class="note" style="margin-top:8px">' + escHtml(rep.note_zh || "") + "</div>";
+  } catch (e) {
+    body.innerHTML = '<div class="note">形态规律加载失败：' + escHtml(e.message) + "</div>";
+    if (tag) tag.textContent = "失败";
+  }
+}
+
 // ----- 卡 5：多尺度规律扫描（V11）-----
 // 这张卡的存在意义：把每档的「检出下限 MDE」摆在明面上。
 // 用户直觉是"窗口越短越容易找规律"，数学上却是反的 —— 40 期需 +35% 才算显著。
@@ -2245,6 +2311,8 @@ async function runMultiScale(force) {
     const mdeRows = await loadMultiScaleMde();
     const rep = await api("/api/multiscale/scan" + (force ? "?only_interesting=false" : ""));
     renderMultiScale(rep, mdeRows);
+    const msBody = $("#multiScaleBody");
+    if (msBody) msBody.setAttribute("data-loaded", "1");
   } catch (e) {
     if (tag) tag.textContent = "失败";
     const body = $("#multiScaleBody");
@@ -2310,7 +2378,12 @@ async function loadV10Cards() {
     loadDistribution(),
     loadRegistryStatus(),
     loadSamplesSideBySide(),
+    loadShapeRules(false),      // V12 形态规律卡
+    loadMultiScaleMde(),        // V11 多尺度 MDE（供卡 5 表头）
   ]);
+  // V11 多尺度扫描卡：首次进 overview 时自动渲染（force=true 拉全部维度）
+  const msBody = document.querySelector("#multiScaleBody");
+  if (msBody && !msBody.getAttribute("data-loaded")) runMultiScale(true);
 }
 
 

@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>双色球智能预测分析系统</title>
-<link rel="stylesheet" href="/static/style.css?v=20261018.7">
+<link rel="stylesheet" href="/static/style.css?v=20261018.9">
 <!-- ECharts CDN + 本地 fallback -->
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"
   onerror="this.src='/static/vendor/echarts.min.js?v=20260817.7'"></script>
@@ -29,7 +29,7 @@
       <div class="gp-title">⚙️ 常用设置</div>
       <label>注数
         <select id="cfgTickets" onchange="recalcPredictConfig()">
-          <option value="5">5</option><option value="10" selected>10</option>
+          <option value="5" selected>5（默认）</option><option value="10">10</option>
           <option value="20">20</option>
         </select>
       </label>
@@ -75,6 +75,7 @@
         </div>
         <div class="pred-meta" id="predMeta"></div>
         <div class="pred-status" id="predStatus"></div>
+        <div class="strict-banner hidden" id="strictBanner"></div>
         <div id="predList"></div>
         <div class="note" id="predNote"></div>
 
@@ -317,6 +318,21 @@
               <div id="mlDiagBody"><div class="note">尚未诊断。真实彩票数据上 trusted=False 是预期结论。</div></div>
             </div>
 
+            <!-- 卡 6：形态规律（组合恒等约束，V12）——
+                 这些不是"预测下一期"的规律，而是组合数学恒等约束：
+                 和值/跨度/三区/奇偶/连号几乎必然落在这些区间内。
+                 作为严格模式的"可用规律"，LLM 在此约束下生成注单，形态必然合理。 -->
+            <div class="card" id="shapeRuleCard" style="margin-top:16px">
+              <h2>🧬 形态规律（组合恒等约束） <span class="tag" id="shapeRuleTag">加载中…</span></h2>
+              <div class="note" style="margin-bottom:8px">
+                这些<b>不是</b>「预测下一期」的规律，而是<b>组合数学恒等约束</b>：
+                任何一期开奖的形态（和值/跨度/三区/奇偶/连号）都几乎必然落在这些区间内
+                （实测 3515 期与 C(33,6) 全空间理论枚举一致）。
+                作为严格模式的「可用规律」，LLM 在此约束下生成的注单，形态必然合理。
+              </div>
+              <div id="shapeRuleBody"><div class="note">加载形态规律…</div></div>
+            </div>
+
             <!-- 卡 5：多尺度规律扫描（V11）——
                  存在的意义：把每档的"检出下限 MDE"摆在明面上。
                  用户直觉是"窗口越短越容易找规律"，但数学上是反的：40 期需 +35% 才算显著，
@@ -326,7 +342,8 @@
               <div class="note" style="margin-bottom:8px">
                 <b>短窗口看似更容易显著，其实是它的检出下限更高</b>：40 期需 <b>+35%</b> 的效应才算显著，
                 全部期数只需 <b>+3.8%</b>。只有效应达到该档下限（可信）才值得进一步验证；
-                标「显著但不可信」的，是靠样本波动凑出来的。
+                标「功效不足」的是显著但低于该档可检出下限——可能真实但样本不足，
+                不可当作已验证规律。
               </div>
               <div class="eval-actions">
                 <button id="btnMultiScale" onclick="runMultiScale(true)">重新扫描</button>
@@ -639,6 +656,6 @@
 </div>
 
 <div id="toast"></div>
-<script src="/static/app.js?v=20261018.7"></script>
+<script src="/static/app.js?v=20261018.9"></script>
 </body>
 </html>

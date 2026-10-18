@@ -183,7 +183,7 @@ def test_frontend_mde_table_is_fetched():
 
 
 def test_frontend_version_bumped():
-    """?v= 必须升到 20261018.7（否则用户拿到的是缓存里的旧前端）。"""
+    """?v= 必须是最新（20261018.9，否则用户拿到的是缓存里的旧前端）。"""
     html = _read("web/index.html")
-    assert "20261018.7" in html
-    assert "20261018.6" not in html
+    assert "20261018.9" in html
+    assert "20261018.8" not in html
