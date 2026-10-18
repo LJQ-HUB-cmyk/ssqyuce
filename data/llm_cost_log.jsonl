@@ -34,3 +34,4 @@
 {"ts": 1792329788.72, "model": "agent-router/deepseek-v4-flash", "purpose": "engine", "tokens_in": 7058, "tokens_out": 9656, "yuan": 0.1203408, "ok": true, "attempts": 1, "price_per_1m_yuan": 7.2, "usage_seen": 1}
 {"ts": 1792331982.269, "model": "agent-router/deepseek-v4-flash", "purpose": "hypothesis", "tokens_in": 1953, "tokens_out": 5387, "yuan": 0.052848, "ok": true, "attempts": 1, "price_per_1m_yuan": 7.2, "usage_seen": 1}
 {"ts": 1792332423.509, "model": "agent-router/deepseek-v4-flash", "purpose": "hypothesis", "tokens_in": 1953, "tokens_out": 7077, "yuan": 0.065016, "ok": true, "attempts": 1, "price_per_1m_yuan": 7.2, "usage_seen": 1}
+{"ts": 1792332856.173, "model": "agent-router/deepseek-v4-flash", "purpose": "hypothesis", "tokens_in": 1953, "tokens_out": 14645, "yuan": 0.1195056, "ok": true, "attempts": 1, "price_per_1m_yuan": 7.2, "usage_seen": 1}
