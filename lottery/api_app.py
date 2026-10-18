@@ -183,6 +183,52 @@ def run_backtests():
 
 # ---------- 预测 ----------
 
+def _strict_mode_reject_response(draws, issue):
+    """V11 严格模式门控：出号必须由 LLM 分析规律完成。
+
+    返回 None（放行）或 JSONResponse（拒绝出号，422）。
+    **必须在缓存检查之前调用**：严格模式下已有预测缓存也必须重新校验，
+    不允许用旧缓存绕过门控（2026-10-18 顺序缺陷修复）。
+
+    两条硬性校验（任一不满足即拒绝，绝不静默降级到统计基线）：
+      ① 可用规律（counts.usable）必须 > 0；
+      ② LLM 出号通道必须可用（llm_can_pick=True）。
+    """
+    from . import methods as _METH
+    _errs = []
+
+    # ① 规律必须可用
+    try:
+        from . import patterns_runtime as _PR
+        _psnap = _PR.load_snapshot(current_issue=issue) or _PR.build_snapshot(draws)
+        _usable_n = int((_psnap.get("counts") or {}).get("usable") or 0)
+    except Exception:                                    # noqa: BLE001
+        _usable_n = 0
+    if _usable_n == 0:
+        _errs.append(
+            ("strategy",
+             ("严格模式下不出号：当前**无可用规律**（usable=0）。"
+              "本模式要求必须用规律经 LLM 分析出号；请在「规律库」确认有 usable 规律，"
+              "或关闭严格模式（LOTT_STRICT_MODE=0）。")))
+
+    # ② LLM 通道必须可用
+    _ch = _METH.resolve_channels()
+    if not bool(_ch.get("llm_can_pick")):
+        _errs.append(
+            ("llm",
+             ("严格模式下不出号：LLM 出号通道不可用（llm_can_pick=False）。"
+              "请检查 LOTT_METHODS 是否包含 llm、LLM 网关（data/llm_config.json）"
+              "是否可用。")))
+
+    if _errs:
+        return JSONResponse(
+            {"ok": False, "strict_mode": True,
+             "strict_gates": [e[0] for e in _errs],
+             "error": "；".join(e[1] for e in _errs)},
+            status_code=422)
+    return None
+
+
 @app.api_route("/api/predict", methods=["GET", "POST"])
 def predict(use_llm: Optional[bool] = None,
             n_tickets: Optional[int] = Query(None),
@@ -210,6 +256,16 @@ def predict(use_llm: Optional[bool] = None,
     # 不再用「seq+1」硬猜（旧写法在期号越界时会显示成明年的 4xx 期号）。
     _exp = BT.expected_issue(draws)
     issue = _exp["issue"]
+
+    # V11 严格模式门控（**必须在缓存检查之前**）：无可用规律或 LLM 通道
+    # 不可用时拒绝出号；通过校验则强制现算（regenerate=True），不允许
+    # 用旧缓存绕过门控。这是 2026-10-18 修复的顺序缺陷。
+    _strict_active = bool(getattr(config, "STRICT_MODE", False))
+    if _strict_active:
+        _rej = _strict_mode_reject_response(draws, issue)
+        if _rej is not None:
+            return _rej
+        regenerate = True            # 严格模式强制现算，不走缓存
     if not regenerate:
         existing = db.load_predictions(issue)
         if existing:
@@ -253,38 +309,12 @@ def predict(use_llm: Optional[bool] = None,
     # 出号注数：显式传参数 > 环境配置 > 默认 5（用户要求默认 5 注、可配置）
     _n_req = int(n_tickets) if n_tickets is not None else int(config.N_TICKETS)
 
-    # ============ V11 严格模式门控（用户 2026-10-18 指令）============
-    # 出号**必须**由 LLM 分析规律完成；LLM 不可用或可用规律为 0 时拒绝出号。
-    # 绝不静默降级到统计基线 —— 这是与默认模式的本质区别。
+    # 严格模式已在前置门控校验并强制 regenerate=True；这里补 use_llm 强制
+    _strict_active = bool(getattr(config, "STRICT_MODE", False))
     _strict_notes = []
-    if bool(getattr(config, "STRICT_MODE", False)):
-        _strict_notes.append("严格模式：出号强制依赖 LLM + 规律")
-        # ①规律必须可用
-        try:
-            from . import patterns_runtime as _PR
-            _psnap = _PR.load_snapshot(current_issue=issue) or _PR.build_snapshot(draws)
-            _usable_n = int((_psnap.get("counts") or {}).get("usable") or 0)
-        except Exception as _e:                       # noqa: BLE001
-            _usable_n = 0
-        if _usable_n == 0:
-            return JSONResponse(
-                {"ok": False, "strict_mode": True,
-                 "error": ("严格模式下不出号：当前**无可用规律**（usable=0）。"
-                           "本模式要求必须用规律经 LLM 分析出号；"
-                           "请在「规律库」确认有 usable 规律，或关闭严格模式（LOTT_STRICT_MODE=0）。"),
-                 "usable": 0},
-                status_code=422)
-        # ②LLM 通道必须可用
-        if not bool(_channels_now.get("llm_can_pick")):
-            return JSONResponse(
-                {"ok": False, "strict_mode": True,
-                 "error": ("严格模式下不出号：LLM 出号通道不可用（llm_can_pick=False）。"
-                           "请检查 LOTT_METHODS 是否包含 llm、LOTT_LLM_ONLY_OUTPUT，"
-                           "或 LLM 网关（data/llm_config.json）。"),
-                 "llm_can_pick": False},
-                status_code=422)
+    if _strict_active:
         use_llm = True                                   # 严格模式强制走 LLM
-        _strict_notes.append(f"可用规律 {_usable_n} 条，LLM 通道可用")
+        _strict_notes.append("严格模式：出号强制依赖 LLM + 规律，本次为现算（未走缓存）")
     try:
         res = engine.predict_next(draws, use_llm=use_llm, n_tickets=_n_req,
                                   llm_required=(use_llm is True),

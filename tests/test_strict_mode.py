@@ -234,3 +234,36 @@ def test_scheduler_hook_calls_lifecycle(monkeypatch, seeded_db):
 
     _scheduler_step()
     assert called.get("n", 0) >= 1          # 生命周期被调用
+
+
+def test_strict_ignores_cache_and_validates_anyway(monkeypatch, seeded_db):
+    """顺序缺陷回归（2026-10-18）：严格模式必须**先于缓存检查**生效。
+
+    旧的实现里门控在 ``if not regenerate: existing=...`` 之后 ——
+    一旦目标期已有预测缓存，严格模式会被绕过直接返回旧票（哪怕当时无规律/LLM 关）。
+    修复后：严格模式开启时强制 ``regenerate=True``，缓存不再能掩盖门控校验。
+    """
+    from fastapi.testclient import TestClient
+    from lottery import api_app, backtest as BT
+    from lottery.api_app import app
+    seeded_db(600, seed=3)
+    _enable_strict(monkeypatch, True)
+
+    monkeypatch.setattr(api_app.config, "DRAW_WEEKDAYS", (0, 1, 2, 3, 4, 5, 6))
+    monkeypatch.setattr(api_app.config, "DRAW_TIME", "00:00")
+    monkeypatch.setattr(BT, "expected_issue",
+                        lambda d: {"issue": str(int(d[-1]["issue"]) + 1)})
+
+    # 目标期**已有缓存预测**（这是旧实现会被绕过门控的诱因）
+    monkeypatch.setattr(api_app.db, "load_predictions",
+                        lambda i: [{"issue": i, "reds": "1,2,3,4,5,6",
+                                    "blue": 7, "method": "stat:freq"}],
+                        raising=False)
+    # 但无可用规律 → 即使有缓存，严格模式也必须拒绝
+    import lottery.patterns_runtime as PR
+    monkeypatch.setattr(PR, "load_snapshot",
+                        lambda *a, **k: {"counts": {"usable": 0}}, raising=False)
+
+    r = TestClient(app).get("/api/predict")     # 不传 regenerate=true
+    assert r.status_code == 422, f"缓存不应绕过严格门控：{r.text}"
+    assert "无可用规律" in r.json()["error"]
