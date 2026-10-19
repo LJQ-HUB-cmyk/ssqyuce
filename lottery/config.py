@@ -19,6 +19,38 @@ STARTED_AT = time.time()
 # M4.5：配置后启用所有 /api/* 的 Bearer Token 校验；空值保持兼容开放。
 API_TOKEN = (os.environ.get("LOTT_TOKEN") or "").strip() or None
 
+# ---------- 多用户身份（MU-1）----------
+# 系统主体哨兵（Lead 裁决 3）：调度器/后台任务等"非人类主体"写入数据时用它归属。
+#
+# 为什么是 0 而不是 NULL：
+#   `NULL` 在 SQL 三值逻辑里与任何值比较都不相等，`WHERE user_id != ?` 会**漏掉**
+#   系统任务行；也无法回答"这是谁的任务"。0 是可查询、可审计、可显式过滤的哨兵。
+#
+# 为什么必须定义在这里而不是各文件写字面量：
+#   调度器、tasks 默认值、predictions 回填兜底三处共用它；分散写 0 将来改值会漏改。
+#   **0 不插入 users 表**（它不是人）。
+SYSTEM_USER_ID = 0
+
+# 鉴权执行模式（W05）。`off` = 仅解析身份、不拦截（灰度过期用）；
+# `enforce` = deny-by-default，未登录一律 401。
+# 默认 off 的原因：前端登录界面尚未落地（W08），此时强制拦截会让线上不可用。
+# **切换前必须先完成前端登录页 + 引导建号**，否则整站会 401。
+AUTH_MODE = (os.environ.get("LOTT_AUTH_MODE") or "off").strip().lower()
+
+
+def auth_enforced() -> bool:
+    """鉴权是否处于强制拦截状态。"""
+    return AUTH_MODE == "enforce"
+
+
+# 会话 Cookie 名。`__Host-` 前缀是浏览器强制的加固：必须 Secure + Path=/ + 无 Domain，
+# 因此子域无法覆盖它（防"子域写入同名 Cookie"的会话固定攻击）。
+# 本地纯 http 调试时浏览器不存 Secure Cookie，可用 LOTT_COOKIE_NAME=ssq_sid 临时降级。
+SESSION_COOKIE_NAME = (os.environ.get("LOTT_COOKIE_NAME") or "__Host-ssq_sid").strip()
+# Cookie 的 Secure 属性。生产（nginx 443）必须 True；本地 http 联调可设 0。
+SESSION_COOKIE_SECURE = (os.environ.get("LOTT_COOKIE_SECURE") or "1").strip() == "1"
+
+
 # ---------- W01（多用户改造 P0 部署前置）----------
 # 文档端点（/docs、/redoc、/openapi.json）默认**关闭**。
 # 为什么必须默认关：这三条路径**不在 `/api/` 前缀下**，天然绕过 `optional_api_auth`

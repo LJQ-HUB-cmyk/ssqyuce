@@ -114,6 +114,111 @@ def _ensure_llm_audit(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_audit_post ON llm_audit(post, ts)")
 
 
+def _ensure_identity_tables(conn: sqlite3.Connection) -> None:
+    """MU-1 / W04：身份三表 + bootstrap 主管理员行。
+
+    依据 `docs/reviews/U1_IDENTITY.md` §4.1/§4.2/§4.3 的冻结 DDL。
+
+    ## 为什么 `users.status` 的 CHECK 必须有**四个**值
+
+    `bootstrap` 少写一个就会让本迁移的 INSERT 被 CHECK 拒绝 → 整批事务回滚
+    → **上线失败**。这是 Lead 在评审阶段裁决过的硬冲突（U1 原本只写了三个值）。
+
+    ## 为什么 bootstrap 行是 `role='user'`
+
+    U1 §4.1 的建议：插入时用 `role='user'` + `is_primary_admin=0`，
+    只有"设密成功"的同一事务里才升为 `role='admin'` + `is_primary_admin=1`
+    + `status='active'`。这样即使将来中间件的 status 闸门写漏，role 也不会额外授权
+    （纵深防御）。反过来若插入即 `role='admin'`，一旦 status 闸门失效就是一个
+    **零密码管理员**。
+
+    ## 为什么 `username` 保留表内 UNIQUE + 软删除时改名
+
+    表内 UNIQUE 是 Lead 冻结的约定（`username TEXT UNIQUE NOT NULL`）。
+    但 UNIQUE 会让"删除后重建同名用户"永久失败，所以软删除时把用户名改写为
+    ``name#deleted#<user_id>`` 释放原名（见 `auth.soft_delete_user`）。
+
+    forward-only：仅 CREATE TABLE/INDEX 与一条幂等 INSERT，无 DROP/RENAME。
+    """
+    # ---- users（U1 §4.1）----
+    conn.execute("""CREATE TABLE IF NOT EXISTS users (
+        user_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        username        TEXT    NOT NULL UNIQUE,
+        password_hash   TEXT,
+        role            TEXT    NOT NULL DEFAULT 'user'
+                                CHECK(role IN ('admin','user')),
+        status          TEXT    NOT NULL DEFAULT 'active'
+                                CHECK(status IN ('bootstrap','active','disabled','locked')),
+        display_name    TEXT    NOT NULL DEFAULT '',
+        is_primary_admin INTEGER NOT NULL DEFAULT 0,
+        failed_count    INTEGER NOT NULL DEFAULT 0,
+        locked_until    REAL    NOT NULL DEFAULT 0,
+        last_login_at   REAL,
+        token_version   INTEGER NOT NULL DEFAULT 1,
+        llm_profile     TEXT    NOT NULL DEFAULT 'default',
+        external_id     TEXT,
+        deleted_at      REAL,
+        created_at      REAL    NOT NULL,
+        updated_at      REAL    NOT NULL
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_users_status ON users(status, deleted_at)")
+    # 主管理员唯一性锚点：全表最多一行 is_primary_admin=1（Lead 裁决 2）
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_users_primary_admin"
+        " ON users(is_primary_admin) WHERE is_primary_admin = 1")
+
+    # ---- user_sessions（U1 §4.2）----
+    conn.execute("""CREATE TABLE IF NOT EXISTS user_sessions (
+        session_id   TEXT    PRIMARY KEY,
+        user_id      INTEGER NOT NULL,
+        created_at   REAL    NOT NULL,
+        expires_at   REAL    NOT NULL,
+        last_seen_at REAL    NOT NULL,
+        ip           TEXT    NOT NULL DEFAULT '',
+        user_agent   TEXT    NOT NULL DEFAULT '',
+        csrf_token   TEXT    NOT NULL DEFAULT '',
+        revoked_at   REAL
+    )""")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_user"
+        " ON user_sessions(user_id, revoked_at)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_exp ON user_sessions(expires_at)")
+
+    # ---- user_audit_log（U1 §4.3）----
+    conn.execute("""CREATE TABLE IF NOT EXISTS user_audit_log (
+        audit_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts          REAL    NOT NULL,
+        actor_id    INTEGER,
+        actor_name  TEXT    NOT NULL DEFAULT '',
+        action      TEXT    NOT NULL,
+        target_id   INTEGER,
+        target_name TEXT    NOT NULL DEFAULT '',
+        result      TEXT    NOT NULL DEFAULT 'ok',
+        ip          TEXT    NOT NULL DEFAULT '',
+        detail_json TEXT    NOT NULL DEFAULT '{}'
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_uaudit_ts ON user_audit_log(ts DESC)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_uaudit_act ON user_audit_log(action, ts DESC)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_uaudit_tgt ON user_audit_log(target_id, ts DESC)")
+
+    # ---- bootstrap 主管理员行（幂等：仅当表内一个存活用户都没有时插入）----
+    #
+    # `role='user'` + `is_primary_admin=0` + `status='bootstrap'`：零权限占位，
+    # 等引导流程设密成功后在同一事务里升级（U1 §4.1 不变量 2）。
+    # 不加 `role='admin'`，否则"零密码 + admin"这一行就是提权漏洞。
+    now = time.time()
+    conn.execute(
+        "INSERT INTO users(username, password_hash, role, status, display_name,"
+        " is_primary_admin, token_version, created_at, updated_at)"
+        " SELECT 'admin', NULL, 'user', 'bootstrap', '系统管理员', 0, 1, ?, ?"
+        " WHERE NOT EXISTS (SELECT 1 FROM users WHERE deleted_at IS NULL)",
+        (now, now),
+    )
+
+
 MIGRATIONS: List[Tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "reconcile audit table", _ensure_reconcile_runs),
     (2, "legacy provenance columns", _ensure_legacy_columns),
@@ -121,6 +226,9 @@ MIGRATIONS: List[Tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (3, "v10 replay results", _ensure_replay_results),
     # V12-13（V12 期间新增第 4 号：补上 V10-01 从未落地的 llm_audit 表）
     (4, "v12 llm audit table", _ensure_llm_audit),
+    # MU-1 / W04（多用户批次第 5 号：身份三表 + bootstrap 主管理员行）
+    # 编号占位已冻结：5=users/sessions/audit、6=（保留给 MU-2 的数据租户化）。
+    (5, "mu1 identity tables", _ensure_identity_tables),
 ]
 
 _SCHEMA_VERSION_DDL = """CREATE TABLE IF NOT EXISTS schema_version (

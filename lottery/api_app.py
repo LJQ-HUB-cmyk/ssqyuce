@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import contextvars
 import hmac
 import os
 import time
@@ -22,8 +23,23 @@ class _NoCacheStaticFiles(StaticFiles):
         return resp
 
 from . import config, data_fetcher, db
+from . import auth_api
 from . import migrations
 from . import features as F, diagnose as D, mining as M
+
+# 当前请求的用户上下文（仅 contextvar；**不用于 api_app→db 的租户传参**，
+# 那条路径必须用显式参数 —— 裸 threading.Thread 不继承 contextvar，
+# 丢失后会静默落到 SYSTEM 写错数据，而且测试不会红。见 Lead 裁决 9。）
+#
+# 存在价值：留给 `llm_client` 这类**无法改签名**的深层库读取"当前是谁"，
+# 以便按用户选 LLM 配置（U2 落地时使用）。
+_current_user_id: "contextvars.ContextVar[int | None]" = contextvars.ContextVar(
+    "current_user_id", default=None)
+
+
+def current_user_id():
+    """供深层库读取当前用户；无上下文时返回 None（绝不回退 admin）。"""
+    return _current_user_id.get()
 
 app = FastAPI(
     title="双色球智能预测分析系统",
@@ -45,16 +61,136 @@ app.add_middleware(
 )
 
 
+# ── MU-1 / W05：身份解析的**唯一入口**（Lead 裁决 8）──────────────────────
+#
+# 为什么必须是模块级函数，而不是中间件里的内联逻辑：
+#   `app.dependency_overrides` 对 HTTP 中间件**无效**。若解析内联在中间件里，
+#   测试就无法用一个 fixture 统一注入身份，只能把 36 处 `TestClient` 逐个改成
+#   "注入真实 session cookie" —— 爆炸半径从 1 处变成 36 处。
+#   外提之后 conftest 一行 monkeypatch 即全局生效：
+#       monkeypatch.setattr(api_app, "_resolve_session_user_id", lambda r: ADMIN_ID)
+#
+# 三条纪律：① 模块级；② 同步签名（不起协程）；③ 不读 contextvar、不依赖中间件状态。
+# **无有效会话时返回 None，绝不回退 admin / SYSTEM_USER_ID**（那是提权后门）。
+def _resolve_session_user_id(request: Request):
+    """Cookie → user_id；无效/未登录返回 ``None``。"""
+    from . import auth_api
+    sess = auth_api.session_from_request(request)
+    if not sess:
+        return None
+    return int(sess["user"]["user_id"])
+
+
+def _load_active_user_for_middleware(user_id: int):
+    from . import auth
+    return auth.load_active_user(int(user_id))
+
+
 @app.middleware("http")
-async def optional_api_auth(request: Request, call_next):
-    """LOTT_TOKEN 配置后保护 /api/*；静态前端和健康探活保持可加载。"""
-    if config.API_TOKEN and request.url.path.startswith("/api/"):
-        auth = request.headers.get("authorization", "")
-        expected = f"Bearer {config.API_TOKEN}"
-        if not hmac.compare_digest(auth, expected):
-            return JSONResponse({"ok": False, "error": "需要 Bearer Token"}, status_code=401,
-                                headers={"WWW-Authenticate": "Bearer"})
-    return await call_next(request)
+async def auth_middleware(request: Request, call_next):
+    """多用户鉴权（deny-by-default）+ 旧 LOTT_TOKEN 兼容。
+
+    执行顺序（U1 §7.3，**顺序不可调换**）：
+      1. 求所需角色（公开 → 直接放行）
+      2. 解析身份（唯一入口 `_resolve_session_user_id`）
+      3. **status 闸门**：只接受 `status='active'`（bootstrap/locked/disabled 一律 403）
+      4. **角色闸门**：admin-only 路径校验角色
+      5. 注入 contextvar（供 llm_client 等深层库读取），finally 必须清理
+
+    第 3 步必须先于第 4 步：`status='bootstrap'` 的行可能写着 `role='admin'`，
+    若先判角色再判 status，这一行就是一个**零密码管理员**。
+
+    `config.AUTH_MODE != 'enforce'` 时只做"解析 + 记录"，不拦截 —— 这是留给
+    "前端登录页尚未落地"的灰度期。切换前必须完成前端登录页与引导建号。
+    """
+    from . import auth_api
+
+    path = request.url.path
+    need = auth_api.required_role(path)
+
+    # ① 旧 LOTT_TOKEN 兼容层（**先于**多用户分级，恢复既有语义）：
+    #    配了 LOTT_TOKEN 时保护所有 /api/*，唯二例外是 /api/health（容器探活）
+    #    与登录/引导入口（否则本身就要 token 才能登录，死锁）。
+    #    这条曾经被写成"只对公开路径跳过校验"，导致配了 token 后 /api/info
+    #    反而公开 —— 既有测试 test_m4_5_engineering 抓住了它。教训：
+    #    **白名单只能收窄，不能因为"路径小"就顺手放行**。
+    if config.API_TOKEN and path.startswith("/api/") \
+            and path not in _TOKEN_EXEMPT:
+        if not _token_ok(request):
+            return _unauthorized_bearer()
+
+    if need is None:
+        return await call_next(request)
+
+    # ② 解析身份
+    uid = None
+    try:
+        uid = _resolve_session_user_id(request)
+    except Exception:  # noqa: BLE001 —— 解析失败一律视为未登录，绝不放行
+        uid = None
+
+    # 灰度期：不拦截，但把身份写进 contextvar，便于后续按用户化改造渐进生效
+    if not config.auth_enforced():
+        if uid is not None:
+            _current_user_id.set(uid)
+        try:
+            return await call_next(request)
+        finally:
+            _current_user_id.set(None)
+
+    if uid is None:
+        # 旧 LOTT_TOKEN 仍可作为"机器对机器"的兼容通道（若部署时配了）
+        if config.API_TOKEN and _token_ok(request):
+            return await call_next(request)
+        return JSONResponse({"ok": False, "error": "未登录",
+                             "auth_required": True}, status_code=401,
+                            headers={"WWW-Authenticate": "Cookie"})
+
+    # ③ status 闸门（先于角色判断）
+    user = _load_active_user_for_middleware(uid)
+    if user is None:
+        auth_api.auth.audit("authz.denied", actor_id=uid, ip=auth_api.client_ip(request),
+                            result="denied",
+                            detail={"path": path, "reason": "inactive_status"})
+        return JSONResponse({"ok": False, "error": "账户不可用"}, status_code=403)
+
+    # ④ 角色闸门
+    if need == "admin" and user.get("role") != "admin":
+        auth_api.auth.audit("authz.denied", actor_id=uid, ip=auth_api.client_ip(request),
+                            result="denied",
+                            detail={"path": path, "required": "admin"})
+        return JSONResponse({"ok": False, "error": "需要管理员权限"}, status_code=403)
+
+    # ⑤ contextvar：仅供 llm_client 这类**无法改签名**的深层库读取
+    _current_user_id.set(uid)
+    try:
+        return await call_next(request)
+    finally:
+        _current_user_id.set(None)      # AnyIO 工作线程会被复用，不清理会串身份
+
+
+# 旧 LOTT_TOKEN 的豁免路径（**必须保持极小**）：只有容器探活与登录入口。
+# 其余 /api/* 在配置了 LOTT_TOKEN 时一律要求 Bearer —— 这是 V4 起就有的语义，
+# 多用户改造不得放宽它（放宽等于给存量部署留了一个静默后门）。
+_TOKEN_EXEMPT = frozenset({"/api/health", "/api/auth/login", "/api/auth/bootstrap",
+                           "/api/auth/logout", "/api/auth/me"})
+
+
+def _token_ok(request: Request) -> bool:
+    """旧 LOTT_TOKEN 校验（Bearer）。"""
+    if not config.API_TOKEN:
+        return False
+    got = request.headers.get("authorization", "")
+    return hmac.compare_digest(got, f"Bearer {config.API_TOKEN}")
+
+
+def _unauthorized_bearer() -> JSONResponse:
+    return JSONResponse({"ok": False, "error": "需要 Bearer Token"}, status_code=401,
+                        headers={"WWW-Authenticate": "Bearer"})
+
+
+# 认证与管理路由（登录/登出/me/引导 + 用户管理 + 审计）
+app.include_router(auth_api.router)
 
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
