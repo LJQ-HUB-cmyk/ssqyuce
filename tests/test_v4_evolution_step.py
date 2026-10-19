@@ -187,7 +187,13 @@ def test_scheduler_skips_prediction_when_already_generated(monkeypatch):
 # ---------- 3. 手动触发与自动调度同路径 ----------
 
 def test_api_run_endpoint_uses_same_step_as_scheduler(monkeypatch):
-    """`/api/evolution/run` 必须调用 _evolution_step，避免两处逻辑漂移。"""
+    """`/api/evolution/run` 必须调用 _evolution_step，避免两处逻辑漂移。
+
+    V12 变更（2026-10-19，CPU 治理）：`_evolution_step` 新增 ``force`` 参数
+    （幂等闸门：同一期数据在自动调度下只跑一次；手动触发传 ``force=True`` 绕过）。
+    桩必须同步接收 ``force``，并断言手动路径**确实传了 True** —— 否则「用户点了
+    却因为幂等闸门什么都没跑」会成为一个静默的功能缺陷。
+    """
     from fastapi.testclient import TestClient
 
     from lottery import api_app
@@ -195,9 +201,10 @@ def test_api_run_endpoint_uses_same_step_as_scheduler(monkeypatch):
 
     called = {}
 
-    def _step(limit=0, use_llm=True):
+    def _step(limit=0, use_llm=True, force=False):
         called["limit"] = limit
         called["use_llm"] = use_llm
+        called["force"] = force
         return {"ok": True, "verified": 0}
 
     monkeypatch.setattr(api_app, "_evolution_step", _step)
@@ -206,6 +213,7 @@ def test_api_run_endpoint_uses_same_step_as_scheduler(monkeypatch):
     assert r.status_code == 200, r.text
     assert called.get("limit") == 400
     assert called.get("use_llm") is False
+    assert called.get("force") is True, "手动触发必须绕过幂等闸门（force=True）"
     assert r.json().get("ok") is True
 
 

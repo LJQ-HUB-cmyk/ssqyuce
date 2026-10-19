@@ -322,3 +322,241 @@ heat 线程 tid=17/19 属既有负载。**建议单独立项排查**（项目日
 
 作者身份已修正为项目惯例 `ssq-dev <dev@local>`（首次提交曾被 git 自动写成
 模板占位邮箱，已 `--amend --reset-author` 修正）。
+
+---
+
+# 第五批：L2 结构层 + L3 决策层 + V12-04 收尾（Lead 执行，2026-10-19）
+
+承接 `V12_PATTERN_REDEFINITION_PLAN.md` 的阶段 B / C。本批补齐方案里 **L2 三项（10/11/12 的收尾）+ L3 四项（13/14/15/16）+ V12-04 的分层强制项**。
+
+> **口径总纲**：L2 不是「从历史学到的规律」，而是**组合数学恒等式**（可全枚举验证到 1e-9，
+> 不需要样本量/p 值/功效）；L3 的每一条都必须能被确定性代码打分，**弃权不得计入做对**。
+
+## 一、交付清单
+
+| 任务 | 层 | 状态 | 主要落点 |
+|---|---|---|---|
+| **V12-10** L2 精确值服务 | L2 | ✅ | `lottery/l2_service.py`（新）+ `GET /api/l2/distribution` |
+| **V12-11** 预算内最优组合求解器 | L2 | ✅ | `lottery/engine.py::optimal_portfolio` + `tests/test_v12_portfolio.py` |
+| **V12-12** 形态约束加固（收尾） | L2 | ✅ | 已在第四批前完成；本批补「L2 不得叫可用规律」口径 |
+| **V12-13** AI 两岗位 + 打分卡 | L3 | ✅ | `lottery/ai_audit.py`（新）+ migration **#4 `llm_audit`** + `GET /api/llm/audit/latest` + `POST /api/llm/audit/run` |
+| **V12-14** 数据异常期检测器 | L3 | ✅ | `lottery/data_audit.py`（新）+ `GET /api/audit/anomaly/latest` |
+| **V12-15** 边际读数端点 | L3 | ✅ | `GET /api/portfolio/marginal` |
+| **V12-16** 用户可自证实验 | L3 | ✅ | `lottery/selfcheck.py`（新）+ `POST /api/experiments/randomness-selfcheck` |
+| **V12-04**（收尾）`layer` 必填 + 跨层求和强制测试 | 横向 | ✅ | `patterns_runtime.py`（`layer` + `by_evidence_layer`）、`shape_rules.py`、`api_app.py` 严格模式门控、`tests/test_v12_layer_isolation.py`（新） |
+
+## 二、L2 验收（方案写死的数字，逐项实测）
+
+| 验收项 | 方案要求 | 实测 | 结论 |
+|---|---|---|---|
+| V12-10 `n=5 preset=spread` 的 `p_at_least_r.4` | `0.024504`（±1e-6） | **0.02450413879779842** | ✅ |
+| `p_at_least_r_method` | 必须 `exact_enum` | `exact_enum` | ✅ |
+| `union_coverage`（5 注互不相交） | 30 | **30** | ✅ |
+| `var_ratio`（`Ā=0`） | 0.1111… | **0.1111111111111111** | ✅ |
+| `ev_ratio_full` | ≈ 0.45673 | **0.45673239701760976** | ✅ |
+| `prize_assumption` 必填 | 缺即失败 | 存在（V4 假设表 A 全文） | ✅ |
+| V12-11 `n=5 min_var` 的 `var_ratio` | ≤ 0.1112 | **0.111111** | ✅ |
+| **A5 反向用例**：`ev_ratio_full` 与注单无关 | 逐位相同 | 三种 objective 下均 == 单注口径 | ✅ |
+| V12-15 禁建议文案 | `划算\|推荐` 计数 = 0 | **0** | ✅ |
+| V12-15 边际读数 | 中性、不含建议 | `delta_pp=6.6046`、`expected_return_yuan=-1.0865` | ✅ |
+
+**L2 的真实收益必须说清**：把票单从「高重叠」修到「互不相交」`P(≥1注≥4红)` 从 `0.019517` 提到 `0.024504`，而 **iid 近似是 `0.024265`** —— 即低重叠只比 iid 高 **+0.98%**，**iid 就是天花板**。**EV 恒为 `0.45673`，不受任何选号影响。**
+
+## 三、L3 验收（A6 / A7）
+
+### V12-13 打分卡（A6：`skipped` 单列、不进分母）
+- 测试 **35 例**全绿，含：`degraded` 不进分母、`n_wrong>0 ⇒ score<1`、`n= "12"`（字符串）判 `invalid`、method 集合多/少判 `invalid`、`red_mean` 小数第 4 位 +0.0001 必 `fail`、并列奖级取**最高**。
+- **补上 V10-01 从未落地的 `llm_audit` 表**（migration #4，字段与 V10 §2.1.5 冻结 DDL 逐字一致）。
+- `skill_stats` 默认基线由写死的 `0.5` 改为**哑判官基线**（最常见金标准占比）——原 `0.5` 会让闭眼全答 `keep` 的假判官（实测准确率 99.19%）轻松「达标」。
+
+### V12-16 自证实验（A7：同 seed 逐字节一致）
+- 真实 3516 期：4/4 检查通过，`response_sha256` 同 seed 两次相同，换 seed 不同。
+- **发现并修复一个真实性能缺陷**：首次计算零分布（`n_perm=200` × `randomness_report`）实测 **5.6~6.7s**，**超出方案要求的 3s**。
+  - **不能靠调小 `n_perm` 过关**：实测零分布 5% 分位随 `n_perm` 单调变化（200→0.0264，100→0.0325，60→0.0537，40→0.0863），调小等于**偷偷放宽判据**。
+  - 改为「确定性值两级缓存（进程内 + 磁盘）+ 启动期后台预热」：预热后用户请求 **0.069s**，且 `q05` 仍为 **0.0264**（判据未放宽）。
+  - 新增 2 条护栏测试（磁盘缓存命中不重算、缓存键必须区分参数）。
+
+### V12-14 异常期检测器（A6 的判定口径）
+| 场景 | 判定 | p_adj | 结论 |
+|---|---|---|---|
+| 纯随机（`num_freq`/`sum_mean`/`odd_count`） | `noise` | 0.287 / 1.0 / 1.0 | ✅ 不误报 |
+| 只在末 100 期注入偏置 | `regime_shift` | 0.0125 | ✅ 正确区分「只在一段」 |
+| **全程** +30% 号频偏置 | `real_defect` | 0.0125 | ✅ 两段复现才升级 |
+| 纯随机对照 | `noise` | 1.0 | ✅ |
+
+> `regime_shift` 与 `real_defect` 的区分正是方案要的「不许把单段显著当成结构缺陷」：只有**独立复现段**也成立才判 `real_defect`。
+
+## 四、V12-04 收尾（裁决 R-2 的强制项）
+
+| 项 | 落地 |
+|---|---|
+| `layer` 字段**必填** | `patterns_runtime.build_snapshot` 每条规则带 `layer="L1"` |
+| 拆掉跨层求和 | `counts["usable"] == counts["usable_long_term"]`（禁止 `long+phase`） |
+| 按层计数 | 新增 `counts["by_evidence_layer"] = {L1:{tier:…}, L2:{…}, L3:{…}}`；`by_layer`（V11 起的 tier 计数）**原样保留**避免契约漂移 |
+| 强制测试 | `tests/test_v12_layer_isolation.py` **6 例**，含两个反向用例：注入 `layer="L4"` 必失败、缺 `layer` 必失败、注入跨层求和字段必被点名 |
+| 严格模式门控 | 改为 `layer=="L2"` 且 `violation_count==0`，文案明示「L2 可用 ≠ 存在可预测规律」 |
+| 命名 | `shape_rules.py` 去掉「可用规律」自称，保留**否定式**说明（「**不是**可用规律」）作为口径教育 |
+
+## 五、全量回归
+
+| 阶段 | 结果 |
+|---|---|
+| 基线（HEAD `b283b12` / 4.0.2） | 892 passed, 20 skipped, 1 xfailed（含 1 例性能护栏在机器负载下偶发） |
+| 本批新增测试 | **+90 例**（l2_exact 16 / portfolio 11 / selfcheck 9 / data_audit 13 / ai_audit 35 / layer_isolation 6） |
+| 修复的既有测试 | `tests/test_v10_replay.py::test_migration_3_creates_frozen_ddl`——原断言 `MIGRATIONS[-1][0]==3` 与「新增第 4 号」冲突；改为按版本号定位并额外锁定 #4，**冻结语义不变** |
+
+## 六、如实记录的未做项与遗留
+
+| 项 | 说明 |
+|---|---|
+| **V12-17 前端三卡重排** | 未做。后端契约（`layer`/`by_evidence_layer`/`ai_audit`/L2 精确值/自证实验）已就绪，前端可直接消费 |
+| **V12-19 版本号** | 未升（仍 `4.0.2 / 2026-10-V12`）。本批未发布，升版与部署需单独一批 |
+| **V12-20 冻结开关** | 未做（`LOTT_SEARCH_FROZEN` 与 `/api/discovery/scan` 的 `frozen=true`） |
+| **容器 CPU ~100%** | 第四批已核实为**既有现象、非 V12 引入**，本批未处理，仍建议单独立项 |
+| **性能护栏偶发失败** | `test_discover_does_not_scale_with_history_squared` 在宿主 load≈2.8 时实测 2.96 倍 > 阈值 2.77 倍。属**机器负载敏感**而非实现回归；是否放宽阈值需单独裁决（避免把真 O(N²) 放过去） |
+
+## 七、工作区与运行时状态说明
+
+- `data/selfcheck_null_cache.json`（V12-16 零分布缓存）已加入 `.gitignore`——它是
+  **确定性派生数据**（可由 seed 重算），与 `hypotheses.json` / `llm_claims.json` /
+  `patterns_runtime.json` 同属运行时状态，不入库。
+- 工作区曾出现 `data/llm_cost_log.jsonl` 新增 2 行（`purpose=hypothesis`，
+  时间 15:06 / 15:56，落在并行子任务运行期间）。已核实：**不是测试写出的**——
+  `llm_client.cost_log_path()` 走 `config.DATA_DIR`，而 `tests/conftest.py` 已隔离该路径
+  （实测跑完 35 例后该文件无变化）。那两行是子任务在测试隔离之外直接跑脚本时按设计
+  记录的真实 LLM 成本。已 `git checkout` 还原，未纳入本批改动。
+
+## 八、复现命令
+
+```bash
+cd /root/DSH/应用/ssqyuce
+
+# 本批新增测试（90 例）
+LOTT_DB=/tmp/v12/all.db .venv/bin/python -m pytest \
+  tests/test_v12_l2_exact.py tests/test_v12_portfolio.py \
+  tests/test_v12_selfcheck.py tests/test_v12_data_audit.py \
+  tests/test_v12_ai_audit.py tests/test_v12_layer_isolation.py -q
+
+# 全量回归
+LOTT_DB=/tmp/v13full/t.db .venv/bin/python -m pytest -q
+
+# L2 真值（方案写死的验收数字）
+PYTHONPATH=. .venv/bin/python -c "
+from lottery import l2_service as L, engine as E
+p=L.l2_distribution_payload(n=5, preset='spread')
+print('p4 =', p['distribution']['p_at_least_r']['4'])          # 0.02450413879779842
+r=E.optimal_portfolio(5,'min_var'); print('var_ratio =', r['var_ratio'])  # 0.1111…
+"
+
+# L3 自证实验（需先预热或接受首跑 ~5.6s）
+PYTHONPATH=. .venv/bin/python -c "
+from lottery import db, selfcheck as S
+d=db.load_draws(); S.warm_null_quantile(n_issues=len(d))
+import time; t=time.time(); a=S.selfcheck(d,seed=42); b=S.selfcheck(d,seed=42)
+print('all_pass', a['all_pass'], '| sha equal', a['response_sha256']==b['response_sha256'],
+      '|', round(time.time()-t,2),'s')
+"
+```
+
+---
+
+# 第九批：容器 CPU ~100% 的根因核查与治理（2026-10-19）
+
+第四批留下的疑点「容器 CPU 长期 100%，建议单独立项排查」本次核查完毕。**结论：不是死循环，也不是 V12 引入，而是两条可测的重复计算。**
+
+## 一、先纠正前提：当前基线并不高
+
+| 观测 | 值 |
+|---|---|
+| `docker stats` 连续 12 次采样（1 分钟） | **0.20%~0.23%**（两次瞬时 1.03%/0.75%） |
+| 宿主 load average | 0.62 / 0.30 / 0.22 |
+| 容器累计 CPU / 运行时长 | 4082s / ≈17h ≈ **平均 6.7%** |
+
+所以「长期 100%」这个描述**不准确**；真实现象是**周期性满核**。第四批当时看到的 100% 很可能正好落在满载窗口内。
+
+## 二、真实根因：每 30 分钟跑一轮「23 分钟的重活」
+
+`_scheduler_loop` 每 `sleep(1800)` 调用 `_scheduler_step()`；开奖日（周二/四/日）过 21:35 后每轮都会走完整链路。日志实测 2026-10-18（周日）三轮：
+
+| 轮次 | 起 | 止 | 耗时 |
+|---|---|---|---|
+| 1 | 14:13:52 | 14:36:09 | **22 分 17 秒** |
+| 2 | 15:06:38 | 15:25:33 | **18 分 55 秒** |
+| 3 | 15:56:01 | 16:18:29 | **22 分 28 秒** |
+
+⇒ 每 30 分钟里有 19~22 分钟单核跑满 = 持续占用 **57%~73%**。这才是「CPU ~100%」的观测来源。
+
+## 三、根因一：`_rebuild_probs` 算 4 个模型只用 1 个（已修）
+
+**profiler 定位**（`verify_hypothesis_ab` 单次 41.6s）：
+
+```
+1200 calls  models.py:49  markov_model     20.6s  (63%)
+1200 calls  models.py:37  omission_model    8.1s
+```
+
+原因：`engine._rebuild_probs(name, hist)` 无论要哪个方法，都调 `models.build_models(hist)`——**一次算 freq / omission / markov / bayes 四个**。而所有调用方都只取一个：
+
+- `evolution._ab_structural_delta` 只要 `"freq"`（`freq_model` 是 O(30) 的轻量计算）
+- `battle._method_probs` 每个方法也只取一个
+
+**修法**：改为按需只算被请求的那一个（查 `_MODEL_BUILDERS` 表）。
+
+**验收（三项全过）**：
+
+| 验收项 | 结果 |
+|---|---|
+| 逐位对等：单模型 == `build_models` 里的那一个 | 4 个模型全部 `np.array_equal` 为真 |
+| 结果一致性：优化前后 `delta_red_hits`/`delta_blue_rate` | **逐位相同**（已用 `git stash` 前后对照实测） |
+| 提速 | 单次 verify 41.6s → **10.2s（4×）**；3 条假说 95s → **9.6s（10×）** |
+
+> **一次被实测否定的假设（记录教训）**：我最初推测瓶颈是「32 条假说重复计算同一个对照组回放」，加了对照组缓存后发现**零收益**（112.3s vs 113.1s），说明对照组只占小头。该改动已**完整撤回**（`git checkout lottery/evolution.py`），没有把无效复杂度留在代码里。真正的线索来自 profiler，不是直觉。
+
+## 四、根因二：同一期数据被反复进化（已修）
+
+数据抓取每轮返回 `inserted_new: 0`（当天数据早已到齐），但 `_evolution_step` 每轮仍对全部 32 条假说重跑 A/B——**没有「同一份数据只进化一次」的约束**。
+
+**修法**：幂等闸门。把「已进化到的数据指纹（期数 + 末期号）」写入 `data/evolution_state.json`；指纹没变就跳过。
+
+| 场景 | 实测 |
+|---|---|
+| 第一次（真跑） | 102.7s |
+| 第二次（同一期数据） | **0.038s，`skipped=True`** |
+| `force=True`（`/api/evolution/run` 手动触发） | 97.4s，**不跳过** |
+
+手动触发必须绕过闸门，否则「用户点了却没反应」会变成静默缺陷——该行为由 `test_evolution_step_force_bypasses_idempotency` 与 `test_api_run_endpoint_uses_same_step_as_scheduler` 双重锁定。
+
+## 五、故意**不**修的：`constraint_ctx` 的逐期重建
+
+剩余热点是 `constraint_ctx`（1200 次，6.8s）。但 `battle._ctx_for_t` 的 docstring 明确记录了一次**历史上的错误缓存**：`constraint_ctx` 用滑动窗口 `draws[-500:]`，t=500 与 t=504 的窗口不同，缓存会把 ctx 错误复用进而**改变出号结果**。
+
+> 这是项目里一个**已显式裁决过的设计决定**（正确性优先于性能）。本次不推翻它，只在此记录：若将来仍要压这部分开销，正确方向是「让 ctx 计算可证明与窗口位置无关」，而不是加缓存。
+
+## 六、新增测试（15 例，`tests/test_v12_cpu_governance.py`）
+
+| 断言 | 反向验证（故意退回实现→测试变红） |
+|---|---|
+| `_MODEL_BUILDERS` 与 `build_models` 成员集合一致 | — |
+| 单模型构建与 `build_models` 逐位相同（4 例参数化） | — |
+| **请求 freq 时不得构建 markov/omission/bayes** | ✅ 退回全量构建 → 立即失败 |
+| `force=True` 不跳过；指纹含末期号 | ✅ 禁用闸门 → 立即失败 |
+
+两条关键测试都做了「故意退回实现、确认测试会红」的鉴别力验证，避免留下永远通过的空测试。
+
+## 七、回归
+
+| 阶段 | 结果 |
+|---|---|
+| 治理前基线 | 1033 passed, 20 skipped, 1 xfailed（158s） |
+| 治理后 | **1036 passed, 20 skipped, 1 xfailed（111s）** |
+| 全量耗时变化 | 158s → **约 115s**（本次优化同样加速了测试里的回放） |
+
+**契约变更**：`_evolution_step` 新增 `force` 参数；`tests/test_v4_evolution_step.py` 的桩同步接收并断言 `force=True`（原桩不接该参数会导致 503）。
+
+## 八、对第四批结论的更正
+
+| 第四批结论 | 本次更正 |
+|---|---|
+| 「容器 CPU 长期 100%」 | **不准确**。当前基线 0.2%，真实现象是开奖日每 30 分钟一轮 19~22 分钟的满载 |
+| 「不是 V12 引入」 | **成立**（7 小时前旧镜像同样如此），但根因是**既有**的重复计算，具有明确修复路径 |
+| 「建议单独立项排查」 | **已完成**，两条根因均已修复并有回归测试 |

@@ -197,25 +197,43 @@ def _strict_mode_reject_response(draws, issue):
     from . import methods as _METH
     _errs = []
 
-    # ① 形态规律可用（V12 扩大「规律」定义）：
+    # ① L2 结构约束可用（V12-04 口径修正，裁决 R-2）：
     #    此前要求 counts.usable > 0（显著规律），但 3515 期实测 0 条显著，
-    #    会让严格模式永远哑火。V12 起改用**组合恒等约束**（和值/跨度/三区/
-    #    奇偶/连号）作为"可用规律"：实测与 C(33,6) 理论枚举一致，可复现。
-    #    若未来真的出现显著规律，它叠加在形态约束之上。
+    #    会让严格模式永远哑火。V12 起改用 **L2 结构层的组合恒等约束**
+    #    （和值/跨度/三区/奇偶/连号）作为门控依据：它与 C(33,6) 理论枚举一致，
+    #    可复现、不需要样本量。
+    #
+    #    口径纪律（V12-04 强制）：这门控只能命名为 **layer=="L2" 且 violation=0**，
+    #    **不得**把它叫成「可用规律」——L1 的「可用规律」语义是「检出/未检出」，
+    #    与 L2 的「约束满足率」不是同一种计数，混用正是「可用规律 0 vs 5 条」
+    #    矛盾的来源。L2 的通过不意味着存在可预测下期的规律。
+    #
+    #    violation_count 的定义：用当前 ctx 对 C(33,6) 全空间做**抽样**
+    #    校验约束本身自洽（全枚举由 tests/test_v12_shape_lock.py 锁定）；
+    #    这里只要求 ctx 结构完整且可枚举出合法约束，因此 violation 恒为 0 的
+    #    前提是 ctx 齐全 —— 缺字段时显式置 violation>0 并拒绝。
     try:
-        _ok_ctx = False
+        _l2_layer = "L2"
+        _violations = 0
         from . import shape_rules as _SR
         _sc = _SR.shape_constraint_ctx(draws)
-        if _sc.get("sum_max") and _sc.get("top_zones"):
-            _ok_ctx = True
+        _required = ("sum_min", "sum_max", "span_min", "span_max",
+                     "top_zones", "odd_range", "max_consecutive")
+        _missing = [k for k in _required if _sc.get(k) is None]
+        if _missing or not _sc.get("top_zones"):
+            _violations = max(1, len(_missing))
+        _ok_ctx = (_l2_layer == "L2" and _violations == 0)
     except Exception:                                    # noqa: BLE001
         _ok_ctx = False
+        _violations = 1
     if not _ok_ctx:
         _errs.append(
             ("strategy",
-             ("严格模式下不出号：**形态规律不可用**（组合恒等约束无法生成，"
-              "历史数据不足或异常）。形态规律是当前唯一可复现的可用规律，"
-              "请确认历史数据齐全，或关闭严格模式（LOTT_STRICT_MODE=0）。")))
+             (f"严格模式下不出号：**L2 结构约束不可用**（layer={_l2_layer}，"
+              f"violation_count={_violations}；组合恒等约束无法生成，"
+              f"历史数据不足或异常）。注意：L2 可用只说明形态约束成立，"
+              f"**不代表**存在可预测下期的规律。请确认历史数据齐全，"
+              f"或关闭严格模式（LOTT_STRICT_MODE=0）。")))
 
     # ② LLM 通道必须可用
     _ch = _METH.resolve_channels()
@@ -2205,7 +2223,8 @@ def _scheduler_step():
               "（LLM 决策通道已关停，本次为纯统计/ML）" if not _llm_on else "")
 
 
-def _evolution_step(limit: int = 0, use_llm: bool = True) -> dict:
+def _evolution_step(limit: int = 0, use_llm: bool = True,
+                    force: bool = False) -> dict:
     """每期开奖后自动跑的一轮自进化：挖掘 → 注册 → A/B 实战验证 → 裁决。
 
     为什么需要它：``evolve_once`` 只做「挖掘+注册+应用」，假说会永远停在
@@ -2217,7 +2236,21 @@ def _evolution_step(limit: int = 0, use_llm: bool = True) -> dict:
     成本控制：
     - ``limit`` 限制参与验证的历史期数（0=全部）；A/B 内部另有 600 期上限
     - ``use_llm`` 控制是否调用 LLM 提炼新假说（单次 1~2 分钟）
+    - **幂等（2026-10-19 CPU 治理）**：同一期数据只自动进化一次。见下方说明。
     - 整体失败只记录不抛出，绝不影响当期预测生成
+
+    ⚠️ 为什么要幂等（实测根因）
+    -------------------------
+    ``_scheduler_step`` 由 ``_scheduler_loop`` 每 1800s 调用一次；在**开奖日**
+    （周二/四/日）过了 21:35 之后，每轮都会走到这里。而这一天剩下的时间里数据
+    并不会再变（``inserted_new: 0``），于是**同一份数据被反复跑完整进化**：
+    日志实测 2026-10-18（周日）14:13 / 15:06 / 15:56 三轮，每轮 19~22 分钟。
+    这就是「容器 CPU 长期 100%」的第二层成因（第一层是 ``_rebuild_probs`` 的
+    冗余模型构建，已单独修复）。
+
+    修法：把「已进化到的数据指纹（期数 + 末期号）」记在 ``data/evolution_state.json``；
+    指纹没变就**跳过**（返回 ``skipped=True``）。数据一更新指纹就变 ⇒ 立刻恢复进化。
+    手动触发（``/api/evolution/run``）传 ``force=True``，永不被跳过。
 
     返回本轮摘要，便于调度日志与 ``/api/evolution/status`` 观测。
     """
@@ -2226,6 +2259,19 @@ def _evolution_step(limit: int = 0, use_llm: bool = True) -> dict:
     draws = db.load_draws()
     if not draws:
         return {"ok": False, "reason": "本地暂无开奖数据"}
+
+    # ---- 幂等闸门：同一份数据只自动进化一次 ----
+    fingerprint = f"{len(draws)}:{draws[-1].get('issue')}"
+    if not force:
+        state = _evolution_state_load()
+        if state.get("last_fingerprint") == fingerprint:
+            return {"ok": True, "skipped": True,
+                    "skipped_reason": "该期数据已完成进化（幂等跳过）",
+                    "fingerprint": fingerprint,
+                    "last_run_at": state.get("last_run_at"),
+                    "note_zh": ("本期数据未变化，进化已跑过 → 跳过（避免每 30 分钟"
+                                "重复跑完整 A/B 验证；手动触发请用 /api/evolution/run）")}
+
     if limit:
         draws = draws[-int(limit):]
 
@@ -2293,7 +2339,49 @@ def _evolution_step(limit: int = 0, use_llm: bool = True) -> dict:
     except Exception as e:  # noqa: BLE001
         summary["decision_skill"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
     print("[evolution] 本轮完成:", summary["resolution"], "| 库:", summary["by_status"])
+    # 记录本次进化对应的数据指纹（幂等闸门的数据源）。写失败只记录、不影响结果。
+    try:
+        _evolution_state_store(fingerprint, summary)
+    except Exception as e:  # noqa: BLE001
+        print("[evolution] 状态记录失败（不影响进化结果）:", e)
+    summary["fingerprint"] = fingerprint
     return summary
+
+
+def _evolution_state_path():
+    """进化幂等状态文件路径（与 ``adaptive_state.json`` 同目录，属运行时状态）。"""
+    return config.DATA_DIR / "evolution_state.json"
+
+
+def _evolution_state_load() -> dict:
+    """读幂等状态；文件缺失/损坏一律返回空 dict（当作「从未进化」）。"""
+    import json as _json
+    try:
+        p = _evolution_state_path()
+        if not p.exists():
+            return {}
+        raw = _json.loads(p.read_text(encoding="utf-8") or "{}")
+        return raw if isinstance(raw, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _evolution_state_store(fingerprint: str, summary: dict) -> None:
+    """记录「已进化到的数据指纹」（原子替换）。"""
+    import json as _json
+    import os as _os
+    import time as _time
+    p = _evolution_state_path()
+    payload = {
+        "last_fingerprint": str(fingerprint),
+        "last_run_at": _time.strftime("%Y-%m-%d %H:%M:%S"),
+        "last_resolution": summary.get("resolution"),
+        "schema": 1,
+    }
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(_json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    _os.replace(tmp, p)
 
 
 def _scheduler_loop():
@@ -2900,7 +2988,8 @@ def evolution_run(limit: int = Query(0, ge=0, le=3490),
         return JSONResponse({"ok": False, "available": True,
                              "error": "本地暂无开奖数据"}, status_code=400)
     try:
-        result = _evolution_step(limit=int(limit), use_llm=bool(use_llm))
+        # 手动触发**必须**绕过幂等闸门（用户的意图就是「现在再跑一轮」）。
+        result = _evolution_step(limit=int(limit), use_llm=bool(use_llm), force=True)
     except Exception as e:  # noqa: BLE001
         return JSONResponse({"ok": False, "available": False,
                              "error": "_evolution_step() 执行失败",
@@ -2914,6 +3003,295 @@ def evolution_run(limit: int = Query(0, ge=0, le=3490),
     except Exception:  # noqa: BLE001
         pass
     return result
+
+
+# ---------------------------------------------------------------------------
+# V12-13：AI 两岗位（核对员 / 契约检查器）+ 打分卡
+#
+# 铁律（V10 §3.2 两岗位共同约束）：这两条路由**不产号、不写 predictions、
+# 不进候选池**；只读 ``llm_audit``（仅追加）或把判定扔进后台任务。
+# 无记录时 ``available=False`` —— 前端必须显示"本次未取得 AI 核对结果"，
+# **不许**渲染成"AI 已核对"。
+# ---------------------------------------------------------------------------
+
+@app.get("/api/llm/audit/latest")
+def llm_audit_latest(post: Optional[str] = Query(None),
+                     limit: int = Query(200, ge=1, le=500)):
+    """最近一次 AI 核对判定 + 打分卡（只读）。
+
+    ``post`` 可选 ``result_narrator`` / ``contract_checker``；不传则看全部。
+    打分卡规则（V12 §1.3 硬性准入）：``n``（判定次数）、``score = n_correct /
+    (n_correct+n_wrong+n_invalid)``，``skipped``（degraded）**单列、不进分母**。
+    """
+    try:
+        from . import ai_audit
+    except ImportError as e:
+        return JSONResponse({"ok": False, "available": False,
+                             "error": "AI 核对模块尚未就绪",
+                             "detail": str(e)}, status_code=503)
+    if post is not None and post not in ai_audit.POSTS:
+        return JSONResponse({"ok": False, "available": False,
+                             "error": f"未知岗位：{post}（必须是 {ai_audit.POSTS}）"},
+                            status_code=400)
+    try:
+        out = ai_audit.latest_audit(post=post)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "available": False,
+                             "error": "读取审计记录失败",
+                             "detail": f"{type(e).__name__}: {e}"}, status_code=503)
+    out = dict(out)
+    out["ok"] = True
+    out["posts"] = list(ai_audit.POSTS)
+    return out
+
+
+@app.post("/api/llm/audit/run")
+async def llm_audit_run(request: Request,
+                        post: str = Query(...),
+                        limit_issues: int = Query(30, ge=1, le=200),
+                        use_llm: int = Query(1, ge=0, le=1)):
+    """跑一次 AI 核对（**后台任务**，V10 §3.2.3-2：预测请求绝不等 LLM）。
+
+    * ``post=result_narrator``：输入来自真实 ``eval_details`` 最近 ``limit_issues`` 期
+      （只读，不重新跑预测）；
+    * ``post=contract_checker``：输入来自请求体 ``{"items": [{key, params, target}]}``
+      （不传则取最近一次 ``llm_claims`` 快照中的 filters；都没有则 400）。
+
+    立即返回 ``task_id``，前端轮询 ``/api/tasks/{id}``。单次只发 **1 次** LLM 调用。
+    """
+    try:
+        from . import ai_audit
+    except ImportError as e:
+        return JSONResponse({"ok": False, "error": "AI 核对模块尚未就绪",
+                             "detail": str(e)}, status_code=503)
+    if post not in ai_audit.POSTS:
+        return JSONResponse({"ok": False,
+                             "error": f"未知岗位：{post}（必须是 {ai_audit.POSTS}）"},
+                            status_code=400)
+    body: Dict[str, Any] = {}
+    try:
+        raw = await request.body()
+        if raw:
+            parsed = json.loads(raw.decode("utf-8") or "{}")
+            if isinstance(parsed, dict):
+                body = parsed
+    except Exception:  # noqa: BLE001
+        body = {}
+    try:
+        if post == ai_audit.POST_NARRATOR:
+            rows = db.load_eval_details(limit_issues=int(limit_issues))
+            if not rows:
+                return JSONResponse({"ok": False,
+                                     "error": "本地暂无 eval_details 记录（尚未有核对过的预测）"},
+                                    status_code=400)
+            audit_input = ai_audit.build_narrator_input(rows,
+                                                        limit_issues=int(limit_issues))
+        else:
+            items = body.get("items")
+            if items is None:
+                items = _latest_claim_filters()
+            if not items:
+                return JSONResponse({"ok": False,
+                                     "error": "没有可检查的 filters（请求体 items 为空且无 llm_claims 快照）"},
+                                    status_code=400)
+            audit_input = ai_audit.build_contract_input(items)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": "构造核对输入失败",
+                             "detail": f"{type(e).__name__}: {e}"}, status_code=503)
+
+    def _fn(_progress):
+        _progress(0.1, "AI 核对运行中（单次调用）…")
+        res = ai_audit.run_post(post, audit_input, use_llm=bool(use_llm),
+                                persist=True)
+        res["ok"] = True
+        res["note_zh"] = res.get("note_zh") or "AI 核对完成"
+        return res
+
+    tid = _bg_run("llm_audit", _fn)
+    return {"ok": True, "task_id": tid, "post": post,
+            "note_zh": "已进入后台任务，前端轮询 /api/tasks/{id}"}
+
+
+def _latest_claim_filters() -> List[Dict[str, Any]]:
+    """从最近一次 ``llm_claims`` 快照里取出 filters（只读；没有则返回空列表）。"""
+    try:
+        from . import llm_lab
+        claims = llm_lab.load_claims() or {}
+    except Exception:  # noqa: BLE001
+        return []
+    items = claims.get("claims") or claims.get("items") or []
+    out: List[Dict[str, Any]] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        flt = it.get("filter") or it.get("params") or {}
+        out.append({"key": str(it.get("key") or flt.get("key") or ""),
+                    "params": dict(it.get("params") or flt.get("params") or {}),
+                    "target": str(it.get("target") or "red")})
+    return [x for x in out if x["key"]]
+
+
+# ==========================================================================
+# V12-10 / V12-15：L2 结构层的两个 API（组合数学恒等式，不依赖历史数据）
+#
+# 共同纪律：
+#   * 所有概率都是 C(33,6) **全枚举精确值**（``method="exact_enum"``），
+#     与样本量 / p 值无关；
+#   * 不改变、不宣称改变期望值（``ev_ratio_full`` 恒为单注口径）；
+#   * **不给购买建议**（返回体里不得出现「划算」「推荐」等词，
+#     ``tests/test_v12_l2_exact.py`` 用 grep 计数锁死）。
+# ==========================================================================
+
+@app.get("/api/l2/distribution")
+def l2_distribution(n: int = Query(5, ge=1, le=16),
+                    preset: str = Query("spread"),
+                    seed: int = Query(0),
+                    tickets: Optional[str] = Query(None)):
+    """V12-10 L2 精确值服务：n 注票组的分布/尾部/覆盖精确值（中性读数）。
+
+    入参：``n``（1..16）、``preset``（``spread`` 号位均摊 = 低重叠，``overlap``
+    高重叠）、``seed``（造票种子，同 seed 同结果）、``tickets``（可选 JSON 字符串
+    ``[{"reds":[..6..],"blue":1},...]``，给了就以它为准）。
+
+    出参：``ticket_distribution()`` 原样字段 + ``method="exact_enum"``（断言非精确
+    即 500）+ ``methods``（每个字段的方法标签）+ ``n``。
+    """
+    from . import l2_service
+    try:
+        payload = l2_service.l2_distribution_payload(
+            n=int(n), preset=preset, seed=int(seed), tickets_json=tickets)
+    except (ValueError, TypeError) as exc:
+        return JSONResponse({"ok": False, "error": f"参数错误: {exc}"},
+                            status_code=400)
+    except AssertionError as exc:          # exact_enum / prize_assumption 断言失败
+        return JSONResponse({"ok": False, "error": f"L2 口径断言失败: {exc}",
+                             "method": "unavailable"}, status_code=500)
+    return _jsonable(payload)
+
+
+@app.get("/api/portfolio/marginal")
+def portfolio_marginal(n: int = Query(10, ge=1, le=15),
+                       preset: str = Query("spread")):
+    """V12-15 边际读数（L3-4）：「加到 n+1 注」的中性读数，**只给数字不给建议**。
+
+    返回 ``delta_p_at_least_one_prize_pp``（+X 个百分点，全枚举精确值差分）、
+    ``expected_return_yuan = −¥2×(1−ev_ratio_full)``（新增 1 注的期望回报）、
+    ``ev_ratio_full``、``prize_assumption``、``n``、``n_next``、``method="exact_enum"``。
+    """
+    from . import l2_service
+    try:
+        payload = l2_service.marginal_reading(int(n), preset=preset)
+    except (ValueError, TypeError) as exc:
+        return JSONResponse({"ok": False, "error": f"参数错误: {exc}"},
+                            status_code=400)
+    except AssertionError as exc:
+        return JSONResponse({"ok": False, "error": f"L2 口径断言失败: {exc}",
+                             "method": "unavailable"}, status_code=500)
+    return _jsonable(payload)
+
+
+# ==========================================================================
+# V12-16 / V12-14 新增路由（追加在既有路由之后，**不修改**任何既有路由）
+# ==========================================================================
+
+@app.post("/api/experiments/randomness-selfcheck")
+def experiments_randomness_selfcheck(
+        seed: int = Query(42),
+        n_issues: Optional[int] = Query(None, ge=0, le=20000),
+        n_perm: Optional[int] = Query(None, ge=0, le=5000),
+        n_draws: Optional[int] = Query(None, ge=0, le=20000),
+        synthetic_bias: Optional[str] = Query(None),
+        window: Optional[int] = Query(None, ge=1, le=20000)):
+    """**用户可自证实验**（V12-16 / L3-7）：用合成随机数据重跑同一套检验，并排展示。
+
+    真实数据走 ``rigor.randomness_report()`` 原样；合成数据由 ``seed`` 派生的
+    ``numpy.random.default_rng`` 新生成（同期数、同蓝球范围）。返回 4 项检查
+    （``real_not_detected`` / ``synthetic_uncorrected_rate_in_ci`` /
+    ``strongest_p_same_magnitude`` / ``reproducible_same_seed``）、``all_pass``、
+    ``seed``、``response_sha256``、``elapsed_ms``。
+
+    可复现（A7）：同 ``seed`` 两次响应的 ``response_sha256`` 必须相同
+    （哈希覆盖剔除 ``response_sha256`` 与 ``elapsed_ms`` 后的规范化 JSON）。
+
+    参数
+    ----
+    seed: 唯一随机性来源（默认 42）。
+    n_issues: 合成数据期数；默认 = 真实有效期数（保证同期数，方案上限 3516）。
+    n_perm: 零分布重采样次数；默认 200。越小越快，越大分位估计越稳。
+    n_draws: 只用最近 n 期真实数据（默认全部）；用于快速演示/自测。
+    synthetic_bias: 传 ``"number"`` 时给**合成数据**注入偏置（反向演示：
+        假数据一旦带偏，检查 1 会失败）。默认不注入。
+    window: 兼容参数，当前未使用（保留签名以免前端改造成本）。
+    """
+    from . import selfcheck as _sc
+    try:
+        draws = db.load_draws()
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": "读取开奖数据失败",
+                             "detail": f"{type(e).__name__}: {e}"}, status_code=503)
+    if n_draws:
+        draws = draws[-int(n_draws):]
+    bias = (synthetic_bias or "").strip() or None
+    if bias not in (None, "number"):
+        return JSONResponse({"ok": False,
+                             "error": "synthetic_bias 只支持 'number' 或留空"},
+                            status_code=400)
+    try:
+        payload = _sc.selfcheck(
+            draws, seed=int(seed),
+            n_issues=(_sc.DEFAULT_N_ISSUES if n_issues is None else int(n_issues)),
+            n_perm=(_sc.DEFAULT_N_PERM if n_perm is None else int(n_perm)),
+            synthetic_bias=bias)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": "自证实验执行失败",
+                             "detail": f"{type(e).__name__}: {e}"}, status_code=503)
+    return _jsonable(payload)
+
+
+@app.get("/api/audit/anomaly/latest")
+def audit_anomaly_latest():
+    """V12-14（L3-3）：读取**最近一次**数据异常审计结果（只读，不触发计算）。
+
+    无记录时返回 ``available=False``（HTTP 200，前端据此显示「尚未运行」），
+    不返回 404 —— 404 会让前端把它当成接口故障。
+    """
+    from . import data_audit
+    try:
+        payload = data_audit.latest_audit()
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"available": False, "error": "读取审计产物失败",
+                             "detail": f"{type(e).__name__}: {e}"},
+                            status_code=503)
+    return _jsonable(payload)
+
+
+@app.post("/api/audit/anomaly/run")
+def audit_anomaly_run(use_llm: int = Query(1, ge=0, le=1),
+                      window: int = Query(40, ge=5, le=500),
+                      w_seg: int = Query(300, ge=30, le=3000),
+                      n_perm: int = Query(2000, ge=200, le=20000),
+                      seed: int = Query(20261018)):
+    """V12-14（L3-3）：**后台**跑一次数据异常审计（立即返回 task_id，不阻塞）。
+
+    审计流程：确定性统计 → LLM 提名（``use_llm=1``；不可用时 ``degraded=True``）
+    → 代码逐条判定（``real_defect`` / ``regime_shift`` / ``noise``）→ 落盘。
+    完成后 ``GET /api/audit/anomaly/latest`` 可读到结果。
+    """
+    draws = db.load_draws()
+    if not draws:
+        return JSONResponse({"ok": False, "available": True,
+                             "error": "本地暂无开奖数据"}, status_code=400)
+    from . import data_audit
+
+    def _work(progress):
+        return data_audit.run_audit(draws, use_llm=bool(use_llm), window=int(window),
+                                    w_seg=int(w_seg), n_perm=int(n_perm),
+                                    seed=int(seed), progress=progress)
+
+    tid = _bg_run("data_audit", _work)
+    return {"ok": True, "task_id": tid,
+            "note_zh": ("数据审计已在后台运行（LLM 提名 + 确定性判定），"
+                        "完成后 GET /api/audit/anomaly/latest 可读结果")}
 
 
 # M2：后台预热 ML 模型（首个预测请求不阻塞；训练结果按数据版本缓存）
@@ -2970,6 +3348,32 @@ if getattr(config, "BOOT_REFRESH_RULES", True) and os.environ.get("LOTT_BOOT_REF
         import threading as _threading
         _threading.Thread(target=_boot_refresh_rules_snapshot, daemon=True,
                           name="boot-rules-refresh").start()
+    except Exception:  # noqa: BLE001
+        pass
+
+    # V12-16：预热自证实验的零分布（纯随机数据下「最强校正 p」的 5% 分位）。
+    # 这个值是**确定性**的（只由 seed / 期数 / n_perm / 检验数 / alpha 决定），
+    # 首次计算约 5.6s（200 次 × randomness_report），之后走磁盘缓存 <0.1s。
+    # 把首次计算挪到启动后台，用户点「🧪 验证」时就不会等 5 秒。
+    # 预热失败不影响任何功能（自证实验会自己再算一次）。
+    def _boot_warm_selfcheck_null():
+        import time as _t
+        _t.sleep(25)          # 让启动回测/预测先跑完，避免抢 CPU（与上面补刷错开）
+        try:
+            from . import selfcheck as _sc
+            d = db.load_draws()
+            if not d:
+                return
+            res = _sc.warm_null_quantile(seed=_sc.DEFAULT_SEED,
+                                         n_issues=len(d))
+            print("[selfcheck] 零分布预热:", res)
+        except Exception as e:  # noqa: BLE001
+            print("[selfcheck] 零分布预热失败（不影响功能）:", e)
+
+    try:
+        import threading as _threading2
+        _threading2.Thread(target=_boot_warm_selfcheck_null, daemon=True,
+                           name="boot-selfcheck-warm").start()
     except Exception:  # noqa: BLE001
         pass
 

@@ -79,12 +79,23 @@ def _tables(conn):
 # ==========================================================================
 
 def test_migration_3_creates_frozen_ddl(tmp_path):
-    """migration #3 编号 = ``MIGRATIONS[-1][0]``，且 DDL 与 §2.1.5 冻结文本一致。"""
+    """migration #3 的 DDL 与 §2.1.5 冻结文本一致；第 3 号本身不再被追加改动。
+
+    V12-13 变更说明（2026-10-19）：原断言是 ``MIGRATIONS[-1][0] == 3``——
+    它真正要守的是「**第 3 号的内容不许漂移**」，而不是「永远不许有第 4 号」。
+    V12-13 按 V10 §2.1.5 的原文 DDL 补建了从未落地的 ``llm_audit`` 表（第 4 号），
+    因此改为按**版本号**定位第 3 号，并额外断言第 4 号确实是 ``llm_audit``。
+    **冻结语义不变，只是不再用「必须是最后一个」来兼职表达它。**
+    """
     from lottery import replay as R
 
-    assert migrations.MIGRATIONS[-1][0] == 3, "V10 期间编号冻结为第 3 号"
+    versions = [v for v, _name, _fn in migrations.MIGRATIONS]
+    assert versions == sorted(versions), "迁移版本号必须严格递增"
+    names = {v: name for v, name, _fn in migrations.MIGRATIONS}
+    assert names.get(3) == "v10 replay results", "第 3 号（V10-05）必须存在且名称不得漂移"
+    assert names.get(4) == "v12 llm audit table", "第 4 号必须是 V12-13 的 llm_audit"
     conn = _fresh_db(tmp_path)
-    assert migrations.apply(conn) == 3
+    assert migrations.apply(conn) == versions[-1]
 
     cols = {r["name"]: r for r in conn.execute("PRAGMA table_info(replay_results)")}
     assert set(cols) == set(R.COLUMNS), "列集合必须与冻结 DDL 完全一致"

@@ -13,6 +13,8 @@ __pycache__/
 # 运行时数据（含密钥与训练产物，禁止入库）
 data/llm_config.json
 data/adaptive_state.json
+# V12 CPU 治理：进化幂等闸门状态（记录「已进化到哪一期」，属运行时状态）
+data/evolution_state.json
 # 推理型模型学到的可用输出预算（运行时状态，随机器/模型而异）
 data/llm_budget.json
 
@@ -29,6 +31,10 @@ data/llm_claims.json
 
 # V7 规律运行时快照（派生数据，由 /api/rules/refresh 或调度器重建）
 data/patterns_runtime.json
+
+# V12-16：自证实验的零分布缓存（**确定性**派生数据，可由 seed 重算；
+# 缓存只为把首次约 5.6s 的计算挪到启动后台，丢失只影响速度、不影响结果）
+data/selfcheck_null_cache.json
 # D-3：ML 诊断结果缓存（运行时状态，可重算）
 data/ml_diag_cache.json
 data/ml_diag_cache.json.tmp

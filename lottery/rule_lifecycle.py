@@ -797,10 +797,18 @@ def _lookup(src: Optional[Dict], field: str) -> Optional[float]:
     return _num(cur)
 
 
-def skill_stats(judgements: Sequence[Dict], baseline: float = 0.5) -> Dict:
+def skill_stats(judgements: Sequence[Dict],
+                baseline: Optional[float] = None) -> Dict:
     """AI 复核技能的度量：与金标准一致率 + Wilson 下界 + 分组混淆。
 
     **样本不足不下结论**：``n_action < 10`` 时只报描述统计。
+
+    基线（V12-13）：默认 ``baseline=None`` 时用**哑判官基线**——「全答金标准中最常见
+    那一类」所能取得的准确率（= 最常见金标准的占比）。为什么必须换掉原来的 ``0.5``：
+    一个闭眼全答 ``keep`` 的假判官，在 ``rule_lifecycle`` 上实测准确率 **99.19%**
+    （金标准几乎全是 ``hold``）；用 ``0.5`` 当基线，等于把「不比抛硬币差」当成达标，
+    而这个门槛哑判官闭眼就能过。显式传 ``baseline`` 仍走旧语义（向后兼容，返回体
+    ``baseline_kind="fixed"``）。
     """
     rows = [j for j in (judgements or []) if isinstance(j, dict)]
     valid = [j for j in rows if j.get("valid")]
@@ -815,6 +823,12 @@ def skill_stats(judgements: Sequence[Dict], baseline: float = 0.5) -> Dict:
         v = str(j.get("verdict") or "?")
         slot = by_gold.setdefault(g, {})
         slot[v] = int(slot.get(v, 0)) + 1
+    if baseline is None:
+        baseline_kind = "dumb_judge"
+        baseline = _dumb_judge_share(valid)
+    else:
+        baseline_kind = "fixed"
+        baseline = float(baseline)
     concl = "insufficient"
     if n >= 10 and n_action >= 10:
         concl = "below-baseline" if (lo is not None and lo <= baseline) else "ok"
@@ -822,9 +836,21 @@ def skill_stats(judgements: Sequence[Dict], baseline: float = 0.5) -> Dict:
         "n": n, "n_invalid": sum(1 for j in rows if not j.get("valid")),
         "n_action": n_action, "agree": agree, "agreement": p,
         "wilson_lo": lo, "wilson_hi": hi, "baseline": float(baseline),
+        "baseline_kind": baseline_kind,
         "by_gold": by_gold, "conclusion": concl,
-        "note_zh": _skill_note(n, n_action, p, lo, concl),
+        "note_zh": _skill_note(n, n_action, p, lo, concl, baseline, baseline_kind),
     }
+
+
+def _dumb_judge_share(valid: Sequence[Dict]) -> float:
+    """哑判官基线 = 最常见金标准类别的占比（全答那一类能拿到的准确率上限）。"""
+    if not valid:
+        return 0.5
+    counts: Dict[str, int] = {}
+    for j in valid:
+        g = str(j.get("gold_direction") or "hold")
+        counts[g] = counts.get(g, 0) + 1
+    return max(counts.values()) / float(len(valid))
 
 
 def _agrees(j: Dict) -> bool:
@@ -848,17 +874,19 @@ def wilson_interval(k: int, n: int, z: float = 1.96) -> Tuple[Optional[float], O
 
 
 def _skill_note(n: int, n_action: int, p: Optional[float],
-                lo: Optional[float], concl: str) -> str:
+                lo: Optional[float], concl: str,
+                baseline: float = 0.5, baseline_kind: str = "fixed") -> str:
     if n == 0:
         return "尚无 AI 复核记录"
+    base_txt = ("哑判官基线" if baseline_kind == "dumb_judge" else "基线")
     if concl == "insufficient":
         return (f"已复核 {n} 条（其中金标准为动作的 {n_action} 条）。"
                 f"动作样本 < 10，本报告只作描述、不下『AI 是否跟得上』的结论 —— "
                 f"在当前数据下判据多为 hold，这是预期结果。")
     if concl == "below-baseline":
-        return (f"一致率 {p:.1%}（Wilson 下界 {lo:.1%}）不优于随机基线，"
+        return (f"一致率 {p:.1%}（Wilson 下界 {lo:.1%}）不优于{base_txt} {baseline:.1%}，"
                 f"AI 复核未显示出增量价值 → 建议自动降级为『只展示』。")
-    return f"一致率 {p:.1%}（Wilson 下界 {lo:.1%}）优于随机基线"
+    return (f"一致率 {p:.1%}（Wilson 下界 {lo:.1%}）优于{base_txt} {baseline:.1%}")
 
 
 # ---------------------------------------------------------------------------

@@ -144,6 +144,11 @@ def build_snapshot(draws: Sequence[Dict], scan: Optional[Dict] = None,
         usable = bool(_long_term_ok or _phase_ok)
         rules.append({
             "id": h.get("id"), "source": h.get("source") or "stat",
+            # V12-04（裁决 R-2）：**`layer` 为必填字段**，值只能是 L1/L2/L3。
+            # 统计假说走的是「选号函数 + 与均匀随机有差」的检验，属 **L1 预测型**：
+            # 它的计数语义是「检出 / 未检出」，与 L2 的「约束满足率」、L3 的
+            # 「决策对的 / 错的」**不是同一种计数**，禁止相加（见下方 counts 注释）。
+            "layer": "L1",
             "statement": h.get("statement"), "dim": spec,
             "target": (discovery.FAMILY_BY_KEY.get(spec.get("key")) or {}).get("target", "red"),
             "hyp_status": h.get("status"),
@@ -189,6 +194,8 @@ def build_snapshot(draws: Sequence[Dict], scan: Optional[Dict] = None,
         rules.append({
             "id": f"scan:{f.get('key')}:{json.dumps(f.get('params') or {}, sort_keys=True)}",
             "source": "discovery", "statement": f"{f.get('name_zh')} {f.get('params')}",
+            # V12-04：同属 L1（扫描出的选号过滤器），`layer` 必填
+            "layer": "L1",
             "dim": {"key": f.get("key"), "params": f.get("params") or {}},
             "target": f.get("target", "red"), "hyp_status": None,
             "regime": {"status": st, "label": it.get("status_zh"),
@@ -200,6 +207,16 @@ def build_snapshot(draws: Sequence[Dict], scan: Optional[Dict] = None,
         })
     _n_long = sum(1 for r in rules if r.get("tier") == "usable_long_term")
     _n_phase = sum(1 for r in rules if r.get("tier") == "usable_phase")
+    # V12-04：按 `layer` 分列（**三层不共享同一个计数**，见方案 §0 第 4 条）。
+    #   L1 计数语义 = 检出 / 未检出（统计假说的 tier 分布）
+    #   L2 计数语义 = 约束满足率（组合恒等式，不需要 p 值）
+    #   L3 计数语义 = 决策对的 / 错的（AI 两岗位打分卡，degraded 单列）
+    _by_layer_tiers: Dict[str, Dict[str, int]] = {}
+    for _r in rules:
+        _lay = str(_r.get("layer") or "L1")
+        _slot = _by_layer_tiers.setdefault(_lay, {})
+        _t = str(_r.get("tier") or "monitor")
+        _slot[_t] = int(_slot.get(_t, 0)) + 1
     counts = {
         # V12-04（裁决 R-2）：**拆分跨层求和**。
         #
@@ -210,8 +227,16 @@ def build_snapshot(draws: Sequence[Dict], scan: Optional[Dict] = None,
         # 相加会让首屏出现「5 条可用，其中 0 条有预测力」，比「0 条」更误导
         # （docs/analysis/LEAD_VERDICT.md §五）。
         #
-        # 现在：按层分列于 ``by_layer``，``usable`` 保留为**兼容字段**但语义收紧为
-        # 「长期可用条数」= 旧口径里的 usable_long_term。真正的跨层合计不再提供。
+        # 现在：``by_layer`` 是**权威分层**（每个 layer 各自的 tier 计数），
+        # ``usable`` 保留为**兼容字段**但语义收紧为「长期可用条数」。
+        # 跨层合计不再用于任何展示口径；``all_tiers_sum`` 保留但字段名自带警告。
+
+        # V12-04 新增：**按 L1/L2/L3 分层**的 tier 计数（三层不共享同一个计数）。
+        # 注意：字段名是 ``by_evidence_layer`` 而不是 ``by_layer``——后者自 V11 起
+        # 已被占用为「按 tier 计数」（前端与 test_v11_phase_usable 都在读它），
+        # 直接改语义会造成契约漂移；新口径用新名字，旧字段原样保留。
+        "by_evidence_layer": _by_layer_tiers,
+        # 按 tier 计数（V11 起的既有契约，语义不变）
         "by_layer": {
             "usable_long_term": _n_long,
             "usable_phase": _n_phase,

@@ -86,11 +86,41 @@ def _ensure_replay_results(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_replay_issue ON replay_results(issue)")
 
 
+def _ensure_llm_audit(conn: sqlite3.Connection) -> None:
+    """V12-13：LLM 两岗位（核对员 / 契约检查器）的判定记录表。
+
+    背景：V10 §2.1.5 的冻结 DDL 里本来就有 ``llm_audit``，但 V10-01 实际**从未落地**
+    （``lottery/ai_audit.py`` 不存在、全仓 ``grep llm_audit`` 零命中），所以第 3 号迁移
+    只建了 ``replay_results``。V12-13 补上这张表，按 V10 §2.1.5 原文的冻结 DDL 建，
+    **字段一字不改**——已有的文档契约不该因为「晚建了一个版本」而漂移。
+
+    写语义（V10 §2.1.5 冻结）：``INSERT OR IGNORE``，**仅追加**；判定历史不可被覆盖。
+    ``audit_id = sha1(post|run_id|ts_ns)`` 保证重试幂等。
+
+    forward-only：只有 ``CREATE TABLE IF NOT EXISTS`` / ``CREATE INDEX``，
+    无 DROP / RENAME / 改类型（``db.get_conn()`` 首次连库即自动落地，无回滚路径）。
+    """
+    conn.execute("""CREATE TABLE IF NOT EXISTS llm_audit (
+        audit_id     TEXT PRIMARY KEY,
+        run_id       TEXT NOT NULL,
+        post         TEXT NOT NULL,
+        model        TEXT NOT NULL DEFAULT '',
+        input_json   TEXT NOT NULL DEFAULT '',
+        output_json  TEXT NOT NULL DEFAULT '',
+        verdict      TEXT NOT NULL,
+        fail_fields  TEXT NOT NULL DEFAULT '[]',
+        ts           REAL NOT NULL
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_audit_post ON llm_audit(post, ts)")
+
+
 MIGRATIONS: List[Tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "reconcile audit table", _ensure_reconcile_runs),
     (2, "legacy provenance columns", _ensure_legacy_columns),
     # V10-05（§2.1.5 编号冻结：这是第 3 号，V10 期间不再新增第 4 号）
     (3, "v10 replay results", _ensure_replay_results),
+    # V12-13（V12 期间新增第 4 号：补上 V10-01 从未落地的 llm_audit 表）
+    (4, "v12 llm audit table", _ensure_llm_audit),
 ]
 
 _SCHEMA_VERSION_DDL = """CREATE TABLE IF NOT EXISTS schema_version (
