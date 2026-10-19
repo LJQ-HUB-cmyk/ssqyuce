@@ -838,7 +838,11 @@ def llm_eval_run(issues: int = Query(60, ge=3, le=200),
         except Exception as e:  # noqa: BLE001
             db.fail_task(task_id, str(e))
 
-    threading.Thread(target=_work, daemon=True).start()
+    # MU-2：后台线程**不继承** contextvars，必须显式带过去，否则这次评估烧掉的
+    # LLM 额度记不到发起人名下（配额统计静默落空）。用 copy_context 而非传参：
+    # 深层库 llm_client 是按 contextvar 读用户的（Lead 裁决 9）。
+    threading.Thread(target=contextvars.copy_context().run, args=(_work,),
+                     daemon=True).start()
     return {"ok": True, "task_id": task_id,
             "note": ("后台任务运行中（60 期 × 三通道，LLM 通道较慢，约 5~30 分钟）。"
                      "轮询 /api/tasks/<task_id> 完成后查看 /api/eval/llm/latest。")}
@@ -3117,7 +3121,9 @@ def _bg_run(kind: str, fn, on_done=None) -> str:
         except Exception as e:  # noqa: BLE001
             db.update_task(tid, "failed", 0.0, f"{type(e).__name__}: {e}")
 
-    threading.Thread(target=_run, daemon=True, name=f"bg-{tid}").start()
+    # MU-2：同 llm_eval，后台任务里的 LLM 消耗必须记到发起人头上
+    threading.Thread(target=contextvars.copy_context().run, args=(_run,),
+                     daemon=True, name=f"bg-{tid}").start()
     return tid
 
 

@@ -224,6 +224,28 @@ def _bill_finish(bill: Dict, *, ok: bool, error: Optional[str] = None) -> Dict:
     if error:
         row["error"] = str(error)[:200]
     _append_cost_row(row)
+
+    # MU-2：把这次消费记到**发起人**名下（配额统计用）。
+    #
+    # 放在 `_bill_finish` 是因为它是全部 4 个出口（成功 / strict 抛错 / 降级 /
+    # 超时）的**唯一交汇点** —— 在 `chat()` 的每个 return 前各插一次，
+    # 迟早漏掉某个分支，表现为"某些调用不计入配额"。
+    #
+    # 归属用 `current_user_id()`（contextvar）：`llm_client` 是**无法改签名**的
+    # 深层库，正是 Lead 裁决 9 里"contextvar 只留给这类库"的场景。
+    # 无上下文（后台线程/调度器）时返回 None → 记为系统消费，不记到某个人头上。
+    try:
+        from . import api_app
+        _uid = api_app.current_user_id()
+        if _uid is not None:
+            from . import user_llm_store
+            user_llm_store.record_usage(
+                int(_uid),
+                tokens=(int(tokens_in or 0) + int(tokens_out or 0)),
+                calls=1 if ok else 0)
+    except Exception:      # noqa: BLE001 —— 用量统计绝不影响主流程
+        pass
+
     return row
 
 

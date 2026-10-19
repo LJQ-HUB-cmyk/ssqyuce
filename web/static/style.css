@@ -709,3 +709,27 @@ footer { color: var(--muted); font-size: 12px; text-align: center; margin-top: 2
   padding: 3px 10px; background: var(--bg2);
 }
 .user-chip b { color: var(--text); font-weight: 600; }
+
+/* ==================== LLM 配置：用量条与输入框组合 ==================== */
+
+.llm-usage {
+  display: flex; align-items: center; gap: 10px;
+  margin: 4px 0 12px; font-size: 12px;
+}
+.llm-usage-label { color: var(--muted); white-space: nowrap; }
+.llm-usage-bar {
+  flex: 1; height: 6px; border-radius: 999px;
+  background: var(--bg2); border: 1px solid var(--border); overflow: hidden;
+}
+.llm-usage-fill {
+  height: 100%; width: 0%; border-radius: 999px;
+  background: var(--green); transition: width .25s ease;
+}
+.llm-usage-fill.warn { background: var(--gold); }
+.llm-usage-fill.danger { background: var(--red); }
+.llm-usage-num { color: var(--text); font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+/* 输入框 + 右侧按钮（如 API Key 的「清除」） */
+.input-with-btn { display: flex; gap: 8px; align-items: stretch; }
+.input-with-btn input { flex: 1; }
+.input-with-btn button { white-space: nowrap; }

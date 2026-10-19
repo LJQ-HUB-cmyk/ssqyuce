@@ -363,15 +363,39 @@ def quota_exceeded(user_id: int) -> Optional[str]:
 
 
 def record_usage(user_id: int, tokens: int = 0, calls: int = 1) -> None:
-    """累加当日用量。失败不影响主流程（用量统计不该阻断出号）。"""
+    """累加当日用量。失败不影响主流程（用量统计不该阻断出号）。
+
+    ## 为什么必须是 UPSERT 而不是 UPDATE
+
+    第一版写成 `UPDATE ... WHERE user_id=?`，在**从未进过设置页**的用户上
+    匹配 0 行 —— 而那正是最常见的情况（管理员用共享通道、从没配过个人配置）。
+    结果是：真实 LLM 调用成功、成本日志里 tokens 齐全，但配额计数永远是 0。
+    这是本轮实测抓到的第二个"静默落空"（第一个是 contextvar 没穿过线程池）。
+
+    失败方向很糟：用户以为有 5 万额度，实际从来没被计数，也就永远不会被拦。
+    """
     if user_id is None:
         return
     try:
-        reset_daily_counters_if_needed(user_id)
+        tokens = max(0, int(tokens))
+        calls = max(0, int(calls))
+        today = time.strftime("%Y-%m-%d", time.localtime())
         db.get_conn().execute(
-            "UPDATE user_llm_config SET today_tokens_used=today_tokens_used+?,"
-            " today_calls_used=today_calls_used+? WHERE user_id=?",
-            (max(0, int(tokens)), max(0, int(calls)), int(user_id)))
+            """INSERT INTO user_llm_config
+               (user_id, today_tokens_used, today_calls_used, last_reset_date, updated_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                 today_tokens_used = CASE
+                   WHEN user_llm_config.last_reset_date = excluded.last_reset_date
+                   THEN user_llm_config.today_tokens_used + excluded.today_tokens_used
+                   ELSE excluded.today_tokens_used END,
+                 today_calls_used = CASE
+                   WHEN user_llm_config.last_reset_date = excluded.last_reset_date
+                   THEN user_llm_config.today_calls_used + excluded.today_calls_used
+                   ELSE excluded.today_calls_used END,
+                 last_reset_date = excluded.last_reset_date,
+                 updated_at = excluded.updated_at""",
+            (int(user_id), tokens, calls, today, time.time()))
         db.get_conn().commit()
     except Exception:      # noqa: BLE001
         pass

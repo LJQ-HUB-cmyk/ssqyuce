@@ -4,10 +4,10 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>双色球智能预测分析系统</title>
-<link rel="stylesheet" href="/static/style.css?v=20261020.1">
+<link rel="stylesheet" href="/static/style.css?v=20261020.2">
 <!-- ECharts CDN + 本地 fallback -->
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"
-  onerror="this.src='/static/vendor/echarts.min.js?v=20261020.1'"></script>
+  onerror="this.src='/static/vendor/echarts.min.js?v=20261020.2'"></script>
 </head>
 <body>
 <div class="app">
@@ -527,20 +527,36 @@
               <div class="settings-card-head">
                 <div>
                   <h3>🤖 LLM 大模型</h3>
-                  <p class="settings-desc">用于预测推理的第二通道（OpenAI 兼容接口）。配置保存在服务器 data 目录，重启不丢失。</p>
+                  <p class="settings-desc">用于预测推理的第二通道（OpenAI 兼容接口）。<b>配置按账号隔离</b>：你填的 Key 只影响你自己，看不到也用不到别人的。</p>
                 </div>
                 <div class="llm-status-badge" id="llmStatus">检测中…</div>
               </div>
 
               <div class="settings-body">
 
-                <!-- 作用域说明：全局默认 / 个人未开放 —— 由 loadLlmConfig() 按 scope 填写 -->
+                <!-- 当前生效来源：我自己的配置 / 管理员共享通道 / 无（纯统计） -->
                 <div class="v10-honesty" id="llmScopeNote" style="display:none"></div>
+
+                <!-- 用量与配额（仅共享通道受限；用自己的 Key 不受限） -->
+                <div class="llm-usage" id="llmUsage" style="display:none">
+                  <span class="llm-usage-label">今日共享通道用量</span>
+                  <div class="llm-usage-bar"><div class="llm-usage-fill" id="llmUsageFill" style="width:0%"></div></div>
+                  <span class="llm-usage-num" id="llmUsageNum">-</span>
+                </div>
 
                 <label class="switch-row" title="关闭后预测只使用统计模型">
                   <span>启用 LLM 推理</span>
                   <span class="switch">
                     <input type="checkbox" id="cfgLlmEnabled" onchange="toggleLlmConfig()">
+                    <span class="slider"></span>
+                  </span>
+                </label>
+
+                <!-- 自备 Key 开关：不勾 = 走管理员共享通道（有配额），勾 = 花自己的钱 -->
+                <label class="switch-row" title="勾选后使用你自己填写的 API 地址与 Key">
+                  <span>使用我自己的 API Key</span>
+                  <span class="switch">
+                    <input type="checkbox" id="cfgUseCustomKey" onchange="toggleLlmConfig()">
                     <span class="slider"></span>
                   </span>
                 </label>
@@ -553,8 +569,12 @@
 
                 <div class="field">
                   <label for="cfgApiKey">API Key</label>
-                  <input type="password" id="cfgApiKey" placeholder="sk-..." autocomplete="new-password">
-                  <p class="field-hint">保存后 Key 只存在服务器，明文回显为星号</p>
+                  <div class="input-with-btn">
+                    <input type="password" id="cfgApiKey" placeholder="sk-..." autocomplete="new-password">
+                    <button type="button" class="ghost" id="btnClearKey" onclick="clearLlmKey()"
+                            title="删除已保存的 Key">清除</button>
+                  </div>
+                  <p class="field-hint">加密保存在服务器，界面只回显末四位；留空保存表示不修改</p>
                 </div>
 
                 <div class="field-row">
@@ -742,6 +762,6 @@
 </div>
 
 <div id="toast"></div>
-<script src="/static/app.js?v=20261020.1"></script>
+<script src="/static/app.js?v=20261020.2"></script>
 </body>
 </html>

@@ -3479,64 +3479,138 @@ function setLlmStatus(text, cls) {
  * 走 **`/api/user/llm/config`**（W08 起新增），不再走 `/api/config/llm`：
  * 后者是管理员专用端点，普通用户调用会 403，"我的配置"却报"需要管理员权限"
  * 会把用户彻底搞糊涂 —— 而他的模型配置本来就该由他自己管。
- *
- * `scope` 字段决定界面语气：
- *  * `global`  —— 管理员，改的是全局默认（现阶段的真实形态）；
- *  * `unbound` —— 普通用户，隔离尚未上线，界面如实说明"暂不可用、请用统计通道"。
  */
-let _llmScope = "global";
+
+/**
+ * 读并渲染「我的 LLM 配置」（MU-2 起真正按账号隔离）。
+ *
+ * 后端 `/api/user/llm/config` 的 `scope` 有三态，界面必须**说清是哪一种**，
+ * 否则用户会分不清"我正在花自己的钱"和"我正在花管理员的额度"：
+ *   user   → 用的是我自己的 Key（不受系统配额限制）
+ *   system → 我在用管理员的共享通道（受今日配额限制）
+ *   none   → 没有可用通道，会走纯统计出号（**照常出号，不是故障**）
+ */
+let _llmScope = "none";
 
 async function loadLlmConfig() {
   try {
     const cfg = await api("/api/user/llm/config");
-    _llmScope = cfg.scope || "global";
-    const unbound = _llmScope === "unbound";
+    _llmScope = cfg.scope || "none";
+
+    const bad = {user: cfg.configured, system: cfg.configured, none: false}[_llmScope];
     setLlmStatus(
-      unbound ? "⚪ 未启用（未隔离）" : (cfg.configured ? "✅ 已配置" : "❌ 未配置"),
-      unbound ? "bad" : (cfg.configured ? "ok" : "bad"));
+      bad ? (cfg.configured ? "✅ 已配置" : "❌ 未配置") : "⚪ 纯统计出号",
+      bad && cfg.configured ? "ok" : "bad");
+
     $("#cfgBaseUrl").value = cfg.base_url || "";
-    // 只回显脱敏值做提示，**不回填成可编辑内容**（避免用户以为那就是真 key）
+    // Key 输入框**永远留空**，只用 placeholder 显示脱敏值与"留空=不修改"。
+    // 若把脱敏串填进 value，用户一保存就会把它当成真 Key 提交上去。
     $("#cfgApiKey").value = "";
     $("#cfgApiKey").placeholder = cfg.has_api_key
-      ? (cfg.api_key_masked || "******") + "（已保存，留空=不修改）"
-      : (unbound ? "个人配置尚未开放" : "sk-...");
+      ? ((cfg.api_key_masked || "******") + "（已保存 · 留空=不修改）")
+      : "sk-...";
     $("#cfgModel").value = cfg.model || "";
     $("#cfgSamples").value = cfg.samples || 3;
     $("#cfgLlmEnabled").checked = !cfg.disabled;
+    $("#cfgUseCustomKey").checked = !!cfg.use_custom_key;
 
-    // 普通用户在隔离上线前不允许改：整卡禁用 + 明确文案
-    const banner = $("#llmScopeNote");
-    if (banner) {
-      banner.style.display = "block";
-      banner.innerHTML = unbound
-        ? ("当前账号<b>尚未开放个人模型配置</b>，直接使用统计通道出号即可（不需要任何 key）。"
-           + "个人配置隔离上线后可在此填写自己的 API Key。")
-        : (AUTH.user && AUTH.user.role === "admin"
-            ? "当前为<b>管理员全局默认配置</b>，对所有尚未配置个人模型的使用者生效。"
-            : "");
-    }
-    const editable = !unbound;
-    ["cfgBaseUrl", "cfgApiKey", "cfgModel", "cfgSamples", "cfgLlmEnabled"].forEach(id => {
-      const el = $("#" + id);
-      if (el) el.disabled = !editable;
-    });
-    if (editable) toggleLlmConfig();
-    const saveBtn = $("#btnSaveLlm");
-    if (saveBtn) saveBtn.disabled = !editable;
-    const testBtn = $("#btnTestLlm");
-    if (testBtn) testBtn.disabled = !editable;
+    renderLlmScope(cfg);
+    renderLlmUsage(cfg);
+    toggleLlmConfig();
   } catch(e) {
     console.error("loadLlmConfig failed:", e);
     setLlmStatus("❌ 加载失败", "bad");
+    const b = $("#llmScopeNote");
+    if (b) {
+      b.style.display = "block";
+      b.innerHTML = "读取配置失败：" + escHtml(e.message) +
+        "。这不影响出号 —— 没有可用通道时会自动走纯统计。";
+    }
   }
 }
 
+/** 顶部来源说明：把"我这会儿在花谁的钱"讲清楚。 */
+function renderLlmScope(cfg) {
+  const b = $("#llmScopeNote");
+  if (!b) return;
+  b.style.display = "block";
+  const admin = (AUTH.user && AUTH.user.role === "admin");
+  const map = {
+    user: "✅ 当前生效：<b>你自己的配置</b>（消耗你自己 Key 的额度，不受系统配额限制）。",
+    system: "ℹ️ 当前生效：<b>管理员共享通道</b>（受每日配额限制）。"
+          + "想不受限制，可在下方勾选「使用我自己的 API Key」并填写你的配置。",
+    none: "⚪ 当前<b>没有可用的 LLM 通道</b>，预测会走<b>纯统计模式照常出号</b>（不需要任何 Key）。"
+        + "想启用大模型，请在下方填写配置。",
+  };
+  let html = map[_llmScope] || map.none;
+  if (cfg.reason) html += '<br><span class="llm-reason">原因：' + escHtml(cfg.reason) + "</span>";
+  if (admin && !cfg.system_channel_configured) {
+    html += '<br><span class="llm-reason">提示：你是管理员，可在此配置<b>共享通道</b>'
+          + "（对所有未配个人 Key 的用户生效），或到「更多 → 系统默认」单独维护。</span>";
+  }
+  b.innerHTML = html;
+}
+
+/** 今日共享通道用量。自备 Key 不受配额限制，因此不显示这条。 */
+function renderLlmUsage(cfg) {
+  const box = $("#llmUsage");
+  if (!box) return;
+  const quota = Number(cfg.daily_token_quota || 0);
+  if (_llmScope === "user" || !quota) {
+    // 自备 Key（花自己的钱）或配额=0（不限）→ 这条没有意义
+    box.style.display = "none";
+    return;
+  }
+  const used = Number(cfg.today_tokens_used || 0);
+  const pctUsed = Math.max(0, Math.min(100, Math.round((used / quota) * 100)));
+  box.style.display = "flex";
+  const fill = $("#llmUsageFill");
+  if (fill) {
+    fill.style.width = pctUsed + "%";
+    fill.className = "llm-usage-fill" + (pctUsed >= 90 ? " danger" : pctUsed >= 70 ? " warn" : "");
+  }
+  const num = $("#llmUsageNum");
+  if (num) num.textContent = used.toLocaleString() + " / " + quota.toLocaleString() + " tokens（" + pctUsed + "%）";
+}
+
 function toggleLlmConfig() {
-  const enabled = $("#cfgLlmEnabled")?.checked;
+  const enabled = !!$("#cfgLlmEnabled")?.checked;
+  // 只有勾了「使用我自己的 Key」才需要填地址/Key/模型；
+  // 不勾时这些字段对共享通道无意义，禁用可避免"填了却不生效"的困惑。
+  const custom = !!$("#cfgUseCustomKey")?.checked;
+  ["cfgLlmEnabled", "cfgUseCustomKey"].forEach(id => {
+    const el = $("#" + id);
+    if (el) el.disabled = false;                 // 这两个开关永远可点
+  });
   ["cfgBaseUrl", "cfgApiKey", "cfgModel", "cfgSamples"].forEach(id => {
     const el = $("#" + id);
-    if (el) el.disabled = !enabled;
+    if (el) el.disabled = !(enabled && custom);
   });
+  const clearBtn = $("#btnClearKey");
+  if (clearBtn) clearBtn.disabled = !custom;
+}
+
+/** 删除已保存的 Key（显式操作，与"留空=不修改"区分开）。 */
+async function clearLlmKey() {
+  if (!confirm("确认删除已保存的 API Key？删除后该账号将回落到共享通道（若管理员配置了）或纯统计。")) {
+    return;
+  }
+  const status = $("#llmConfigStatus");
+  try {
+    const r = await fetch("/api/user/llm/config", {
+      method: "POST",
+      headers: {"Content-Type": "application/json", "X-CSRF-Token": AUTH.csrf || ""},
+      body: JSON.stringify({clear_api_key: true}),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) throw new Error(j.error || ("HTTP " + r.status));
+    toast("API Key 已删除");
+    if (status) status.innerHTML = '<span class="oktxt">✓ Key 已删除</span>';
+    await loadLlmConfig();
+  } catch (e) {
+    toast("删除失败：" + e.message);
+    if (status) status.innerHTML = '<span class="errtxt">✗ 删除失败：' + escHtml(e.message) + "</span>";
+  }
 }
 
 async function saveLlmConfig() {
@@ -3544,22 +3618,29 @@ async function saveLlmConfig() {
     toast("设置表单未加载完成，请刷新页面重试");
     return;
   }
+  const custom = !!$("#cfgUseCustomKey")?.checked;
   const payload = {
-    base_url: $("#cfgBaseUrl").value.trim(),
-    model: $("#cfgModel").value.trim(),
+    use_custom_key: custom,
     samples: parseInt($("#cfgSamples")?.value || "3") || 3,
     disabled: !$("#cfgLlmEnabled")?.checked,
   };
-  // **关键**：只有用户真的输入了新 key 才提交 api_key。
-  // 输入框现在是空的（只显示占位脱敏值），无条件提交空串会把已保存的 key 抹掉
+  // 只有勾了"用自己的 Key"才提交连接参数；否则提交空值会把已存的配置抹掉。
+  if (custom) {
+    payload.base_url = $("#cfgBaseUrl").value.trim();
+    payload.model = $("#cfgModel").value.trim();
+  }
+  // **关键**：只有真的输入了新 Key 才提交 api_key。
+  // 输入框是空的（只显示脱敏占位），无条件提交空串会把已保存的 Key 抹掉
   // —— 这是"改个注数就丢了 API Key"的经典写法。
   const typedKey = ($("#cfgApiKey").value || "").trim();
   if (typedKey) payload.api_key = typedKey;
 
-  if (!payload.disabled &&
-      (!payload.base_url || !payload.model || (!typedKey && !($("#cfgApiKey").placeholder || "").includes("已保存")))) {
-    toast("启用 LLM 需填写 API 地址 / Key / 模型名称");
-    return;
+  if (custom && !payload.disabled) {
+    const hasSavedKey = ($("#cfgApiKey").placeholder || "").includes("已保存");
+    if (!payload.base_url || !payload.model || (!typedKey && !hasSavedKey)) {
+      toast("使用自己的 Key 需填写 API 地址 / Key / 模型名称");
+      return;
+    }
   }
 
   const status = $("#llmConfigStatus");
@@ -3571,9 +3652,8 @@ async function saveLlmConfig() {
       body: JSON.stringify(payload),
     });
     if (res && res.ok) {
-      toast(payload.disabled ? "LLM 已停用，配置已保存" : "LLM 配置已保存");
+      toast(payload.disabled ? "LLM 已停用，配置已保存" : "配置已保存");
       if (status) status.innerHTML = '<span class="oktxt">✓ 已保存，立即生效（无需重启）</span>';
-      setLlmStatus(payload.disabled || !res.configured ? "❌ 未配置" : "✅ 已配置", res.configured && !payload.disabled ? "ok" : "bad");
       if ($("#cfgLlm")) $("#cfgLlm").checked = !payload.disabled;
       $("#cfgApiKey").value = "";
       await loadLlmConfig();      // 重新拉脱敏值，确认落库后的真实状态
@@ -3583,7 +3663,7 @@ async function saveLlmConfig() {
   } catch(e) {
     console.error("saveLlmConfig failed:", e);
     toast("保存失败: " + e.message);
-    if (status) status.innerHTML = '<span class="errtxt">✗ 保存失败：' + e.message + '</span>';
+    if (status) status.innerHTML = '<span class="errtxt">✗ 保存失败：' + escHtml(e.message) + "</span>";
   }
 }
 

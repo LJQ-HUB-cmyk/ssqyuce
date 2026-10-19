@@ -900,8 +900,26 @@ def llm_tickets(draws: List[Dict], stats: Dict, patterns: List[Dict],
     n_samples = int(llm_samples) if llm_samples else config.LLM_SAMPLES
     calls = [model_cfgs[i % n_models] for i in range(n_samples)]
     call_errors: List[str] = []
+
+    # MU-2：**把 contextvars 显式带进工作线程**。
+    #
+    # 实测问题：`ThreadPoolExecutor` 提交的可调用对象**不继承** contextvars
+    # （不同于 AnyIO 在线程池里复制上下文的行为）。于是 `llm_client` 记账时
+    # 拿到的 `current_user_id()` 恒为 None → 用量记不到任何人头上 →
+    # 配额永远显示 0，**而且不会报任何错**（实测：真实 LLM 出号成功、
+    # llm_used=true，但 today_tokens_used 仍是 0）。
+    #
+    # 修法是标准做法：在**提交处**捕获当前上下文，再在线程里跑。
+    # 必须用 `copy_context()`（复制），不能把同一个 Context 对象传给多个线程 ——
+    # Context 不允许被并发进入，会抛 "cannot enter context: already entered"。
+    import contextvars as _ctxvars
+    _parent_ctx = _ctxvars.copy_context()
+
+    def _run_with_ctx(cfg: Dict) -> List[Dict]:
+        return _parent_ctx.copy().run(_ticket_call, cfg)
+
     with ThreadPoolExecutor(max_workers=min(len(calls), 4)) as ex:
-        futures = [ex.submit(_ticket_call, cfg) for cfg in calls]
+        futures = [ex.submit(_run_with_ctx, cfg) for cfg in calls]
         for f in futures:
             try:
                 tickets.extend(f.result())
