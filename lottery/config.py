@@ -23,7 +23,7 @@ BACKUP_DATA_URL = (os.environ.get("LOTT_BACKUP_DATA_URL") or "").strip() or None
 
 # ---------- 版本信息（前端主页 / API / GitHub 说明统一引用） ----------
 
-APP_VERSION = "4.0.2"          # v12 完整版：V12-01/04/12/21（覆盖率修复 + 补集反转 + 拆跨层求和 + 全枚举精确率）
+APP_VERSION = "4.1.0"          # v12 完整版 + L2/L3：V12-01/04/10/11/12/13/14/15/16/21 + 容器 CPU 治理
 APP_BUILD = "2026-10-V12"      # 构建标识（V12 交付批次）
 APP_MILESTONES = {
     "V12": {"status": "done", "desc": "规律「窄/假/半」三重修复（依据 docs/analysis/LEAD_VERDICT.md）：①V12-01 修复 30/124 档从未被检验——V11 新增 8 个形态族用 history[-w:] 切片，但 asof_scan 传入 ScanContext（dict 子类）触发 KeyError 被 except Exception 静默吞成空集，再被 sd<=0 二次跳过；给 ScanContext 加切片支持后 n_tested 由 94 → 124、E[FP] 4.70 → 6.20，8 族全部进入搜索（真实数据 best_quick_p_adjusted=0.0804，与预测逐位吻合，仍 >0.05 故「修好≠找到」）。②V12-21 补集反转：hits(S)+hits(Sᶜ)≡6 ⇒ delta_S+delta_Sᶜ≡0，负效应本就是补集的正效应；原 resolve_registry 把 delta<0 判 rejected 直接丢弃，等于销毁一半信号；现在原假说仍记 rejected（诚实保留）并同时登记补集候选（仍需 A/B+前置注册三关门），complement_of 标记来源、n_tested_delta 恒 0 保证 FWER 不变。③V12-04 拆除跨层求和：patterns_runtime 与 rule_lifecycle 两处 usable=long+phase 改为 by_layer 分列 + all_tiers_sum 显式命名，避免首屏「N 条可用其中 0 条有预测力」。④V12-12 形态通过率全枚举精确化：span 由手写 0.95 修正为 0.999853、zones 0.90→0.799152、sum 0.90→0.906411、consec 0.99→0.997042、parity 由 2 万次抽样 0.8257→精确 0.825159；生产通过率锁定 68.2992%（结构锁 + 真值锁 + 反向用例）。测试 858 → 891 passed。"},
