@@ -218,6 +218,57 @@ def test_primary_admin_unique_index(isolated_env, admin_user):
 # C. 鉴权中间件
 # ---------------------------------------------------------------------------
 
+def _collect_route_paths(app):
+    """枚举 app 上**全部**路由路径（含 include_router 挂进来的子路由）。
+
+    为什么不能直接遍历 ``app.routes``
+    ---------------------------------
+    FastAPI 0.142（starlette 1.7）把 ``include_router`` 改成了**惰性**实现：
+    ``app.routes`` 里只放一个 ``_IncludedRouter`` 占位对象，子路由要到真正
+    构建路由表时才展开。于是 ``getattr(r, "path", None)`` 对占位对象返回 None，
+    子路由被**静默跳过**。
+
+    实测后果（本项目真实发生过）：auth_api 的 11 条 + user_llm_api 的 4 条
+    共 **15 条路由**从未被分级覆盖测试看到，而测试仍以 ``len(paths) >= 80``
+    通过 —— 也就是说"每条路由都有明确分级"这条纪律在 auth 路由上一直是空的。
+    这与 V13 评审发现的 ``register_prereg`` 零调用是同一类问题：
+    **断言写在了看不见目标的地方，所以永远绿**。
+
+    因此这里显式展开占位对象；将来 FastAPI 若换实现，走原路径即可。
+    """
+    out = []
+    for r in app.routes:
+        p = getattr(r, "path", None)
+        if p and p.startswith("/") and getattr(r, "methods", None):
+            out.append(p)
+            continue
+        expand = getattr(r, "effective_candidates", None)
+        if callable(expand):
+            try:
+                cands = expand()
+            except TypeError:      # 某些版本要求传参数，说明不是我们要的那类对象
+                cands = []
+            for c in cands or []:
+                cp = getattr(c, "path", None)
+                if cp and cp.startswith("/") and getattr(c, "methods", None):
+                    out.append(cp)
+    return out
+
+
+def test_route_enumeration_sees_included_routers(isolated_env):
+    """**元测试**：枚举函数必须看得到 include_router 挂进来的路由。
+
+    没有这条，`_collect_route_paths` 万一退化成只看顶层，全量分级测试会
+    重新变成"看不见目标却永远绿"。这里把"看得见"本身钉死。
+    """
+    from lottery import api_app
+    db.close()
+    paths = _collect_route_paths(api_app.app)
+    assert "/api/auth/login" in paths, "枚举不到 auth_api 的子路由 —— 全量分级测试失效"
+    assert "/api/user/llm/config" in paths, "枚举不到 user_llm_api 的子路由"
+    assert "/api/admin/users" in paths
+
+
 def test_every_route_has_explicit_grade(isolated_env):
     """**参数化覆盖全部路由**：将来新增端点忘记定级会直接挂这条。
 
@@ -225,11 +276,7 @@ def test_every_route_has_explicit_grade(isolated_env):
     """
     from lottery import api_app
     db.close()
-    paths = []
-    for r in api_app.app.routes:
-        p = getattr(r, "path", None)
-        if p and p.startswith("/") and getattr(r, "methods", None):
-            paths.append(p)
+    paths = _collect_route_paths(api_app.app)
     assert len(paths) >= 80, f"路由数异常：{len(paths)}"
     for p in paths:
         role = api_app.auth_api.required_role(p)

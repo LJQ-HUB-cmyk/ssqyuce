@@ -52,8 +52,307 @@ let currentIssue = null;
 const TASK_POLL_MS = 1000;
 const pendingTasks = {};
 
+// ==================== 身份层（W08） ====================
+//
+// 服务端会话 + CSRF 双提交。前端只需持有 **CSRF token**（内存里，不落 localStorage：
+// XSS 能读到的东西不该包括它），Cookie 由浏览器自动携带（HttpOnly + Secure）。
+let AUTH = {
+  loaded: false,
+  authenticated: false,
+  enforced: false,
+  user: null,
+  csrf: "",        // /api/auth/me 不返回 CSRF，登录/引导响应里返回
+};
+
+/** 是否需要在启动时弹登录层。灰度期（未 enforce）一律不弹。 */
+function needsLogin() {
+  return AUTH.enforced && !AUTH.authenticated;
+}
+
+function showAuthOverlay(show, hint) {
+  const el = $("#authOverlay");
+  if (!el) return;
+  el.style.display = show ? "flex" : "none";
+  if (show) {
+    const h = $("#authHint");
+    if (h && hint) h.textContent = hint;
+    setTimeout(() => { try { $("#authUser").focus(); } catch (_) {} }, 50);
+  }
+}
+
+function authFail(elId, msg) {
+  const el = $(elId);
+  if (!el) { toast(msg); return; }
+  el.textContent = msg;
+  el.classList.remove("hidden");
+}
+function authClear(elId) {
+  const el = $(elId);
+  if (!el) return;
+  el.textContent = "";
+  el.classList.add("hidden");
+}
+
+/** 探测登录态。**任何失败都按"未登录"处理但保留 enforced 原值**，
+ *  以免后端临时抖动时把用户踢出并把界面改成"未启用鉴权"。 */
+async function loadAuthState() {
+  try {
+    const j = await api("/api/auth/me", { authProbe: true });
+    AUTH.loaded = true;
+    AUTH.authenticated = !!j.authenticated;
+    AUTH.enforced = !!j.auth_enforced;
+    AUTH.user = j.user || null;
+    renderUserChip();
+    return AUTH;
+  } catch (e) {
+    console.error("loadAuthState failed:", e);
+    AUTH.loaded = true;
+    return AUTH;
+  }
+}
+
+function renderUserChip() {
+  const box = $("#userChip");
+  if (!box) return;
+  if (!AUTH.authenticated || !AUTH.user) {
+    box.innerHTML = "";
+    box.style.display = "none";
+    const nav = $("#navUserAdmin");
+    if (nav) nav.style.display = "none";
+    return;
+  }
+  const isAdmin = AUTH.user.role === "admin";
+  const role = isAdmin ? " · 管理员" : "";
+  box.style.display = "inline-flex";
+  box.innerHTML = '<span>👤 <b>' + escHtml(AUTH.user.username) + "</b>" + role + "</span>" +
+    '<button class="gear-btn" onclick="doLogout()" title="退出登录">退出</button>';
+  // 「更多 → 用户管理」只对管理员出现；普通用户即便猜到 URL 也会被中间件 403
+  const nav = $("#navUserAdmin");
+  if (nav) nav.style.display = isAdmin ? "" : "none";
+}
+
+async function doLogin(ev) {
+  if (ev) ev.preventDefault();
+  authClear("#authError");
+  const btn = $("#authLoginBtn");
+  if (btn) { btn.disabled = true; btn.textContent = "登录中…"; }
+  try {
+    const r = await fetch("/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: ($("#authUser")?.value || "").trim(),
+        password: $("#authPass")?.value || "",
+      }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) {
+      // 失败原因统一为后端返回文案（人不存在与口令错**必须**是同一句）
+      authFail("#authError", j.error || ("登录失败（HTTP " + r.status + "）"));
+      return;
+    }
+    AUTH.authenticated = true;
+    AUTH.user = j.user;
+    AUTH.csrf = j.csrf_token || "";
+    if ($("#authPass")) $("#authPass").value = "";
+    showAuthOverlay(false);
+    renderUserChip();
+    toast("欢迎回来，" + (j.user?.username || ""));
+    await loadAll();
+  } catch (e) {
+    authFail("#authError", "登录请求失败：" + e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "登录"; }
+  }
+}
+
+async function doBootstrap(ev) {
+  if (ev) ev.preventDefault();
+  authClear("#bootError");
+  const btn = $("#authBootBtn");
+  if (btn) { btn.disabled = true; btn.textContent = "初始化中…"; }
+  try {
+    const r = await fetch("/api/auth/bootstrap", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        token: $("#bootToken")?.value || "",
+        password: $("#bootPass")?.value || "",
+      }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) {
+      authFail("#bootError", j.error || ("初始化失败（HTTP " + r.status + "）"));
+      return;
+    }
+    toast("管理员已初始化，请用新口令登录");
+    if ($("#authUser")) $("#authUser").value = j.username || "admin";
+    if ($("#bootToken")) $("#bootToken").value = "";
+    if ($("#bootPass")) $("#bootPass").value = "";
+  } catch (e) {
+    authFail("#bootError", "初始化请求失败：" + e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "完成初始化"; }
+  }
+}
+
+async function doLogout() {
+  try {
+    await fetch("/api/auth/logout", {
+      method: "POST",
+      headers: { "X-CSRF-Token": AUTH.csrf || "" },
+    });
+  } catch (_) {}
+  AUTH.authenticated = false;
+  AUTH.user = null;
+  AUTH.csrf = "";
+  renderUserChip();
+  if (AUTH.enforced) showAuthOverlay(true, "已退出登录。");
+  else location.reload();
+}
+
+// ==================== 用户管理（管理员） ====================
+
+async function openUserAdmin() {
+  const el = $("#userAdminOverlay");
+  if (!el) return;
+  if (!AUTH.authenticated || AUTH.user?.role !== "admin") {
+    toast("需要管理员权限");
+    return;
+  }
+  closeMore();
+  el.style.display = "flex";
+  await refreshUserAdmin();
+}
+
+function closeUserAdmin() {
+  const el = $("#userAdminOverlay");
+  if (el) el.style.display = "none";
+}
+
+async function refreshUserAdmin() {
+  const box = $("#userAdminList");
+  if (!box) return;
+  box.innerHTML = '<div class="note">加载中…</div>';
+  try {
+    const j = await api("/api/admin/users");
+    const rows = (j.users || []).map(u => {
+      const me = AUTH.user && u.user_id === AUTH.user.user_id;
+      const inactive = u.status !== "active";
+      const del = u.deleted_at ? ' <span class="u-meta">（已删除）</span>' : "";
+      const tags =
+        '<span class="auth-role-tag ' + (u.role === "admin" ? "is-admin" : "") + '">' + escHtml(u.role) + "</span>" +
+        '<span class="auth-role-tag ' + (inactive ? "is-inactive" : "") + '">' + escHtml(u.status) + "</span>";
+      // 自保护：不给自己渲染停用/降级/删除按钮（后端也会拒，但界面上不该出现）
+      const actions = (me || u.deleted_at) ? "" : [
+        '<button class="ghost" onclick="adminToggleUser(' + u.user_id + ', \'' +
+          (inactive ? "active" : "disabled") + '\')">' + (inactive ? "启用" : "停用") + '</button>',
+        '<button class="ghost" onclick="adminToggleRole(' + u.user_id + ', \'' +
+          (u.role === "admin" ? "user" : "admin") + '\')">' +
+          (u.role === "admin" ? "降为普通" : "升为管理员") + '</button>',
+        '<button class="ghost" onclick="adminResetPassword(' + u.user_id + ')">重置口令</button>',
+        '<button class="ghost" onclick="adminDeleteUser(' + u.user_id + ')">删除</button>',
+      ].join("");
+      return '<div class="auth-user-row">' +
+        '<span class="u-name">' + escHtml(u.username) + "</span>" + tags + del +
+        '<span class="u-meta">' + (me ? "（我）" : "") +
+          (u.last_login_at ? " 上次登录 " + new Date(u.last_login_at * 1000).toLocaleString() : " 从未登录") +
+        "</span>" +
+        '<span class="u-spacer"></span>' + actions + "</div>";
+    }).join("");
+    box.innerHTML = rows || '<div class="note">暂无用户</div>';
+  } catch (e) {
+    box.innerHTML = '<div class="note">加载失败：' + escHtml(e.message) + "</div>";
+  }
+}
+
+async function adminPatch(userId, payload) {
+  return api("/api/admin/users/" + userId, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", "X-CSRF-Token": AUTH.csrf },
+    body: JSON.stringify(payload),
+  });
+}
+
+async function adminToggleUser(userId, status) {
+  try {
+    await adminPatch(userId, { status });
+    toast(status === "active" ? "已启用" : "已停用");
+    await refreshUserAdmin();
+  } catch (e) { toast("操作失败：" + e.message); }
+}
+
+async function adminToggleRole(userId, role) {
+  try {
+    await adminPatch(userId, { role });
+    toast("角色已改为 " + role);
+    await refreshUserAdmin();
+  } catch (e) { toast("操作失败：" + e.message); }
+}
+
+async function adminResetPassword(userId) {
+  const pw = prompt("输入新的初始口令（至少 8 位）。留空取消。");
+  if (!pw) return;
+  try {
+    await api("/api/admin/users/" + userId + "/reset-password", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-CSRF-Token": AUTH.csrf },
+      body: JSON.stringify({ password: pw }),
+    });
+    toast("口令已重置（该用户所有旧会话已失效）");
+  } catch (e) { toast("重置失败：" + e.message); }
+}
+
+async function adminDeleteUser(userId) {
+  if (!confirm("确认删除该用户？删除后该账号无法登录（数据保留）。")) return;
+  try {
+    await api("/api/admin/users/" + userId, {
+      method: "DELETE",
+      headers: { "X-CSRF-Token": AUTH.csrf },
+    });
+    toast("已删除");
+    await refreshUserAdmin();
+  } catch (e) { toast("删除失败：" + e.message); }
+}
+
+async function doCreateUser() {
+  const st = $("#nuStatus");
+  const name = ($("#nuName")?.value || "").trim();
+  const pass = $("#nuPass")?.value || "";
+  const role = $("#nuRole")?.value || "user";
+  if (!name || !pass) { toast("用户名与初始口令均为必填"); return; }
+  if (st) st.innerHTML = "⏳ 创建中…";
+  try {
+    await api("/api/admin/users", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-CSRF-Token": AUTH.csrf },
+      body: JSON.stringify({ username: name, password: pass, role }),
+    });
+    if (st) st.innerHTML = '<span class="oktxt">✓ 已创建</span>';
+    $("#nuName").value = ""; $("#nuPass").value = "";
+    await refreshUserAdmin();
+  } catch (e) {
+    if (st) st.innerHTML = '<span class="errtxt">✗ ' + escHtml(e.message) + "</span>";
+  }
+}
+
+/**
+ * 统一 fetch 封装。
+ *
+ * 自动补 `X-CSRF-Token`（写操作）与 401 处理：
+ *  * 收到 401 且后端启用鉴权 → 弹登录层，而不是抛一个"要 Bearer Token"的怪错误；
+ *  * 收到 403 "需要管理员权限" → 明确提示，不静默失败。
+ */
 async function api(path, opts = {}) {
-  const r = await fetch(path, opts);
+  const isProbe = !!opts.authProbe;
+  const o = Object.assign({}, opts);
+  delete o.authProbe;
+  // 写操作自动带 CSRF（GET/HEAD 不需要，避免无谓的跨域预检）
+  const method = (o.method || "GET").toUpperCase();
+  if (!["GET", "HEAD", "OPTIONS"].includes(method) && AUTH.csrf) {
+    o.headers = Object.assign({}, o.headers || {}, { "X-CSRF-Token": AUTH.csrf });
+  }
+  const r = await fetch(path, o);
   if (!r.ok) {
     // 优先展示后端 JSON 里的 error 详情（如“大模型不可用或超时(...)”、
     // 严格模式“无可用规律/LLM 通道不可用”等）；解析失败时退回 HTTP 状态码。
@@ -68,6 +367,15 @@ async function api(path, opts = {}) {
     const err = new Error(msg);
     err.status = r.status;
     err.payload = payload || null;
+    if (!isProbe) {
+      if (r.status === 401 && (payload && payload.auth_required)) {
+        AUTH.authenticated = false;
+        AUTH.enforced = true;
+        showAuthOverlay(true, "登录状态已失效，请重新登录。");
+      } else if (r.status === 403 && msg.indexOf("管理员") >= 0) {
+        toast("需要管理员权限：" + path);
+      }
+    }
     throw err;
   }
   return r.json();
@@ -3165,16 +3473,58 @@ function setLlmStatus(text, cls) {
   else el.style.color = "";
 }
 
+/**
+ * 读 LLM 配置。
+ *
+ * 走 **`/api/user/llm/config`**（W08 起新增），不再走 `/api/config/llm`：
+ * 后者是管理员专用端点，普通用户调用会 403，"我的配置"却报"需要管理员权限"
+ * 会把用户彻底搞糊涂 —— 而他的模型配置本来就该由他自己管。
+ *
+ * `scope` 字段决定界面语气：
+ *  * `global`  —— 管理员，改的是全局默认（现阶段的真实形态）；
+ *  * `unbound` —— 普通用户，隔离尚未上线，界面如实说明"暂不可用、请用统计通道"。
+ */
+let _llmScope = "global";
+
 async function loadLlmConfig() {
   try {
-    const config = await api("/api/config/llm");
-    setLlmStatus(config.configured ? "✅ 已配置" : "❌ 未配置", config.configured ? "ok" : "bad");
-    $("#cfgBaseUrl").value = config.base_url || "";
-    $("#cfgApiKey").value = config.disabled || !config.api_key ? "" : "******";
-    $("#cfgModel").value = config.model || "";
-    $("#cfgSamples").value = config.samples || 3;
-    $("#cfgLlmEnabled").checked = !config.disabled;
-    toggleLlmConfig();
+    const cfg = await api("/api/user/llm/config");
+    _llmScope = cfg.scope || "global";
+    const unbound = _llmScope === "unbound";
+    setLlmStatus(
+      unbound ? "⚪ 未启用（未隔离）" : (cfg.configured ? "✅ 已配置" : "❌ 未配置"),
+      unbound ? "bad" : (cfg.configured ? "ok" : "bad"));
+    $("#cfgBaseUrl").value = cfg.base_url || "";
+    // 只回显脱敏值做提示，**不回填成可编辑内容**（避免用户以为那就是真 key）
+    $("#cfgApiKey").value = "";
+    $("#cfgApiKey").placeholder = cfg.has_api_key
+      ? (cfg.api_key_masked || "******") + "（已保存，留空=不修改）"
+      : (unbound ? "个人配置尚未开放" : "sk-...");
+    $("#cfgModel").value = cfg.model || "";
+    $("#cfgSamples").value = cfg.samples || 3;
+    $("#cfgLlmEnabled").checked = !cfg.disabled;
+
+    // 普通用户在隔离上线前不允许改：整卡禁用 + 明确文案
+    const banner = $("#llmScopeNote");
+    if (banner) {
+      banner.style.display = "block";
+      banner.innerHTML = unbound
+        ? ("当前账号<b>尚未开放个人模型配置</b>，直接使用统计通道出号即可（不需要任何 key）。"
+           + "个人配置隔离上线后可在此填写自己的 API Key。")
+        : (AUTH.user && AUTH.user.role === "admin"
+            ? "当前为<b>管理员全局默认配置</b>，对所有尚未配置个人模型的使用者生效。"
+            : "");
+    }
+    const editable = !unbound;
+    ["cfgBaseUrl", "cfgApiKey", "cfgModel", "cfgSamples", "cfgLlmEnabled"].forEach(id => {
+      const el = $("#" + id);
+      if (el) el.disabled = !editable;
+    });
+    if (editable) toggleLlmConfig();
+    const saveBtn = $("#btnSaveLlm");
+    if (saveBtn) saveBtn.disabled = !editable;
+    const testBtn = $("#btnTestLlm");
+    if (testBtn) testBtn.disabled = !editable;
   } catch(e) {
     console.error("loadLlmConfig failed:", e);
     setLlmStatus("❌ 加载失败", "bad");
@@ -3196,13 +3546,18 @@ async function saveLlmConfig() {
   }
   const payload = {
     base_url: $("#cfgBaseUrl").value.trim(),
-    api_key: $("#cfgApiKey").value.trim(),
     model: $("#cfgModel").value.trim(),
     samples: parseInt($("#cfgSamples")?.value || "3") || 3,
     disabled: !$("#cfgLlmEnabled")?.checked,
   };
+  // **关键**：只有用户真的输入了新 key 才提交 api_key。
+  // 输入框现在是空的（只显示占位脱敏值），无条件提交空串会把已保存的 key 抹掉
+  // —— 这是"改个注数就丢了 API Key"的经典写法。
+  const typedKey = ($("#cfgApiKey").value || "").trim();
+  if (typedKey) payload.api_key = typedKey;
 
-  if (!payload.disabled && (!payload.base_url || !payload.model || !payload.api_key)) {
+  if (!payload.disabled &&
+      (!payload.base_url || !payload.model || (!typedKey && !($("#cfgApiKey").placeholder || "").includes("已保存")))) {
     toast("启用 LLM 需填写 API 地址 / Key / 模型名称");
     return;
   }
@@ -3210,7 +3565,7 @@ async function saveLlmConfig() {
   const status = $("#llmConfigStatus");
   if (status) status.innerHTML = '<span class="oktxt">⏳ 正在保存…</span>';
   try {
-    const res = await api("/api/config/llm", {
+    const res = await api("/api/user/llm/config", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify(payload),
@@ -3220,6 +3575,8 @@ async function saveLlmConfig() {
       if (status) status.innerHTML = '<span class="oktxt">✓ 已保存，立即生效（无需重启）</span>';
       setLlmStatus(payload.disabled || !res.configured ? "❌ 未配置" : "✅ 已配置", res.configured && !payload.disabled ? "ok" : "bad");
       if ($("#cfgLlm")) $("#cfgLlm").checked = !payload.disabled;
+      $("#cfgApiKey").value = "";
+      await loadLlmConfig();      // 重新拉脱敏值，确认落库后的真实状态
     } else {
       throw new Error((res && res.error) || "服务器无响应");
     }
@@ -3706,6 +4063,8 @@ function renderMyCopyReceipt(saved, item) {
 // ==================== 加载 ====================
 
 async function loadAll() {
+  // 强制鉴权且未登录时不再打接口（登录成功后会再次调用本函数）
+  if (AUTH.loaded && needsLogin()) return;
   try {
     // 防缓存：预测/健康这类"随时会变"的接口带时间戳，确保刷新页面拿到的是最新数据
     // （用户反馈：重新生成后刷新页面又显示 15 日的旧数据）。
@@ -3793,7 +4152,21 @@ window.addEventListener("hashchange", () => {
   switchTab(location.hash.slice(1) || "predict");
 });
 
-loadAll();
+/**
+ * 启动流程：**先探测身份，再决定是否加载数据**。
+ *
+ * 顺序不能反过来：`loadAll()` 会并发打 4 个受保护接口，未登录时全部 401，
+ * 4 条错误 toast 叠加会把登录层遮住，用户看到的是"一堆报错"而不是"请登录"。
+ */
+(async function boot() {
+  await loadAuthState();
+  if (needsLogin()) {
+    showAuthOverlay(true, "本系统已启用多用户，请登录后使用。");
+    return;                        // 未登录：不加载数据，避免连环 401 弹窗
+  }
+  // 灰度期（未启用鉴权）或已登录：正常加载
+  loadAll();
+})();
 
 // ==================== V6：规律时效（阶段有效性）+ 多维度发现 + LLM 规律工坊 ====================
 

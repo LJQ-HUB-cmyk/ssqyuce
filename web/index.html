@@ -4,10 +4,10 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>双色球智能预测分析系统</title>
-<link rel="stylesheet" href="/static/style.css?v=20261019.1">
+<link rel="stylesheet" href="/static/style.css?v=20261020.1">
 <!-- ECharts CDN + 本地 fallback -->
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"
-  onerror="this.src='/static/vendor/echarts.min.js?v=20261019.1'"></script>
+  onerror="this.src='/static/vendor/echarts.min.js?v=20261020.1'"></script>
 </head>
 <body>
 <div class="app">
@@ -20,6 +20,7 @@
       <span class="badge badge-ver" id="verBadge" title="系统版本">v·</span>
     </div>
     <div class="topbar-actions">
+      <span class="user-chip" id="userChip" style="display:none"></span>
       <button class="gear-btn" onclick="toggleGearPop(event)" title="常用设置">⚙️</button>
       <button onclick="toggleTheme()" title="切换主题">🌓 主题</button>
       <button onclick="exportData()" title="导出数据">📥 导出</button>
@@ -533,6 +534,9 @@
 
               <div class="settings-body">
 
+                <!-- 作用域说明：全局默认 / 个人未开放 —— 由 loadLlmConfig() 按 scope 填写 -->
+                <div class="v10-honesty" id="llmScopeNote" style="display:none"></div>
+
                 <label class="switch-row" title="关闭后预测只使用统计模型">
                   <span>启用 LLM 推理</span>
                   <span class="switch">
@@ -565,8 +569,8 @@
                 </div>
 
                 <div class="settings-actions">
-                  <button onclick="saveLlmConfig()" class="primary">💾 保存配置</button>
-                  <button onclick="testLlmConnection()" class="ghost">🔗 测试连接与出文</button>
+                  <button onclick="saveLlmConfig()" class="primary" id="btnSaveLlm">💾 保存配置</button>
+                  <button onclick="testLlmConnection()" class="ghost" id="btnTestLlm">🔗 测试连接与出文</button>
                   <span id="llmTestResult" class="test-result"></span>
                 </div>
                 <p class="field-hint">测试会跑一次贴近真实预测的结构化出文探测（推理型模型较慢，
@@ -637,6 +641,8 @@
       <button class="more-item" onclick="switchTab('eval')">📊 评估报告</button>
       <button class="more-item" onclick="switchTab('data')">💾 数据管理</button>
       <button class="more-item" onclick="switchTab('settings')">🔧 设置</button>
+      <button class="more-item" id="navUserAdmin" style="display:none"
+              onclick="openUserAdmin()">👥 用户管理</button>
     </div>
   </aside>
 
@@ -655,7 +661,87 @@
   </div>
 </div>
 
+<!-- ==================== 身份：登录遮罩 / 引导 / 用户管理 ==================== -->
+<!--
+  设计要点：
+  1. 登录遮罩在 **auth_enforced=true 且未登录** 时才显示；灰度期（AUTH_MODE=off）
+     完全不打扰现有使用。判据来自后端 /api/auth/me 的 auth_enforced 字段，
+     前端**不自行猜测**。
+  2. 遮罩默认 display:none，由 JS 显示 —— 否则后端未启用鉴权时会挡住整站。
+  3. 引导面板同样按需显示：只有 bootstrap 账号未初始化时才提示。
+-->
+<div class="auth-overlay" id="authOverlay" style="display:none">
+  <div class="auth-card">
+    <h2>🎱 双色球 · 登录</h2>
+    <p class="note" id="authHint">本系统已启用多用户，请登录后使用。</p>
+
+    <form id="authLoginForm" onsubmit="doLogin(event)" autocomplete="on">
+      <div class="field">
+        <label for="authUser">用户名</label>
+        <input type="text" id="authUser" autocomplete="username" required maxlength="32">
+      </div>
+      <div class="field">
+        <label for="authPass">口令</label>
+        <input type="password" id="authPass" autocomplete="current-password" required maxlength="128">
+      </div>
+      <div class="auth-actions">
+        <button type="submit" class="primary" id="authLoginBtn">登录</button>
+      </div>
+      <div class="auth-error hidden" id="authError"></div>
+    </form>
+
+    <!-- 引导：仅在存在未初始化的 bootstrap 账号时可用（后端受一次性 env token 保护） -->
+    <details class="auth-bootstrap" id="authBootstrapBox">
+      <summary>首次部署？初始化管理员账号</summary>
+      <p class="note">需要服务器侧已配置一次性引导口令 <code>LOTT_BOOTSTRAP_TOKEN</code>。</p>
+      <form id="authBootstrapForm" onsubmit="doBootstrap(event)">
+        <div class="field">
+          <label for="bootToken">引导口令</label>
+          <input type="password" id="bootToken" autocomplete="off" required>
+        </div>
+        <div class="field">
+          <label for="bootPass">新管理员口令</label>
+          <input type="password" id="bootPass" autocomplete="new-password" required minlength="8">
+        </div>
+        <div class="auth-actions">
+          <button type="submit" class="ghost" id="authBootBtn">完成初始化</button>
+        </div>
+        <div class="auth-error hidden" id="bootError"></div>
+      </form>
+    </details>
+  </div>
+</div>
+
+<!-- 用户管理（管理员专用，从「更多 → 用户管理」打开） -->
+<div class="auth-overlay" id="userAdminOverlay" style="display:none">
+  <div class="auth-card auth-card-wide">
+    <div class="auth-admin-head">
+      <h2>👥 用户管理</h2>
+      <button class="more-close" onclick="closeUserAdmin()" title="关闭">✕</button>
+    </div>
+    <p class="note">管理员可新增用户、停用账号、重置口令。删除为软删除（保留审计）。</p>
+
+    <div id="userAdminList" class="auth-user-list"><div class="note">加载中…</div></div>
+
+    <div class="auth-newuser">
+      <h3>新增用户</h3>
+      <div class="field-row">
+        <div class="field"><label for="nuName">用户名</label>
+          <input type="text" id="nuName" maxlength="32" autocomplete="off"></div>
+        <div class="field"><label for="nuPass">初始口令</label>
+          <input type="password" id="nuPass" autocomplete="new-password"></div>
+        <div class="field field-sm"><label for="nuRole">角色</label>
+          <select id="nuRole"><option value="user" selected>user</option><option value="admin">admin</option></select></div>
+      </div>
+      <div class="settings-actions">
+        <button onclick="doCreateUser()" class="primary">➕ 创建</button>
+        <span id="nuStatus" class="test-result"></span>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div id="toast"></div>
-<script src="/static/app.js?v=20261019.1"></script>
+<script src="/static/app.js?v=20261020.1"></script>
 </body>
 </html>

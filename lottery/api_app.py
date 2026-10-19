@@ -24,6 +24,7 @@ class _NoCacheStaticFiles(StaticFiles):
 
 from . import config, data_fetcher, db
 from . import auth_api
+from . import user_llm_api
 from . import migrations
 from . import features as F, diagnose as D, mining as M
 
@@ -191,6 +192,8 @@ def _unauthorized_bearer() -> JSONResponse:
 
 # 认证与管理路由（登录/登出/me/引导 + 用户管理 + 审计）
 app.include_router(auth_api.router)
+# W08a：按用户隔离的 LLM 配置（当前归属规则见 user_llm_api 模块 docstring）
+app.include_router(user_llm_api.router)
 
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"

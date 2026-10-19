@@ -9,6 +9,8 @@
   会变成"需要登录"而不是"匿名可用"——失败方向是安全的一侧。
 * 危险操作（写库、烧 LLM 钱、改全局配置、跨用户读）→ `"admin"`。
 * 少数必须匿名可达的（首页、健康检查、登录/引导）→ `None`。
+* `/api/user/**` 一律 `"user"`：它是「**当前登录人**自己的东西」，天然不需要管理员，
+  也**绝不能**落进 `/api/admin/` —— 那会把"管理我自己的配置"误判为管理权限。
 
 配套有一条**参数化测试**遍历 `app.routes`，断言"每条路由都有明确分级"，
 这样将来新增端点若忘了登记，测试会直接红（见 tests/test_mu1_auth.py）。
@@ -91,6 +93,8 @@ ADMIN_EXACT = frozenset({
     # 系统级只读（含他人/全局信息）
     "/api/llm/cost",
     "/api/tasks",
+    # W08a：全局默认 LLM 配置（含 base_url/model；普通用户只看自己的视图）
+    "/api/admin/llm/default",
 })
 
 ADMIN_PREFIX = ("/api/admin/",)
