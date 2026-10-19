@@ -545,16 +545,6 @@ def import_mining_artifact(path=None) -> Dict:
     }
 
 
-def get_latest_mining_result() -> Optional[Dict]:
-    """读取最近一次挖掘结果摘要。"""
-    from . import config
-    result_file = BASE / "data" / "mining_latest.json"
-    if not result_file.exists():
-        return None
-    try:
-        return json.loads(result_file.read_text(encoding="utf-8"))
-    except Exception:
-        return None
 
 
 def save_mining_result(result: Dict) -> None:

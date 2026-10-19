@@ -327,9 +327,18 @@ def test_api_eval_cumulative_has_adaptive(client):
     assert "enabled" in data["adaptive"]
 
 
-def test_api_eval_coverage_endpoint(client):
+# `/api/eval/coverage` 已于 V13 P1a 删除（M4_SIMPLIFY §5 A7）：
+#   它是 U4 时代用 3000 次蒙特卡洛比较 single vs coverage 的一次性对照实验，
+#   而 V12 的 l2_service 已做精确全枚举（/api/l2/distribution、/api/portfolio/marginal），
+#   精确值优于蒙特卡洛近似。
+#   更关键的是它的结论句在说「coverage 模式显著提升蓝球覆盖数」——
+#   这正是「外观工具冒充概率工具」：形态/覆盖改变的是票的样子，不是中奖概率。
+#   保留该端点等于把一句会误导人的结论留在 API 里。
+#
+# 对应的替代断言放在 test_v12_l2_exact.py（精确全枚举），此处只保留一条
+# 「端点确实已下线」的哨兵，防止有人无声地把它加回来。
+def test_eval_coverage_endpoint_is_gone(client):
     r = client.post("/api/eval/coverage?issues=10&n=6&coverage_r=3")
-    assert r.status_code == 200
-    data = r.json()
-    assert "single" in data and "coverage" in data
-    assert data["coverage"]["avg_blue_cover"] >= 1.0
+    assert r.status_code in (404, 405), (
+        "该端点已按 V13 P1a 删除；若确实需要恢复，请先回应 M4_SIMPLIFY §5 A7 "
+        "关于「外观工具冒充概率工具」的质疑")

@@ -51,3 +51,5 @@ data/rule_lifecycle.json.tmp
 data/.secret_key
 # 追加型运行日志（内容随每次调用增长，不属于源码）
 data/llm_cost_log.jsonl
+# V13 P1a：归档的废弃数据文件（保留可恢复，不进版本库）
+data/archive/

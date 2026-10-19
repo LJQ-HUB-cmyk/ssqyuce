@@ -267,7 +267,6 @@ if BET_MODE not in ("single", "blue_compound", "dan_tuo"):
 BLUE_COMPOUND_K = int(os.environ.get("LOTT_BLUE_COMPOUND_K", "5"))
 # dan_tuo：红胆 n 个固定 + 红拖补齐 6 红 + 蓝 1 个 → 展开多注
 DAN_TUO_DANS = int(os.environ.get("LOTT_DAN_TUO_DANS", "4"))
-DAN_TUO_TUOS = int(os.environ.get("LOTT_DAN_TUO_TUOS", "5"))
 
 # ---------- U3 方法自适应降权 ----------
 # ---------- V11「阶段可用」档（phase_usable）----------
@@ -291,7 +290,6 @@ LOTT_PHASE_USABLE = os.environ.get("LOTT_PHASE_USABLE", "0") == "1"
 # 自动关闭阈值：阶段类规律的累计配对 t 值低于此值即自动关闭（默认 -2.0）
 PHASE_USABLE_AUTO_OFF_T = float(os.environ.get("LOTT_PHASE_USABLE_AUTO_OFF_T", "-2.0"))
 # 阶段类规律进入候选所需的最小配对期数（样本不足不统计、也不自动关闭）
-PHASE_USABLE_MIN_PAIRS = int(os.environ.get("LOTT_PHASE_USABLE_MIN_PAIRS", "60"))
 
 # 启动期后台补刷规律快照：默认开。
 # 关闭它用于「pytest / CLI / 任何会反复 import api_app 的场景」——
@@ -457,11 +455,8 @@ def llm_model_list() -> List[Dict]:
 WINDOWS = {"long": 0, "mid": 150, "short": 30}
 
 # 回测参数
-BACKTEST_MIN_N = int(os.environ.get("LOTT_BT_MIN_N", "30"))   # 最少触发样本量
-BACKTEST_HORIZON = int(os.environ.get("LOTT_BT_HORIZON", "1"))  # 结果检验窗口（期）
 
 # 离线评估
-OFFLINE_EVAL_ISSUES = int(os.environ.get("LOTT_OFFLINE_EVAL_ISSUES", "120"))
 
 # ---------- M2 ML 概率模型（GBDT + 随机森林 + 校准） ----------
 

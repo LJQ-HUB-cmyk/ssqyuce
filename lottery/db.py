@@ -322,14 +322,6 @@ def save_features(issue: str, payload: dict):
     conn.commit()
 
 
-def load_features(issue: Optional[str] = None) -> Optional[Dict]:
-    if issue is None:
-        row = get_conn().execute(
-            "SELECT payload FROM features ORDER BY CAST(issue AS INTEGER) DESC LIMIT 1").fetchone()
-    else:
-        row = get_conn().execute("SELECT payload FROM features WHERE issue=?", (issue,)).fetchone()
-    return json.loads(row["payload"]) if row else None
-
 
 # ---------- patterns ----------
 

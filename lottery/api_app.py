@@ -274,17 +274,6 @@ def refresh():
     except Exception as e:  # noqa: BLE001
         return JSONResponse({"ok": False, "error": str(e)}, status_code=502)
     return {"ok": True, **info}
-
-
-@app.get("/api/draws/latest")
-def latest_draws(n: int = Query(20, ge=1, le=200)):
-    draws = db.load_last_draws(n)
-    return [{
-        "issue": d["issue"], "date": d["date"], "reds": d["reds"], "blue": d["blue"],
-        "sum": sum(d["reds"]),
-    } for d in draws]
-
-
 @app.get("/api/draws/history")
 def draw_history(n: int = Query(500, ge=1, le=3490)):
     """返回按序号排列的开奖历史（用于走势图）。"""
@@ -681,55 +670,6 @@ def eval_backtest(issues: int = Query(120), n: int = Query(10)):
     res = evaluate.offline_backtest(draws, issues=min(issues, 200), n_tickets=n,
                                     use_llm=False)
     return res
-
-
-@app.post("/api/eval/coverage")
-def eval_coverage(issues: int = Query(60, ge=5, le=200), n: int = Query(10),
-                  coverage_r: int = Query(3, ge=1, le=5)):
-    """U4 离线对比：coverage 模式 vs 当前 single 模式的 ≥五等奖命中期数 / 蓝球覆盖。
-
-    walk-forward：只用目标期之前数据预测（纯统计+ML，固定种子），对照实际开奖，
-    比较两种选注策略的“≥五等奖命中期数占比”与单期蓝球覆盖。诚实口径：双色球独立
-    随机，任何模式都不承诺超过数学期望，本对比量化的是“结构覆盖体感”差异。
-    """
-    import random
-    import numpy as np
-    from . import engine as E, evaluate as EV
-    draws = db.load_draws()
-    if len(draws) < issues + 301:
-        return JSONResponse({"ok": False, "error": f"数据不足（需 ≥{issues + 301} 期）"},
-                            status_code=400)
-    rng = random.Random(20260817)
-    start = len(draws) - issues
-    stats = {"single": {"hit_periods": 0, "blue_cover": 0, "prizes": 0},
-             "coverage": {"hit_periods": 0, "blue_cover": 0, "prizes": 0}}
-    for i in range(start, len(draws) - 1):
-        history = draws[:i]
-        target = draws[i]
-        for mode, cov in (("single", False), ("coverage", True)):
-            res = E.predict_next(history, use_llm=False, use_ml=False, n_tickets=n,
-                                 persist=False, rng=rng, coverage=cov, coverage_r=coverage_r)
-            tr = EV.tickets_result(res["tickets"], target)
-            stats[mode]["hit_periods"] += int(tr["best_level"] >= 5)
-            stats[mode]["blue_cover"] += res["blue_covered"]
-            stats[mode]["prizes"] += int(sum(tr["levels"]))
-    n_periods = len(range(start, len(draws) - 1))
-    for mode in stats:
-        stats[mode]["hit_period_rate"] = round(stats[mode]["hit_periods"] / max(1, n_periods), 4)
-        stats[mode]["avg_blue_cover"] = round(stats[mode]["blue_cover"] / max(1, n_periods), 2)
-    return {
-        "n_issues": n_periods, "n_tickets": n, "coverage_r": coverage_r,
-        "single": stats["single"], "coverage": stats["coverage"],
-        "delta_hit_period_rate": round(
-            stats["coverage"]["hit_period_rate"] - stats["single"]["hit_period_rate"], 4),
-        "delta_avg_blue_cover": round(
-            stats["coverage"]["avg_blue_cover"] - stats["single"]["avg_blue_cover"], 2),
-        "note": ("coverage 模式通过红球/蓝球覆盖优化，通常显著提升单期蓝球覆盖数，"
-                 "并在相同注数下让“≥五等奖命中期数”体感不低于 single 模式；"
-                 "双色球独立随机，此为结构覆盖的量化对比，非中奖保证。"),
-    }
-
-
 @app.post("/api/eval/online")
 def eval_online():
     from . import evaluate, notify
@@ -747,14 +687,6 @@ def eval_online():
         result["adaptive"] = None
     result["notification"] = notify.notify_after_check(result)
     return result
-
-
-@app.get("/api/notify/status")
-def notify_status():
-    from . import notify
-    return notify.status()
-
-
 @app.get("/api/eval/cumulative")
 def eval_cumulative(method: Optional[str] = Query(None), limit: int = Query(120, ge=1, le=1000)):
     """M4.1：按预测方法返回逐注事实与累计统计；U3 附加方法自适应降权状态。"""
@@ -776,13 +708,6 @@ def eval_by_method(limit_issues: int = Query(200, ge=1, le=5000)):
     """
     from . import evaluate
     return evaluate.method_breakdown(limit_issues=limit_issues)
-
-
-@app.get("/api/eval/meta")
-def eval_meta(issue: Optional[str] = Query(None)):
-    return {"items": db.load_eval_meta(issue)}
-
-
 @app.get("/api/eval/recommendations")
 def eval_recommendations(limit: Optional[int] = Query(None, ge=1, le=1000),
                         min_sample: Optional[int] = Query(None, ge=1, le=1000)):
@@ -915,15 +840,6 @@ def run_mining(min_start: int = Query(300, ge=120, le=1000),
     except Exception as e:
         db.fail_task(task_id, str(e))
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
-
-
-@app.get("/api/mining/latest")
-def get_latest_mining():
-    return M.get_latest_mining_result() or {"status": "none"}
-
-
-# ---------- 回放诊断（M3.5） ----------
-
 @app.post("/api/replay/diagnose")
 def replay_diagnose(n: int = Query(20, ge=3, le=60), use_ml: bool = Query(True)):
     """最近 N 期「系统预测 vs 实际开奖」反事实回放（纯统计+ML，固定种子可复现）。"""
@@ -2874,36 +2790,6 @@ def llm_lab_latest(limit: int = Query(40, ge=1, le=200)):
             "claims": claims, "verdict_counts": counts,
             "verdict_legend": llm_lab.VERDICTS,
             "n_stored": len(data.get("claims") or [])}
-
-
-@app.post("/api/llm_lab/run")
-def llm_lab_run(rounds: int = Query(3, ge=1, le=3),
-                use_llm: int = Query(1, ge=0, le=1),
-                persist: int = Query(1, ge=0, le=1)):
-    """跑一次规律工坊：维度扫描 → 多轮 LLM 提规律/自我质疑/修订 → 逐条落地验证 → 落盘。
-
-    耗时：LLM 三轮各 1~3 分钟（推理型模型更久），维度扫描约 5~10 秒。
-    ``use_llm=0`` 时只跑维度扫描与阶段画像（用于无 LLM 环境自检）。
-    """
-    try:
-        from . import discovery, llm_lab
-    except ImportError as e:
-        return JSONResponse({"ok": False, "available": False,
-                             "error": "LLM 规律工坊模块尚未就绪", "detail": str(e)},
-                            status_code=503)
-    draws = db.load_draws()
-    if not draws:
-        return JSONResponse({"ok": False, "error": "本地暂无开奖数据"}, status_code=400)
-    try:
-        res = llm_lab.run_lab(draws, rounds=int(rounds), use_llm=bool(use_llm),
-                              persist=bool(persist))
-    except Exception as e:  # noqa: BLE001
-        return JSONResponse({"ok": False, "error": "工坊执行失败",
-                             "detail": f"{type(e).__name__}: {e}"}, status_code=503)
-    res.setdefault("ok", True)
-    return res
-
-
 @app.post("/api/llm_lab/register")
 def llm_lab_register():
     """把工坊里 verified 的规律注册进假说库（unmappable/noise 不入库）。"""
@@ -3061,34 +2947,6 @@ def rules_refresh():
         return JSONResponse({"ok": False, "error": "刷新失败",
                              "detail": f"{type(e).__name__}: {e}"}, status_code=503)
     return {"ok": True, **r}
-
-
-@app.post("/api/rules/closed-loop")
-def rules_closed_loop(rounds: int = Query(3, ge=1, le=3),
-                      use_llm: int = Query(1, ge=0, le=1)):
-    """**AI 规律闭环**：挖掘 → 验证 → 注册 → 刷新规律快照（供出号使用）。
-
-    这是用户诉求「用 AI 挖掘规律、验证规律、使用规律」的一键入口：
-    LLM 三轮提规律并自我质疑 → 逐条 as-of 回放 + 阶段画像 → 注册假说库 →
-    重建规律快照 → 下一期预测自动消费（LOTT_RULE_APPLY=1 时真正影响号码，
-    默认影子模式只记录影响）。耗时 1~8 分钟（含 LLM）。
-    """
-    try:
-        from . import llm_lab
-    except ImportError as e:
-        return JSONResponse({"ok": False, "error": "LLM 规律工坊模块尚未就绪",
-                             "detail": str(e)}, status_code=503)
-    draws = db.load_draws()
-    if not draws:
-        return JSONResponse({"ok": False, "error": "本地暂无开奖数据"}, status_code=400)
-    try:
-        res = llm_lab.run_closed_loop(draws, rounds=int(rounds), use_llm=bool(use_llm))
-    except Exception as e:  # noqa: BLE001
-        return JSONResponse({"ok": False, "error": "闭环执行失败",
-                             "detail": f"{type(e).__name__}: {e}"}, status_code=503)
-    return res
-
-
 def _bg_run(kind: str, fn, on_done=None) -> str:
     """把长耗时操作放进后台线程并登记成 db 任务，供前端轮询进度。
 
