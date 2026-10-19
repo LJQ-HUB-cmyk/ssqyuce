@@ -1498,6 +1498,15 @@ def portfolio_distribution(issues: int = Query(1, ge=1, le=20),
     })
 
 
+def _registry_health_for_status() -> Dict:
+    """注册簿健康度（不抛异常，失败时返回 ok=False）。"""
+    try:
+        from . import prereg_scheduler
+        return prereg_scheduler.registry_health()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
 @app.get("/api/registry/status")
 def registry_status(include_scan: bool = Query(False)):
     """V10-10「📋 前置注册」卡：已登记实验的计数 + 每条规则的 prereg 理由 + 累计检验数。
@@ -1590,6 +1599,10 @@ def registry_status(include_scan: bool = Query(False)):
         "last_issue": counters.get("last_issue"),
         "min_batch_size": getattr(hypothesis, "MIN_BATCH_SIZE", None),
         "max_batch_size": getattr(hypothesis, "MAX_BATCH_SIZE", None),
+        # MU-0：健康度。**这是"验证环节有没有在真的工作"的唯一可观测指标**。
+        #   never_registered=True 表示注册簿里没有任何在途实验 —— 若出现，
+        #   说明「前置注册·写入」的调度接线被误删（曾导致 usable 恒 0 数月无人察觉）。
+        "health": _registry_health_for_status(),
         "items": items,
         "snapshot": {
             "available": bool(snapshot),
@@ -2320,6 +2333,28 @@ def _scheduler_step():
         _evolution_step()
     except Exception as e:  # noqa: BLE001
         print("[scheduler] 进化失败（不影响预测）:", e)
+
+    # ── MU-0 / W06：前置注册的**写入侧**（这是全系统最上游的一处断链）──
+    #
+    # 背景（V13 + MU 评审实测）：`hypothesis.register_prereg()` 此前在非测试代码里
+    # **调用点为 0**，于是：
+    #   register_prereg 没人调用 → 假说没有 prereg_status
+    #   → evaluate_prereg 只处理 prereg_status ∈ {registered,running,provisional}
+    #   → prereg_ok 永远不可能为 True → usable_rules() 恒空
+    #   → 界面永远「可用规律 0 条」，且**注入多强的真实效应都是 0**。
+    #
+    # **顺序必须在 evaluate_prereg 之前**：本期扫描出的候选应当在同一轮调度里
+    # 就进入注册簿（虽然它要等 150 期冻结期后才判定），否则每期都"晚一期"。
+    # 失败只降级、绝不中断调度（与既有约定一致）。
+    try:
+        from . import prereg_scheduler
+        _scan = prereg_scheduler.register_scan_candidates(
+            db.load_draws(), issue=str(draws[-1]["issue"]) if draws else "")
+        print("[scheduler] 前置注册·写入:", {
+            k: _scan.get(k) for k in
+            ("ok", "scanned", "registered", "deduped", "judgeable", "error")})
+    except Exception as e:  # noqa: BLE001
+        print("[scheduler] 前置注册·写入失败（不影响预测）:", e)
 
     # V10-02：前置注册判定（**唯一写者**的调用点，见 docs/V10_IMPROVEMENT_PLAN.md §3.3.5b）
     # 必须在快照刷新**之前**跑，否则本期已到期的实验要等下一期才生效（时序错误）。
