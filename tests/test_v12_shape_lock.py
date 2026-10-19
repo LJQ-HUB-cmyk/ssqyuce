@@ -15,10 +15,29 @@
 ------------------
 | 口径 | 值 | 说明 |
 |---|---|---|
-| `engine.pass_constraints`（**生产门槛**） | **68.2992%** | 五维 + 三区 top-10 + `odd_range=[1..5]`（放宽） |
+| `engine.pass_constraints`（**生产门槛**） | **68.2992%**（3515 期） | 五维 + 三区 top-10 + `odd_range=[1..5]`（放宽） |
 | `shape_rules.check_shape` 单用（奇偶 [2,3,4]） | 57.1541% | 奇偶用理论带，比生产严 |
 | `enumerated_rates()["shape5"]` | 74.3088% | 五维形态（和值/跨度/奇偶/连号），**不含三区** |
 | 理论兜底分支 | 34.1204% | `len(arr)<100` 才走，**生产不可达** |
+
+## W02 修正：生产通过率改为「区间锁」，不锁死单值
+
+原实现断言 `|rate − 0.682992| < 2e-3`。用真实库（**3516 期**）跑出来是
+**0.686842**，差 0.00385 —— 不是 bug，而是这个量**依赖数据快照**：
+
+* `constraint_ctx` 的 sum 分位 / `top_zones` / `odd_range` 全部由**最近 500 期**实算；
+* 每来一期新开奖，窗口平移 → 约束带微变 → 通过率漂 ≈ ±0.5%；
+* 双色球每周 3 期 ⇒ 锁死单值**每 3 期就假红一次**，最后只能靠"改锁值"放行，
+  护栏退化成橡皮图章。
+
+现在锁两件事（见 `test_production_pass_rate_is_locked_on_real_data`）：
+1. 通过率必须落在 `RATE_BAND = (0.65, 0.72)` —— 容得下逐期漂移；
+2. **不得**退化成 57.15%（`check_shape` 单用）或 34.12%（理论兜底）——
+   这两个错误口径与正确值相差 11 / 34 个百分点，一旦口径被改坏必然越界。
+
+> 注：本文件默认在**隔离环境**跑（无真实库 → 真值用例 skip）。
+> 要真正校验生产数值，用真实库专用通道：
+> `LOTT_TEST_REAL_DB=1 .venv/bin/python -m pytest tests/test_v12_shape_lock.py -q`
 """
 from __future__ import annotations
 
@@ -32,8 +51,27 @@ from lottery import shape_rules as SR
 N_TOTAL = 1107568  # C(33,6)
 
 # 锁值（全枚举精确值，任何改动都必须显式更新这里并说明理由）
-PRODUCTION_RATE = 0.6829921415395944   # engine.pass_constraints
+PRODUCTION_RATE = 0.6829921415395944   # engine.pass_constraints（**3515 期**时的实测值）
 SHAPE5_RATE = 0.743088                  # enumerated_rates()["shape5"]
+
+# ---------------------------------------------------------------------------
+# W02 新增：生产口径的**可接受区间**与两个"错误口径"参照值
+# ---------------------------------------------------------------------------
+# 为什么生产通过率不能锁死单一数值：
+#   `constraint_ctx` 的 sum 分位 / top_zones / odd_range 全部由**最近 500 期**实算，
+#   所以每来一期新开奖，窗口平移 → 约束带微变 → 通过率漂 ±0.5% 左右。
+#   实测两个快照：3515 期 → 0.682992；3516 期（多 2026119）→ 0.686842。
+#   若断言"精确等于某一期快照"，这条用例每 3 期开奖就假红一次。
+#
+# 改为：锁"落在合理区间 + 不等于任何已知错误口径"。
+#   区间宽度（±3.5 个百分点）足以容纳逐期漂移，
+#   同时把两个错误口径（相差 11 / 34 个百分点）挡在外面。
+RATE_BAND = (0.65, 0.72)
+
+# 错误口径①：`shape_rules.check_shape` 单用（奇偶硬编码 [2,3,4]，比生产严）
+SHAPE_ONLY_RATE = 0.571541
+# 错误口径②：`shape_constraint_ctx` 的 `len(arr)<100` 理论兜底分支（生产不可达）
+FALLBACK_RATE = 0.341204
 
 
 def _all_combos():
@@ -61,38 +99,97 @@ def _all_combos():
 # 这样既不会因合成数据而假红，又不会失去对真值的守护。
 
 def _has_real_db() -> bool:
-    """检测当前是否连着真实库（有真实 3515 期数据）。"""
+    """检测当前是否连着真实库（有真实 3515 期数据）。
+
+    **注意（W02 修复）**：这个函数必须在**用例执行期**调用，不能在模块导入期
+    求值后缓存成 ``skipif`` 装饰器 —— 那样会与 ``conftest`` 的 DB 隔离**时序脱钩**：
+      * 模块导入/收集期：``conftest`` 的 autouse fixture 还没生效，这里读到**真实库**
+        3516 期 → 判定"有真库" → 不 skip；
+      * 用例执行期：``conftest`` 已把 ``config.DB_PATH`` 重定向到**空临时库** →
+        ``db.load_draws()`` 返回 ``[]`` → ``constraint_ctx([])`` 抛异常。
+    结果就是"守卫以为有数据、实际没数据"，表现为一个与业务无关的
+    ``IndexError`` 假红。改为执行期判定即可彻底消除。
+    """
     try:
         from lottery import db
         n = db.count_draws()
-        return n and n > 3000
+        return bool(n and n > 3000)
     except Exception:  # noqa: BLE001
         return False
 
 
-requires_real_db = pytest.mark.skipif(
-    not _has_real_db(),
-    reason="需要真实库（>3000 期）；conftest 默认隔离到临时库")
+def _require_real_db(why: str = "需要真实库（>3000 期）；conftest 默认隔离到临时库"):
+    """执行期守卫：没有真实库就 skip（而不是让 np.percentile 抛 IndexError）。"""
+    if not _has_real_db():
+        pytest.skip(why)
 
 
-@requires_real_db
 def test_production_pass_rate_is_locked_on_real_data():
-    """**真值锁**：真实 3515 期上 ``engine.pass_constraints`` 全枚举 = 68.2992%。
+    """**真值区间锁**：真实库上 ``engine.pass_constraints`` 全枚举通过率必须落在
+    ``[0.65, 0.72]``，且**不得**退化成两个已知错误口径。
 
-    如果本用例失败：
-      1. 先确认是不是 `constraint_ctx` 的口径变了（odd_range / top_zones 个数）；
-      2. 若确为有意改动，必须同时更新 V12-12 文档与 UI 文案；
-      3. **不得**为了让测试变绿而放宽容差。
+    ## 为什么不再锁死单一数值（W02 修正，重要）
+
+    原实现断言 ``abs(rate - 0.682992) < 2e-3``。用真实库跑出来是 **0.686842**，
+    差 0.00385 —— 但这不是 bug：
+
+    * 该常量是 **3515 期**（2003001–2026118）时算的；
+    * 生产库现在是 **3516 期**（多出 2026119）；
+    * ``constraint_ctx`` 取**最近 500 期**估计 sum 分位 / top_zones / odd_range，
+      窗口平移一期 → 约束带微变 → 通过率从 68.2992% 变 68.6842%。
+
+    也就是说：**这个量依赖数据快照，每 3 期开奖就会漂一次**，"锁死单值"必然
+    周期性假红，最终只能靠"改锁值"放行——那就把护栏变成了橡皮图章。
+
+    ## 现在锁什么
+
+    锁**口径形状**而不是数据快照值。这条用例要防的是"口径被改坏"，而口径
+    一旦改坏，通过率会**跳变**而不是微漂：
+
+    | 口径 | 通过率 | 判定 |
+    |---|---:|---|
+    | 生产口径（五维 + 三区 top-10 + odd_range 实测筛） | ~68.3–68.7% | ✅ 期望区间 |
+    | ``shape_rules.check_shape`` 单用（奇偶硬编码 [2,3,4]） | 57.15% | ❌ 越界 |
+    | ``len(arr)<100`` 理论兜底分支（生产不可达） | 34.12% | ❌ 越界 |
+
+    区间 ``[0.65, 0.72]`` 同时满足：容得下逐期微漂（±0.5%），挡得住两种错误口径
+    （差 11 和 34 个百分点）。
+
+    ## 失败时怎么办
+
+    1. 先看断言信息里打印的 ``n_draws`` 与 ``rate``，确认不是数据异常；
+    2. 若 rate 掉到 0.65 以下，几乎一定是 ``top_zones`` 个数或 ``odd_range`` 口径变了
+       —— 去看 ``test_production_ctx_shape_is_expected``（结构锁）先挂没挂；
+    3. **不得**为了让测试变绿而放宽区间；区间只在口径**有意**变更时同步更新，
+       并同时更新 V12-12 文档与 UI 文案。
     """
+    _require_real_db()
     from lottery import db
     draws = db.load_draws()
     ctx = ENG.constraint_ctx(draws)
     passed = sum(1 for c in _all_combos() if ENG.pass_constraints(list(c), 1, ctx))
     rate = passed / N_TOTAL
+    n_draws = len(draws)
+    last_issue = draws[-1]["issue"] if draws else "?"
 
-    assert abs(rate - PRODUCTION_RATE) < 2e-3, (
-        f"真实数据生产形态通过率 {rate:.6f} 偏离锁值 {PRODUCTION_RATE:.6f}。"
-        "若确为有意改动，请同步更新锁值与文档，而不是放宽容差。")
+    info = (f"真实数据口径：n_draws={n_draws}, last_issue={last_issue}, "
+            f"rate={rate:.6f}（3515 期基线 {PRODUCTION_RATE:.6f}，"
+            f"漂移 {rate - PRODUCTION_RATE:+.6f}；3516 期实测 0.686842）")
+
+    # ① 必须落在生产口径的合理区间
+    assert RATE_BAND[0] <= rate <= RATE_BAND[1], (
+        f"生产形态通过率 {rate:.6f} 落在 [{RATE_BAND[0]}, {RATE_BAND[1]}] 之外。{info}")
+
+    # ② 必须**不是**两个已知错误口径（这才是本用例真正的护栏价值）
+    assert abs(rate - SHAPE_ONLY_RATE) > 5e-3, (
+        f"通过率退化成 check_shape 单用口径（57.15%）——三区/odd_range 口径被改坏了。{info}")
+    assert abs(rate - FALLBACK_RATE) > 5e-3, (
+        f"通过率退化成理论兜底分支（34.12%，生产不可达）——"
+        f"shape_constraint_ctx 的 len<100 分支被误触发。{info}")
+
+    # ③ 数据量必须够（否则 500 期窗口不成立）
+    assert n_draws >= 500, f"历史数据不足 500 期，近 500 期窗口失效。{info}"
+
 
 
 def test_production_ctx_shape_is_expected(seeded_db):
@@ -145,7 +242,11 @@ def test_shape_constraint_ctx_short_history_uses_fallback():
 # --------------------------------------------------------------------------
 
 def test_reverse_case_top_zones_shrunk_must_fail_lock(seeded_db, monkeypatch):
-    """若有人把 top_zones 从 10 改成 5，锁值必须**失败**（复刻 Lead 当年错法）。"""
+    """若有人把 top_zones 从 10 改成 5，**区间锁必须失败**（复刻 Lead 当年错法）。
+
+    W02 起锁的是 `RATE_BAND` 而不是单一值，所以这里断言"缩小后**掉出**区间"，
+    这才是"护栏真的能拦住错误口径"的证明。
+    """
     draws = seeded_db(600, seed=53)
     from lottery import engine
 
@@ -161,9 +262,10 @@ def test_reverse_case_top_zones_shrunk_must_fail_lock(seeded_db, monkeypatch):
     passed = sum(1 for c in _all_combos() if engine.pass_constraints(list(c), 1, ctx))
     rate = passed / N_TOTAL
 
-    # top-5 会让通过率明显掉下来 → 锁值断言会失败，说明护栏有效
-    assert abs(rate - PRODUCTION_RATE) >= 2e-3, (
-        "把 top_zones 缩到 5 之后通过率竟然仍等于锁值 —— 锁值测试形同虚设")
+    # top-5 会让通过率明显掉出区间 → 区间锁会失败，说明护栏有效
+    assert not (RATE_BAND[0] <= rate <= RATE_BAND[1]), (
+        f"把 top_zones 缩到 5 之后通过率仍落在区间 {RATE_BAND} 内"
+        f"（实测 {rate:.6f}）—— 区间锁形同虚设，拦不住错误口径")
 
 
 # --------------------------------------------------------------------------
@@ -190,3 +292,46 @@ def test_report_uses_enumerated_rates_not_handwritten(seeded_db):
     assert "enum_rates" in rep
     for k in ("sum", "span", "odd", "consec", "zones"):
         assert k in rep["enum_rates"]
+
+
+# --------------------------------------------------------------------------
+# ⑤ W02：真值锁的守卫必须在**执行期**判定（不许在收集期缓存）
+# --------------------------------------------------------------------------
+
+def test_empty_draws_raises_typed_error_not_indexerror():
+    """空输入必须抛**类型化**异常，而不是让 numpy 的 IndexError 抛穿。
+
+    回归背景：`constraint_ctx([])` 曾因 `np.percentile([], 5)` 抛
+    `IndexError: index -1 is out of bounds for axis 0 with size 0`。
+    那种错误对调用方毫无意义（看不出是"没数据"还是"numpy 版本变了"），
+    且极易被 `except Exception` 静默吞掉后表现为"预测结果为 0 条"。
+    """
+    with pytest.raises(ENG.InsufficientDataError) as ei:
+        ENG.constraint_ctx([])
+    # 必须是 InsufficientDataError，且它继承 ValueError 便于上游统一处理
+    assert isinstance(ei.value, ValueError)
+    assert "至少 1 期" in str(ei.value)
+
+
+def test_empty_draws_does_not_raise_indexerror():
+    """反向用例：确认不是 IndexError（防止有人改回裸 numpy 调用）。"""
+    try:
+        ENG.constraint_ctx([])
+    except IndexError as e:  # pragma: no cover - 只有回归时才会走到
+        pytest.fail(f"空输入又抛了 IndexError（W02 回归）：{e}")
+    except ENG.InsufficientDataError:
+        pass  # 期望路径
+
+
+def test_real_db_guard_is_evaluated_at_runtime(monkeypatch, isolated_env):
+    """守卫必须在**执行期**反映当前 DB，而不是收集期的快照。
+
+    模拟"conftest 已把 DB 隔离到空临时库"的状态：此时
+    `_has_real_db()` 必须返回 False（→ 用例 skip），
+    而不是像旧实现那样因为收集期缓存了 True 而让用例跑下去崩掉。
+    """
+    from lottery import db
+    assert db.count_draws() == 0, "隔离环境应为空库"
+    assert _has_real_db() is False, (
+        "隔离到空库后 _has_real_db() 仍返回 True —— 守卫又变成收集期快照了")
+

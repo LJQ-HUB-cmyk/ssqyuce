@@ -8,7 +8,14 @@ services:
     mem_limit: 768m
     memswap_limit: 1024m
     ports:
-      - "18000:18000"
+      # W01（多用户 P0）：**只绑回环地址**，公网必须经 nginx(443) 反代。
+      #
+      # 原先是 `"18000:18000"` = 0.0.0.0:18000，实测 `ss -tlnp` 确认明文直连公网可达，
+      # 且 `/docs` `/openapi.json` 不在 `/api/` 前缀下、天然绕过鉴权中间件
+      #（U1 实测 `http://<ip>:18000/docs` → 200）。这意味着**任何加在应用层的鉴权
+      # 都能被这个旁路绕开**。多用户上线前必须堵死。
+      # nginx upstream 就是 `127.0.0.1:18000`（/etc/nginx/sites-enabled/ssq），故安全。
+      - "127.0.0.1:18000:18000"
     volumes:
       - ./data:/app/data
     # 全部密钥/URL 只从同目录 .env 注入（compose 自动读取 .env 做变量替换；
@@ -19,6 +26,11 @@ services:
       - LOTT_SCHEDULER=${LOTT_SCHEDULER:-1}
       - LOTT_BOOT_PREDICT=${LOTT_BOOT_PREDICT:-1}
       - LOTT_TOKEN=${LOTT_TOKEN:-}
+      # W01：文档端点默认关（/docs /redoc /openapi.json 不在 /api/ 前缀、绕过鉴权）。
+      # 本地调试可临时设 LOTT_API_DOCS=1。
+      - LOTT_API_DOCS=${LOTT_API_DOCS:-0}
+      # W01：CORS 显式白名单（原 allow_origins=["*"]）。留空则用代码内默认白名单。
+      - LOTT_CORS_ORIGINS=${LOTT_CORS_ORIGINS:-}
       - LOTT_LLM_BASE_URL=${LOTT_LLM_BASE_URL:-}
       - LOTT_LLM_API_KEY=${LOTT_LLM_API_KEY:-}
       - LOTT_LLM_MODEL=${LOTT_LLM_MODEL:-minimax-m3}

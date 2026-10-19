@@ -18,6 +18,25 @@ DATA_URL = "http://e.17500.cn/getData/ssq.TXT"
 STARTED_AT = time.time()
 # M4.5：配置后启用所有 /api/* 的 Bearer Token 校验；空值保持兼容开放。
 API_TOKEN = (os.environ.get("LOTT_TOKEN") or "").strip() or None
+
+# ---------- W01（多用户改造 P0 部署前置）----------
+# 文档端点（/docs、/redoc、/openapi.json）默认**关闭**。
+# 为什么必须默认关：这三条路径**不在 `/api/` 前缀下**，天然绕过 `optional_api_auth`
+# 中间件 —— 也就是说"给 /api/* 加鉴权"完全保护不到它们。生产实测
+# `http://<ip>:18000/docs` 返回 200，等于把全部路由结构、参数 schema 对外公开。
+# 本地开发需要时显式 `LOTT_API_DOCS=1` 打开。
+API_DOCS_ENABLED = (os.environ.get("LOTT_API_DOCS") or "0").strip() == "1"
+
+# CORS 允许来源（逗号分隔）。默认只允许本站与本地开发端口。
+# 为什么收紧要保留：前端 `web/static/app.js` 用的是**相对路径** fetch，属同源请求，
+# 本不需要 CORS 头；`allow_origins=["*"]` 只会让任意第三方页面拿到跨域读取能力。
+# 需要跨域接入时用 `LOTT_CORS_ORIGINS` 显式追加，不再回落到 `*`。
+_DEFAULT_CORS_ORIGINS = "https://ssq.ff88.de,http://127.0.0.1:18000,http://localhost:18000"
+CORS_ORIGINS = [
+    o.strip() for o in
+    (os.environ.get("LOTT_CORS_ORIGINS") or _DEFAULT_CORS_ORIGINS).split(",")
+    if o.strip()
+]
 # M4.4：可选备用源，需返回与 ssq.TXT 相同的 31 字段格式；空值则只运行主源。
 BACKUP_DATA_URL = (os.environ.get("LOTT_BACKUP_DATA_URL") or "").strip() or None
 

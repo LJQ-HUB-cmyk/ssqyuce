@@ -117,9 +117,22 @@ def isolated_env(tmp_path):
 
 
 @pytest.fixture(autouse=True)
-def _auto_isolate_lottery_paths(isolated_env):
-    """所有用例自动获得独立临时库/数据目录，不依赖测试文件字母序。"""
-    yield isolated_env
+def _auto_isolate_lottery_paths(request):
+    """所有用例自动获得独立临时库/数据目录，不依赖测试文件字母序。
+
+    **真实库专用通道（W02）**：设 ``LOTT_TEST_REAL_DB=1`` 时**跳过隔离**，
+    让用例直连生产库 ``data/ssq.db``。只给"真值锁"这类必须在真实数据上跑的
+    用例使用（例：``tests/test_v12_shape_lock.py`` 的 68.2992% 通过率）。
+
+    为什么需要这条通道：默认隔离会让 `count_draws()==0`，真值锁用例只能 skip，
+    于是那个常量**永远不会被真正验证**——"有测试"变成"有测试文件"。
+    默认关闭，避免污染常规回归（隔离本身是为修"字母序巧合全绿"才加的）。
+    """
+    if _os.environ.get("LOTT_TEST_REAL_DB") == "1":
+        yield None
+        return
+    request.getfixturevalue("isolated_env")
+    yield None
 
 
 @pytest.fixture

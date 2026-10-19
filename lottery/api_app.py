@@ -25,9 +25,23 @@ from . import config, data_fetcher, db
 from . import migrations
 from . import features as F, diagnose as D, mining as M
 
-app = FastAPI(title="双色球智能预测分析系统", version=config.APP_VERSION)
+app = FastAPI(
+    title="双色球智能预测分析系统",
+    version=config.APP_VERSION,
+    # W01：文档端点默认关闭。`/docs` `/redoc` `/openapi.json` **不在 `/api/` 前缀下**，
+    # 天然绕过 `optional_api_auth`，是当前生产最容易被忽略的暴露面（实测公网 200）。
+    # 本地开发需要时用 `LOTT_API_DOCS=1` 打开。
+    docs_url="/docs" if config.API_DOCS_ENABLED else None,
+    redoc_url="/redoc" if config.API_DOCS_ENABLED else None,
+    openapi_url="/openapi.json" if config.API_DOCS_ENABLED else None,
+)
+# W01：CORS 收敛到显式白名单（原先 `["*"]`）。前端 `app.js` 用相对路径 fetch，
+# 属同源请求、本不依赖 CORS；放开 `*` 只会扩大第三方页面的跨域读取面。
 app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+    CORSMiddleware,
+    allow_origins=list(config.CORS_ORIGINS),
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 

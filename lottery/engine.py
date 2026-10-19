@@ -15,6 +15,20 @@ from .llm_client import LLMChannelError
 R_MAX, B_MAX = 33, 16
 
 
+class InsufficientDataError(ValueError):
+    """历史数据为空 → 无法估计硬约束上下文。
+
+    W02：以前这种情况会让 ``np.percentile([])`` 抛
+    ``IndexError: index -1 is out of bounds for axis 0 with size 0`` ——
+    调用方拿到的是一个**语义不明**的底层错误，既无法判断"是数据没有"还是
+    "是 numpy 版本问题"，也容易在 except Exception 里被静默吞掉。
+    改为抛出**类型化**异常，把"数据不足"这一前置条件显式化。
+
+    触发场景举例：测试环境 conftest 把 DB 重定向到空临时库后，
+    ``db.load_draws()`` 返回 ``[]`` 而调用方未做前置检查。
+    """
+
+
 # ---------- 硬约束 ----------
 
 def _last_sums(draws: List[Dict], n: int = 500) -> np.ndarray:
@@ -22,6 +36,14 @@ def _last_sums(draws: List[Dict], n: int = 500) -> np.ndarray:
 
 
 def constraint_ctx(draws: List[Dict]) -> Dict:
+    # W02 前置条件：**显式**拒绝空输入，不让 IndexError 从 numpy 内部抛穿。
+    # 只拦"完全没有数据"这一种；只要有 ≥1 期就按既有口径估计
+    # （walk-forward / 回放会传入很短的切片，那是合法用法）。
+    if not draws:
+        raise InsufficientDataError(
+            "constraint_ctx 需要至少 1 期开奖数据，当前传入为空列表"
+            "（常见原因：数据库未初始化、或测试被隔离到空临时库）。"
+        )
     s = _last_sums(draws)
     zc = F.zone_counts(draws[-500:] if len(draws) >= 500 else draws)
     zc_hist = {}

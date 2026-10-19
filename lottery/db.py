@@ -164,8 +164,25 @@ def get_conn() -> sqlite3.Connection:
     global _CONN
     if _CONN is None:
         config.DATA_DIR.mkdir(parents=True, exist_ok=True)
-        _CONN = sqlite3.connect(str(config.DB_PATH), check_same_thread=False)
+        # W01（多用户 P0 部署前置）：连接建立时立刻设三个 pragma。
+        #
+        # 1) `busy_timeout=5000` —— sqlite3 默认 busy timeout 由 `timeout=` 参数决定，
+        #    这里用 PRAGMA 显式写死 5s：并发写撞锁时**等待**而不是立刻抛
+        #    `database is locked`。全站 79 个同步端点共享这一条连接（40 worker 池），
+        #    没有它时任何一次长写事务都会让其它请求直接报错。
+        # 2) `journal_mode=WAL` —— 默认 rollback journal 在写事务期间对全库加排他锁，
+        #    读请求会被阻塞；WAL 让读不阻塞写、写不阻塞读，是单进程多线程场景的正确模式。
+        #    注意：WAL 是**持久化**属性（写入库文件头），设一次即长期生效；重复设置无害。
+        #    副作用：会产生 `-wal` / `-shm` 旁文件，备份时必须一起处理（见 DEPLOY 备份说明）。
+        # 3) `synchronous=NORMAL` —— WAL 模式下的推荐值：崩溃安全性与 FULL 等价
+        #    （不会丢已提交事务），但少一次 fsync，显著降低写延迟。
+        #
+        # 三者都必须在 `executescript(SCHEMA)` **之前**设置：迁移与建表本身也要写库。
+        _CONN = sqlite3.connect(str(config.DB_PATH), check_same_thread=False, timeout=5.0)
         _CONN.row_factory = sqlite3.Row
+        _CONN.execute("PRAGMA busy_timeout=5000")
+        _CONN.execute("PRAGMA journal_mode=WAL")
+        _CONN.execute("PRAGMA synchronous=NORMAL")
         _CONN.executescript(SCHEMA)
         from . import migrations
         migrations.apply(_CONN)

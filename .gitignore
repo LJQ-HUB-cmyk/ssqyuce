@@ -5,6 +5,13 @@ data/*.db
 data/*.pre-migrate-*
 data/*.db.tmp
 data/raw/
+
+# W01：SQLite 启用 WAL 后的旁文件（运行时产物，可能含未 checkpoint 的数据，绝不入库）
+data/*.db-wal
+data/*.db-shm
+
+# W01：手工/脚本备份目录（含生产数据副本，绝不入库）
+data/backups/
 __pycache__/
 *.pyc
 .env
