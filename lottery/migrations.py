@@ -219,6 +219,300 @@ def _ensure_identity_tables(conn: sqlite3.Connection) -> None:
     )
 
 
+
+# ---------------------------------------------------------------------------
+# MU-2：数据租户化（迁移 6 / 7 / 8）
+# ---------------------------------------------------------------------------
+#
+# 编号说明（以**实际上号的迁移**为准，不照抄文档编号）
+# --------------------------------------------------
+# `docs/reviews/U3_DATA_MODEL.md` §7.1 给的是「5=users、6=sessions、7=llm_config、
+# 8=租户化」，但 MU-1 落地时把身份**三表合进了 5 号**（users + user_sessions +
+# user_audit_log），于是实际占号变成：5=身份三表、6/7 空号、8=租户化。
+# 迁移号是**全局串行**的，占号必须以代码里真实的 MIGRATIONS 表为准 ——
+# 照抄文档会造成"以为还有 6/7 可用、结果撞号"。
+#
+# 因此本文只用 **6 / 7 / 8** 三个号：
+#   6 = user_llm_config（U2 冻结 DDL）
+#   7 = issue_baseline（U3 §4.6 的 L0 基线轨道；空表，接口先冻结）
+#   8 = 既有表租户化（predictions + eval_* 重建主键 / tasks、llm_* 加列）
+
+# 系统主体哨兵：与 config.SYSTEM_USER_ID 一致，**不插入 users 表**。
+# 语义 = "系统/历史"，不是任何具体的人。
+_SYSTEM_USER_ID = 0
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> List[str]:
+    try:
+        return [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+    except sqlite3.OperationalError:
+        return []
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+    return row is not None
+
+
+def _pk_columns(conn: sqlite3.Connection, table: str) -> List[str]:
+    """按主键顺序返回列名（`PRAGMA table_info` 的 pk 字段是 1-based 序号）。"""
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    pk = [(r[5], r[1]) for r in rows if r[5]]
+    return [name for _, name in sorted(pk)]
+
+
+def _require_admin_id(conn: sqlite3.Connection) -> int:
+    """**动态**解析主管理员 id（Lead 裁决 1：绝不假设 admin == user_id 1）。
+
+    为什么不能写死 1：SQLite `AUTOINCREMENT` **不复用 ID**。实测「清空 users
+    再重新插入」拿到的是 2。若历史 40 行被回填到字面量 1，而 1 已不存在（或更糟：
+    被一个普通用户占用），表现为"数据凭空消失"或"越权可见"。
+
+    解析顺序：`is_primary_admin=1` → `role='admin' AND status='active'`。
+    两者都解析不到时**不臆造**，返回 SYSTEM_USER_ID 并告警——这样历史数据仍在
+    （归属"系统/历史"），而不是挂到一个错误的人头上。
+    """
+    row = conn.execute(
+        "SELECT user_id FROM users WHERE is_primary_admin=1 AND deleted_at IS NULL"
+        " ORDER BY user_id LIMIT 1").fetchone()
+    if row:
+        return int(row[0])
+    row = conn.execute(
+        "SELECT user_id FROM users WHERE role='admin' AND status='active'"
+        " AND deleted_at IS NULL ORDER BY user_id LIMIT 1").fetchone()
+    if row:
+        return int(row[0])
+    _log("未解析到可用管理员，历史行归 SYSTEM_USER_ID=0（不臆造归属）")
+    return _SYSTEM_USER_ID
+
+
+def _rebuild_table(conn: sqlite3.Connection, table: str, ddl: str,
+                   columns: Sequence[str], *, default_user_id: int,
+                   has_user_col: bool) -> None:
+    """SQLite 通用重建：建新表 → 拷数据 → 删旧表 → 改名 → 重建索引。
+
+    SQLite **不支持** `ALTER TABLE ... MODIFY PRIMARY KEY`，改主键只能重建
+    （U3 §3.3）。整个过程在迁移批次的**同一个事务**里，失败即整批回滚。
+
+    为什么不用 `executescript`：Python ``sqlite3.executescript`` 会**先提交挂起事务**，
+    在迁移事务里用它 = 把"全有或全无"打散成"跑到一半"（U3 §3.3 坑 6）。
+    """
+    if not _table_exists(conn, table):
+        # 全新库：SCHEMA 已建目标结构，这里只需兜底建表（IF NOT EXISTS）
+        conn.execute(ddl)
+        return
+    cols = _table_columns(conn, table)
+    if has_user_col and "user_id" in _pk_columns(conn, table):
+        return                              # 已租户化（幂等）
+    before = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+    conn.execute(f"DROP TABLE IF EXISTS {table}__new")
+    conn.execute(ddl.replace(f"CREATE TABLE IF NOT EXISTS {table}",
+                             f"CREATE TABLE {table}__new", 1))
+    select_cols = ", ".join(columns)
+    if has_user_col:
+        # 用**参数**写回填值，不拼字面量（避免任何"user_id = 1"式的硬编码）。
+        # 注意：SELECT 后面必须是列名，不能是占位符 —— 占位符只能在 VALUES 里用。
+        conn.execute(
+            f"INSERT INTO {table}__new (user_id, {select_cols})"
+            f" SELECT ?, {select_cols} FROM {table}",
+            (int(default_user_id),))
+    else:
+        conn.execute(
+            f"INSERT INTO {table}__new ({select_cols}) SELECT {select_cols} FROM {table}")
+    conn.execute(f"DROP TABLE {table}")
+    conn.execute(f"ALTER TABLE {table}__new RENAME TO {table}")
+
+    after = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+    if after != before:
+        raise RuntimeError(f"迁移重建 {table} 行数不一致：{before} → {after}（整批回滚）")
+    _log(f"{table} 已租户化（{after} 行，user_id 默认 {default_user_id}）")
+
+
+def _ensure_user_llm_config(conn: sqlite3.Connection) -> None:
+    """迁移 6：`user_llm_config`（U2 §3.4 冻结 DDL，按 Lead 裁决去掉物理外键）。
+
+    为什么去掉 `REFERENCES users(user_id) ON DELETE CASCADE`：
+    本库**未启用** `PRAGMA foreign_keys=ON`（`db.py` 从未设置），写了也不生效。
+    "写了不生效"比"不写"更危险——后续看代码的人会以为级联删除受保护。
+
+    为什么 `api_key_encrypted` 而不是明文：密钥必须可逆取回（要发请求），
+    所以不能口令哈希；用 Fernet（AES-128-CBC + HMAC）加密，主密钥来自 env 或
+    `data/.secret_key`（0600）。
+    """
+    conn.execute("""CREATE TABLE IF NOT EXISTS user_llm_config (
+        user_id              INTEGER PRIMARY KEY,
+        use_custom_key       INTEGER NOT NULL DEFAULT 0 CHECK(use_custom_key IN (0,1)),
+        disabled             INTEGER NOT NULL DEFAULT 0 CHECK(disabled IN (0,1)),
+        base_url             TEXT,
+        api_key_encrypted    TEXT,
+        api_key_masked       TEXT,
+        model                TEXT,
+        model_list_json      TEXT NOT NULL DEFAULT '[]',
+        samples              INTEGER NOT NULL DEFAULT 3 CHECK(samples BETWEEN 1 AND 10),
+        extra_body_json      TEXT NOT NULL DEFAULT '{}',
+        daily_token_quota    INTEGER NOT NULL DEFAULT 50000,
+        today_tokens_used    INTEGER NOT NULL DEFAULT 0,
+        today_calls_used     INTEGER NOT NULL DEFAULT 0,
+        last_reset_date      TEXT NOT NULL DEFAULT '',
+        qps_limit            INTEGER NOT NULL DEFAULT 2,
+        updated_at           REAL NOT NULL
+    )""")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ulc_updated ON user_llm_config(updated_at)")
+
+
+def _ensure_issue_baseline(conn: sqlite3.Connection) -> None:
+    """迁移 7：`issue_baseline`（U3 §4.6 的 L0 基线轨道）。
+
+    为什么需要独立表：`predictions` 的语义是"**这个人的票**"。把"系统基线"
+    塞进 predictions 会让 `online_check` 把系统基线当成"某个用户的战绩"来评估，
+    正是 U3 §2.4 要避免的串号。基线不投注、不花钱，所以它**不是票**。
+
+    本轮只冻结接口（空表）；写入方（每次开奖后自动计算 L0 基线）属于后续版本。
+    """
+    conn.execute("""CREATE TABLE IF NOT EXISTS issue_baseline (
+        issue          TEXT PRIMARY KEY,
+        config_fp      TEXT NOT NULL DEFAULT '',
+        tickets_json   TEXT NOT NULL DEFAULT '[]',
+        red_hits       REAL,
+        blue_hit       REAL,
+        reward         REAL,
+        ticket_count   INTEGER NOT NULL DEFAULT 0,
+        created_at     REAL
+    )""")
+
+
+# 既有表的列清单（显式列出：重建时**不用** SELECT *，避免列序变化导致错位）
+_PRED_COLS = ["issue", "seq", "reds", "blue", "confidence", "method",
+              "reasoning", "patterns_used", "evidence_json", "created_at"]
+_EVAL_META_COLS = ["issue", "method", "app_version", "app_build", "model_weights_json",
+                   "config_snapshot_json", "llm_enabled", "n_tickets", "task_id",
+                   "status", "created_at"]
+_EVAL_DETAIL_COLS = ["issue", "method", "seq", "red_hits", "blue_hit", "prize_level",
+                     "reward", "ticket_cost", "net_return", "evaluated_at"]
+_EVAL_RESULT_COLS = ["issue", "red_hits", "blue_hit", "reward", "ticket_count", "created_at"]
+
+
+def _tenantize_legacy_tables(conn: sqlite3.Connection) -> None:
+    """迁移 8：既有表租户化（U3 §7.2）。
+
+    ## 幂等必须是"逐子步骤"，不能是"整函数"
+
+    全新库也会执行迁移（`SCHEMA` 已把新结构建好）。如果写成函数开头一句
+    "predictions 已有 user_id 就 return"，那么在全新库上**整段会被跳过**，
+    导致 tasks.user_id / issue_baseline / llm_audit.user_id 永远不建
+    （U3 §7.2 踩坑预告）。所以每个子步骤各自判存在。
+
+    ## 核心规则
+
+    `db.SCHEMA` = 目标态（只对全新库生效）；本迁移 = 从旧态升级到目标态。
+    两者描述同一个终态，必须同步修改。
+
+    ## 回填锚点
+
+    **动态解析** admin（`_require_admin_id`），绝不写死 `user_id=1`（Lead 裁决 1）。
+    """
+    admin_id = _require_admin_id(conn)
+
+    # ---- predictions：主键 (issue,seq) → (user_id,issue,seq) ----
+    _rebuild_table(conn, "predictions", """CREATE TABLE IF NOT EXISTS predictions (
+        user_id       INTEGER NOT NULL DEFAULT 0,
+        issue         TEXT    NOT NULL,
+        seq           INTEGER NOT NULL,
+        reds          TEXT    NOT NULL,
+        blue          INTEGER NOT NULL,
+        confidence    REAL    NOT NULL,
+        method        TEXT    NOT NULL,
+        reasoning     TEXT    DEFAULT '',
+        patterns_used TEXT    DEFAULT '',
+        evidence_json TEXT    DEFAULT '',
+        config_fp     TEXT    DEFAULT '',
+        created_at    REAL,
+        PRIMARY KEY (user_id, issue, seq)
+    )""", _PRED_COLS, default_user_id=admin_id, has_user_col=True)
+
+    # ---- eval_meta：主键 (issue,method) → (user_id,issue,method) ----
+    _rebuild_table(conn, "eval_meta", """CREATE TABLE IF NOT EXISTS eval_meta (
+        user_id             INTEGER NOT NULL DEFAULT 0,
+        issue               TEXT    NOT NULL,
+        method              TEXT    NOT NULL,
+        app_version         TEXT    NOT NULL DEFAULT '',
+        app_build           TEXT    NOT NULL DEFAULT '',
+        model_weights_json  TEXT    DEFAULT '',
+        config_snapshot_json TEXT   DEFAULT '',
+        llm_enabled         INTEGER DEFAULT 0,
+        n_tickets           INTEGER DEFAULT 0,
+        task_id             TEXT    DEFAULT '',
+        status              TEXT    DEFAULT 'predicted',
+        created_at          REAL,
+        PRIMARY KEY (user_id, issue, method)
+    )""", _EVAL_META_COLS, default_user_id=admin_id, has_user_col=True)
+
+    # ---- eval_details：主键 (issue,method,seq) → (user_id,issue,method,seq) ----
+    _rebuild_table(conn, "eval_details", """CREATE TABLE IF NOT EXISTS eval_details (
+        user_id      INTEGER NOT NULL DEFAULT 0,
+        issue        TEXT    NOT NULL,
+        method       TEXT    NOT NULL,
+        seq          INTEGER NOT NULL,
+        red_hits     INTEGER NOT NULL,
+        blue_hit     INTEGER NOT NULL,
+        prize_level  INTEGER NOT NULL DEFAULT 0,
+        reward       REAL    NOT NULL DEFAULT 0,
+        ticket_cost  REAL    NOT NULL DEFAULT 2,
+        net_return   REAL    NOT NULL DEFAULT -2,
+        evaluated_at REAL,
+        PRIMARY KEY (user_id, issue, method, seq)
+    )""", _EVAL_DETAIL_COLS, default_user_id=admin_id, has_user_col=True)
+
+    # ---- eval_results：主键 (issue) → (user_id,issue) ----
+    _rebuild_table(conn, "eval_results", """CREATE TABLE IF NOT EXISTS eval_results (
+        user_id      INTEGER NOT NULL DEFAULT 0,
+        issue        TEXT    NOT NULL,
+        red_hits     REAL,
+        blue_hit     REAL,
+        reward       REAL    DEFAULT 0,
+        ticket_count INTEGER DEFAULT 0,
+        created_at   REAL,
+        PRIMARY KEY (user_id, issue)
+    )""", _EVAL_RESULT_COLS, default_user_id=admin_id, has_user_col=True)
+
+    # ---- tasks：纯加列（SQLite 允许带常量默认值的 ADD COLUMN）----
+    # 保持**可空**：NULL = 系统/后台任务（U3 §6.2）。改成 NOT NULL 只能重建表，
+    # 而"NULL=系统"这个语义本身正好需要可空。
+    #
+    # 注意 `_table_exists` 守卫：迁移可能在**只建了 schema_version 的最小库**上跑
+    # （见 test_m4_5_engineering 的幂等用例）。此时 tasks 压根不存在，直接 ALTER
+    # 会抛 "no such table"，把整批事务打回滚。**不要**在这里顺手 CREATE TABLE ——
+    # 那会让迁移承担 SCHEMA 的职责，两处 DDL 迟早漂移。
+    if _table_exists(conn, "tasks") and "user_id" not in _table_columns(conn, "tasks"):
+        conn.execute("ALTER TABLE tasks ADD COLUMN user_id INTEGER")
+        conn.execute("UPDATE tasks SET user_id=? WHERE user_id IS NULL", (admin_id,))
+        _who = f"admin={admin_id}" if admin_id else "SYSTEM_USER_ID=0（未解析到管理员）"
+        _log(f"tasks 已加 user_id（历史任务归属 {_who}）")
+
+    # ---- llm_audit / llm_eval_results：纯加列（当前 0 行）----
+    for t in ("llm_audit", "llm_eval_results"):
+        if _table_exists(conn, t) and "user_id" not in _table_columns(conn, t):
+            conn.execute(f"ALTER TABLE {t} ADD COLUMN user_id INTEGER")
+
+    # ---- 索引（按读路径反推，U3 §3.5）----
+    # 同样必须逐条判存在：迁移可能在只建了 schema_version 的最小库上跑。
+    _IDX = [
+        ("idx_pred_issue", "predictions", "(issue)"),
+        ("idx_pred_user_issue_ts", "predictions", "(user_id, issue, created_at)"),
+        ("idx_eval_meta_method", "eval_meta", "(method)"),
+        ("idx_eval_meta_user", "eval_meta", "(user_id, issue)"),
+        ("idx_eval_details_method", "eval_details", "(method)"),
+        ("idx_eval_details_user", "eval_details", "(user_id, issue, method)"),
+        ("idx_tasks_user", "tasks", "(user_id, created_at)"),
+    ]
+    for name, table, cols in _IDX:
+        if _table_exists(conn, table):
+            conn.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {table}{cols}")
+
+
 MIGRATIONS: List[Tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "reconcile audit table", _ensure_reconcile_runs),
     (2, "legacy provenance columns", _ensure_legacy_columns),
@@ -229,6 +523,10 @@ MIGRATIONS: List[Tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     # MU-1 / W04（多用户批次第 5 号：身份三表 + bootstrap 主管理员行）
     # 编号占位已冻结：5=users/sessions/audit、6=（保留给 MU-2 的数据租户化）。
     (5, "mu1 identity tables", _ensure_identity_tables),
+    # MU-2：6/7 是 MU-1 合并身份三表后留下的空号，见上方「编号说明」
+    (6, "mu2 user llm config", _ensure_user_llm_config),
+    (7, "mu2 issue baseline", _ensure_issue_baseline),
+    (8, "mu2 tenantize legacy tables", _tenantize_legacy_tables),
 ]
 
 _SCHEMA_VERSION_DDL = """CREATE TABLE IF NOT EXISTS schema_version (

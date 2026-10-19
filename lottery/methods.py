@@ -202,9 +202,11 @@ def _per_method_issue_rows(limit: int = 500) -> Dict[str, List[Dict]]:
     """
     from . import db
     conn = db.get_conn()
+    # MU-2：方法战绩必须按用户隔离，否则会拿别人的票判定"我的方法好不好"
     rows = [dict(r) for r in conn.execute(
         "SELECT issue, method, red_hits, blue_hit, prize_level "
-        "FROM eval_details ORDER BY issue ASC, method, seq").fetchall()[-limit * 200:]]
+        "FROM eval_details WHERE user_id=? ORDER BY issue ASC, method, seq",
+        (db.resolve_tenant(),)).fetchall()[-limit * 200:]]
     out: Dict[str, List[Dict]] = {}
     for r in rows:
         out.setdefault(r["method"], []).append(r)

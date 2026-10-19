@@ -60,7 +60,11 @@ CREATE TABLE IF NOT EXISTS patterns (
   updated_at REAL
 );
 
+-- MU-2：主键 (issue,seq) → (user_id,issue,seq)。
+-- ⚠️ 本 SCHEMA 只对**全新库**生效；老库由 migrations 迁移 8 重建。
+-- 两者必须描述同一个终态（改这里就要改迁移，反之亦然）。
 CREATE TABLE IF NOT EXISTS predictions (
+  user_id INTEGER NOT NULL DEFAULT 0,   -- 0 = SYSTEM_USER_ID（兜底语义）
   issue TEXT NOT NULL,
   seq INTEGER NOT NULL,
   reds TEXT NOT NULL,            -- "1,4,7,12,28,31"
@@ -70,18 +74,26 @@ CREATE TABLE IF NOT EXISTS predictions (
   reasoning TEXT DEFAULT '',
   patterns_used TEXT DEFAULT '',
   evidence_json TEXT DEFAULT '',
+  config_fp TEXT DEFAULT '',     -- 生成时的配置指纹（缓存键，见 U3 §4.7）
   created_at REAL,
-  PRIMARY KEY (issue, seq)
+  PRIMARY KEY (user_id, issue, seq)
 );
 CREATE INDEX IF NOT EXISTS idx_pred_issue ON predictions(issue);
+-- ⚠️ 其余新索引（引用 user_id 的）**不能放在 SCHEMA 里**：
+-- SCHEMA 在 `migrations.apply()` **之前**执行，而老库的 predictions 此时还没有
+-- user_id 列 → `CREATE INDEX ... (user_id, ...)` 直接抛
+-- "no such column: user_id"，整个 get_conn() 失败（生产升级当场起不来）。
+-- 这类索引只能由迁移 8 创建（那里逐条判表存在）。
 
 CREATE TABLE IF NOT EXISTS eval_results (
-  issue TEXT PRIMARY KEY,
-  red_hits INTEGER,
-  blue_hit INTEGER,
+  user_id INTEGER NOT NULL DEFAULT 0,
+  issue TEXT NOT NULL,
+  red_hits REAL,
+  blue_hit REAL,
   reward REAL DEFAULT 0,
   ticket_count INTEGER DEFAULT 0,
-  created_at REAL
+  created_at REAL,
+  PRIMARY KEY (user_id, issue)
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -113,6 +125,7 @@ CREATE INDEX IF NOT EXISTS idx_llm_eval_run ON llm_eval_results(run_id);
 
 -- M4.1：预测方法与配置不可变快照
 CREATE TABLE IF NOT EXISTS eval_meta (
+  user_id INTEGER NOT NULL DEFAULT 0,
   issue TEXT NOT NULL,
   method TEXT NOT NULL,
   app_version TEXT NOT NULL DEFAULT '',
@@ -124,11 +137,12 @@ CREATE TABLE IF NOT EXISTS eval_meta (
   task_id TEXT DEFAULT '',
   status TEXT DEFAULT 'predicted',
   created_at REAL,
-  PRIMARY KEY (issue, method)
+  PRIMARY KEY (user_id, issue, method)
 );
 CREATE INDEX IF NOT EXISTS idx_eval_meta_method ON eval_meta(method);
 
 CREATE TABLE IF NOT EXISTS eval_details (
+  user_id INTEGER NOT NULL DEFAULT 0,
   issue TEXT NOT NULL,
   method TEXT NOT NULL,
   seq INTEGER NOT NULL,
@@ -139,7 +153,7 @@ CREATE TABLE IF NOT EXISTS eval_details (
   ticket_cost REAL NOT NULL DEFAULT 2,
   net_return REAL NOT NULL DEFAULT -2,
   evaluated_at REAL,
-  PRIMARY KEY (issue, method, seq)
+  PRIMARY KEY (user_id, issue, method, seq)
 );
 CREATE INDEX IF NOT EXISTS idx_eval_details_method ON eval_details(method);
 
@@ -365,30 +379,102 @@ def replace_mined_patterns(results: List[Dict]) -> None:
         save_pattern_results(results)
 
 
+# ---------- 租户解析（MU-2）----------
+#
+# 为什么要一个统一的解析函数，而不是在每个读写下写 `user_id or 0`：
+#
+# 1. **串号是静默的**。少写一个 `AND user_id=?`，用户 B 重新生成就会删光用户 A
+#    同期的票（U3 §3.7 缺陷 W1），而且票单只存这一份、**不可恢复**。
+#    把它收进一个函数，才有唯一的地方能测"到底用的是谁"。
+# 2. **后台线程不继承 contextvars**（裸 threading.Thread / ThreadPoolExecutor）。
+#    调度器、boot 预测、异步任务都会丢上下文；必须有确定性兜底，否则要么炸、
+#    要么静默落到错误的人头上。
+# 3. **兜底绝不能是写死的 1**。`AUTOINCREMENT` 不复用 ID（实测清空重建拿到 2），
+#    写死 1 在"删过 admin 再重建"的库上会指向不存在的人或普通用户。
+
+SYSTEM_USER_ID = 0            # 与 config.SYSTEM_USER_ID 一致；不插入 users 表
+
+
+def _single_tenant_admin_id() -> Optional[int]:
+    """单租户/无会话场景下的归属：动态解析主管理员，解析不到返回 None。
+
+    结果**不缓存**：管理员可能被停用/删除/新建，缓存会让"归属"在运行中途漂移。
+    单次查询走 `users` 的小表索引，代价可忽略（相比一次预测计算）。
+    """
+    try:
+        row = get_conn().execute(
+            "SELECT user_id FROM users WHERE is_primary_admin=1 AND deleted_at IS NULL"
+            " ORDER BY user_id LIMIT 1").fetchone()
+        if row:
+            return int(row[0])
+        row = get_conn().execute(
+            "SELECT user_id FROM users WHERE role='admin' AND status='active'"
+            " AND deleted_at IS NULL ORDER BY user_id LIMIT 1").fetchone()
+        if row:
+            return int(row[0])
+    except Exception:      # noqa: BLE001 —— 老库/迁移未跑时不要因为解析归属而炸
+        return None
+    return None
+
+
+def resolve_tenant(user_id: Optional[int] = None) -> int:
+    """解析"这次读写算谁的"。顺序：显式 → 请求上下文 → 主管理员 → SYSTEM。
+
+    显式参数永远优先：后台任务/调度器必须**显式**传入发起人，不能依赖上下文。
+    """
+    if user_id is not None:
+        return int(user_id)
+    try:
+        from . import api_app
+        uid = api_app.current_user_id()
+        if uid:
+            return int(uid)
+    except Exception:      # noqa: BLE001 —— 循环导入/无请求上下文
+        pass
+    admin = _single_tenant_admin_id()
+    if admin:
+        return int(admin)
+    return SYSTEM_USER_ID
+
+
 # ---------- predictions ----------
 
-def save_predictions(issue: str, tickets: List[Dict]):
+def save_predictions(issue: str, tickets: List[Dict], *,
+                     user_id: Optional[int] = None,
+                     config_fp: str = "") -> int:
+    """幂等替换**某个用户**某一期的票单，返回实际写入归属的 user_id。
+
+    ⚠️ U3 §3.7 缺陷 W1（最严重的串号）：旧实现的 ``DELETE FROM predictions
+    WHERE issue=?`` **不带 user_id**。多用户下一旦用户 B 重新生成，就会删光
+    用户 A 同期的票 —— 而票单只存这一份，**不可恢复**。
+    现在 DELETE 与 INSERT 都带 user_id。
+    """
+    uid = resolve_tenant(user_id)
     conn = get_conn()
-    conn.execute("DELETE FROM predictions WHERE issue=?", (issue,))
+    conn.execute("DELETE FROM predictions WHERE user_id=? AND issue=?", (uid, issue))
     now = time.time()
     for i, t in enumerate(tickets, 1):
         conn.execute(
             """INSERT INTO predictions
-               (issue,seq,reds,blue,confidence,method,reasoning,patterns_used,evidence_json,created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+               (user_id,issue,seq,reds,blue,confidence,method,reasoning,
+                patterns_used,evidence_json,config_fp,created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
-                issue, i, ",".join(map(str, t["reds"])), t["blue"], t["confidence"],
+                uid, issue, i, ",".join(map(str, t["reds"])), t["blue"], t["confidence"],
                 t.get("method", "mixed"), t.get("reasoning", ""),
                 json.dumps(t.get("patterns_used", []), ensure_ascii=False),
-                json.dumps(t.get("evidence", {}), ensure_ascii=False), now,
+                json.dumps(t.get("evidence", {}), ensure_ascii=False),
+                str(config_fp or ""), now,
             ),
         )
     conn.commit()
+    return uid
 
 
-def load_predictions(issue: str) -> List[Dict]:
+def load_predictions(issue: str, *, user_id: Optional[int] = None) -> List[Dict]:
+    uid = resolve_tenant(user_id)
     rows = get_conn().execute(
-        "SELECT * FROM predictions WHERE issue=? ORDER BY seq", (issue,)
+        "SELECT * FROM predictions WHERE user_id=? AND issue=? ORDER BY seq", (uid, issue)
     ).fetchall()
     out = []
     for r in rows:
@@ -401,15 +487,17 @@ def load_predictions(issue: str) -> List[Dict]:
     return out
 
 
-def _recent_prediction_issues(limit: int = 12) -> List[str]:
+def _recent_prediction_issues(limit: int = 12,
+                              *, user_id: Optional[int] = None) -> List[str]:
     """按**落库时间**取最近用过的期号（比按期号排序更贴近"哪一期是最新的"）。
 
     历史 bug 遗留的越界期号（如 2026401）在数值上也大于同年合法期号，
     纯按期号排会把它当"最新"，这正是"刷新后又是旧数据"的根因。
     """
     rows = get_conn().execute(
-        "SELECT issue, MAX(created_at) AS ts FROM predictions GROUP BY issue "
-        "ORDER BY ts DESC, CAST(issue AS INTEGER) DESC LIMIT ?", (int(limit),)).fetchall()
+        "SELECT issue, MAX(created_at) AS ts FROM predictions WHERE user_id=?"
+        " GROUP BY issue ORDER BY ts DESC, CAST(issue AS INTEGER) DESC LIMIT ?",
+        (resolve_tenant(user_id), int(limit))).fetchall()
     return [r["issue"] for r in rows]
 
 
@@ -421,23 +509,30 @@ def _valid_issue(s: str) -> bool:
     return 2003 <= int(s[:4]) <= 2100 and 1 <= int(s[4:]) <= 160
 
 
-def load_last_predictions() -> List[Dict]:
+def load_last_predictions(*, user_id: Optional[int] = None) -> List[Dict]:
     """最近一期预测：先按落库时间取候选，再在**合法期号**里取最大者。
 
     全部候选都不合法时（库被历史 bug 污染），退回时间戳最新的那条并如实保留，
     绝不静默返回空列表让前端以为"没有历史预测"。
     """
-    cand = _recent_prediction_issues()
+    uid = resolve_tenant(user_id)
+    cand = _recent_prediction_issues(user_id=uid)
     valid = [i for i in cand if _valid_issue(i)]
     issue = max(valid, key=lambda x: int(x)) if valid else (cand[0] if cand else None)
-    return load_predictions(issue) if issue else []
+    return load_predictions(issue, user_id=uid) if issue else []
 
 
-def recent_prediction_issues(n: int = 20) -> List[str]:
-    """最近 n 个预测期号：合法期号按期号降序，越界期号置尾（不丢弃、不隐藏）。"""
+def recent_prediction_issues(n: int = 20, *,
+                             user_id: Optional[int] = None) -> List[str]:
+    """最近 n 个预测期号：合法期号按期号降序，越界期号置尾（不丢弃、不隐藏）。
+
+    ⚠️ U3 §3.7 缺陷 W3：旧实现不带 user，`online_check()` 会把**所有人**的票
+    混在一起评估 → 战绩串号。
+    """
     rows = get_conn().execute(
-        "SELECT DISTINCT issue FROM predictions ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?",
-        (int(n),)
+        "SELECT DISTINCT issue FROM predictions WHERE user_id=?"
+        " ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?",
+        (resolve_tenant(user_id), int(n))
     ).fetchall()
     got = [r["issue"] for r in rows]
     valid = sorted([i for i in got if _valid_issue(i)], key=lambda x: -int(x))
@@ -448,8 +543,13 @@ def recent_prediction_issues(n: int = 20) -> List[str]:
 # ---------- eval ----------
 
 def save_eval_meta(issue: str, tickets: List[Dict], result: Optional[Dict] = None,
-                   task_id: str = "") -> None:
-    """保存一次预测的方法/版本/配置快照，历史评估不依赖当前配置。"""
+                   task_id: str = "", *, user_id: Optional[int] = None) -> None:
+    """保存一次预测的方法/版本/配置快照，历史评估不依赖当前配置。
+
+    ⚠️ U3 §3.7 缺陷 W4：``INSERT OR REPLACE`` + 主键无 user →
+    不同用户的配置快照会**互相覆盖**。主键已含 user_id，现在各存各的。
+    """
+    uid = resolve_tenant(user_id)
     conn = get_conn()
     now = time.time()
     result = result or {}
@@ -459,10 +559,10 @@ def save_eval_meta(issue: str, tickets: List[Dict], result: Optional[Dict] = Non
     for method, rows in methods.items():
         conn.execute(
             """INSERT OR REPLACE INTO eval_meta
-               (issue,method,app_version,app_build,model_weights_json,config_snapshot_json,
-                llm_enabled,n_tickets,task_id,status,created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-            (issue, method, config.APP_VERSION, config.APP_BUILD,
+               (user_id,issue,method,app_version,app_build,model_weights_json,
+                config_snapshot_json,llm_enabled,n_tickets,task_id,status,created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (uid, issue, method, config.APP_VERSION, config.APP_BUILD,
              json.dumps({"ml": result.get("ml", {}), "llm_models": result.get("llm_models", [])}, ensure_ascii=False),
              json.dumps({
                  "llm_used": bool(result.get("llm_used")),
@@ -500,12 +600,15 @@ def save_eval_meta(issue: str, tickets: List[Dict], result: Optional[Dict] = Non
     conn.commit()
 
 
-def save_eval_details(issue: str, method: str, tickets: List[Dict], draw: Dict) -> Dict:
+def save_eval_details(issue: str, method: str, tickets: List[Dict], draw: Dict,
+                      *, user_id: Optional[int] = None) -> Dict:
     """幂等保存逐注开奖对照明细，并返回方法汇总。"""
     from . import evaluate as EV
+    uid = resolve_tenant(user_id)
     conn = get_conn()
     now = time.time()
-    conn.execute("DELETE FROM eval_details WHERE issue=? AND method=?", (issue, method))
+    conn.execute("DELETE FROM eval_details WHERE user_id=? AND issue=? AND method=?",
+                 (uid, issue, method))
     total_reward = 0.0
     red_hits, blue_hits, levels = [], [], []
     for seq, ticket in enumerate(tickets, 1):
@@ -517,9 +620,10 @@ def save_eval_details(issue: str, method: str, tickets: List[Dict], draw: Dict) 
         red_hits.append(red); blue_hits.append(blue); levels.append(level)
         conn.execute(
             """INSERT INTO eval_details
-               (issue,method,seq,red_hits,blue_hit,prize_level,reward,ticket_cost,net_return,evaluated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
-            (issue, method, seq, red, blue, level, reward, 2.0, reward - 2.0, now),
+               (user_id,issue,method,seq,red_hits,blue_hit,prize_level,reward,
+                ticket_cost,net_return,evaluated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (uid, issue, method, seq, red, blue, level, reward, 2.0, reward - 2.0, now),
         )
     conn.commit()
     cost = len(tickets) * 2.0
@@ -531,11 +635,12 @@ def save_eval_details(issue: str, method: str, tickets: List[Dict], draw: Dict) 
             "roi": (total_reward - cost) / max(1.0, cost)}
 
 
-def load_eval_meta(issue: Optional[str] = None) -> List[Dict]:
-    sql = "SELECT * FROM eval_meta"
-    args: List = []
+def load_eval_meta(issue: Optional[str] = None, *,
+                   user_id: Optional[int] = None) -> List[Dict]:
+    sql = "SELECT * FROM eval_meta WHERE user_id=?"
+    args: List = [resolve_tenant(user_id)]
     if issue:
-        sql += " WHERE issue=?"; args.append(issue)
+        sql += " AND issue=?"; args.append(issue)
     sql += " ORDER BY issue, method"
     return [dict(r) for r in get_conn().execute(sql, args).fetchall()]
 
@@ -661,7 +766,7 @@ def method_recommendations(limit: Optional[int] = None, min_sample: Optional[int
 
 
 def save_eval(issue: str, red_hits: float, blue_hit: float, reward: float,
-              ticket_count: int):
+              ticket_count: int, *, user_id: Optional[int] = None):
     """写入**组合级（portfolio）**逐期对照行。
 
     V10-04b（R1 P1-4）：``red_hits`` / ``blue_hit`` 现在保留浮点均值，
@@ -670,39 +775,46 @@ def save_eval(issue: str, red_hits: float, blue_hit: float, reward: float,
     因此它**不能**用于方法对比；方法战绩一律按族分列汇总
     （``evaluate.method_breakdown()`` / ``eval_details``）。
     """
+    uid = resolve_tenant(user_id)
     conn = get_conn()
     conn.execute(
-        """INSERT OR REPLACE INTO eval_results (issue,red_hits,blue_hit,reward,ticket_count,created_at)
-           VALUES (?,?,?,?,?,?)""",
-        (issue, float(red_hits), float(blue_hit), reward, ticket_count, time.time()),
+        """INSERT OR REPLACE INTO eval_results
+           (user_id,issue,red_hits,blue_hit,reward,ticket_count,created_at)
+           VALUES (?,?,?,?,?,?,?)""",
+        (uid, issue, float(red_hits), float(blue_hit), reward, ticket_count, time.time()),
     )
     conn.commit()
 
 
-def load_eval_details(limit_issues: Optional[int] = None) -> List[Dict]:
+def load_eval_details(limit_issues: Optional[int] = None, *,
+                      user_id: Optional[int] = None) -> List[Dict]:
     """读取逐注方法明细（``eval_details``，主键 ``(issue, method, seq)``）。
 
     ``limit_issues`` 只取最近 N 期（按数值期号倒序再正序返回），
     避免全表扫描拖慢报表。返回按 ``(issue, method, seq)`` 升序。
     """
+    uid = resolve_tenant(user_id)
     conn = get_conn()
     if limit_issues:
         picked = [r["issue"] for r in conn.execute(
-            "SELECT DISTINCT issue FROM eval_details "
-            "ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?", (int(limit_issues),)
+            "SELECT DISTINCT issue FROM eval_details WHERE user_id=? "
+            "ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?", (uid, int(limit_issues))
         ).fetchall()]
         if not picked:
             return []
         marks = ",".join("?" for _ in picked)
-        sql = (f"SELECT * FROM eval_details WHERE issue IN ({marks}) "
+        sql = (f"SELECT * FROM eval_details WHERE user_id=? AND issue IN ({marks}) "
                "ORDER BY issue, method, seq")
-        return [dict(r) for r in conn.execute(sql, picked).fetchall()]
+        return [dict(r) for r in conn.execute(sql, [uid] + picked).fetchall()]
     return [dict(r) for r in conn.execute(
-        "SELECT * FROM eval_details ORDER BY issue, method, seq").fetchall()]
+        "SELECT * FROM eval_details WHERE user_id=? ORDER BY issue, method, seq",
+        (uid,)).fetchall()]
 
 
-def load_eval() -> List[Dict]:
-    rows = get_conn().execute("SELECT * FROM eval_results ORDER BY issue").fetchall()
+def load_eval(*, user_id: Optional[int] = None) -> List[Dict]:
+    rows = get_conn().execute(
+        "SELECT * FROM eval_results WHERE user_id=? ORDER BY issue",
+        (resolve_tenant(user_id),)).fetchall()
     return [dict(r) for r in rows]
 
 

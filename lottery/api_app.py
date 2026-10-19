@@ -336,6 +336,45 @@ def run_backtests():
 
 # ---------- 预测 ----------
 
+def _strict_scope_for_current_user():
+    """严格模式对**当前用户**是否生效。返回 ``(active: bool, bypass_reason: str)``。
+
+    ## 为什么严格模式必须按用户判定（Lead 裁决 2-A）
+
+    `LOTT_STRICT_MODE=1` 是**部署级**开关，但它想表达的是"用户要求必须由 LLM
+    出号"。多用户下这两者不再等价：
+
+    * 管理员的说法是"我要求 LLM，没有 LLM 就别出号"；
+    * 新注册用户**默认没有任何 LLM 配置**（用户已确认："默认不配置 llm key，
+      需要用户自己配置"）。
+
+    若把部署级开关直接套到所有人，结局是：**每一个新用户点"生成预测"都收到 422
+    "严格模式下不出号"，而他能做的只有去配置一个 API Key** —— 这等于用一个
+    全局开关把系统对新用户完全锁死，而"纯统计通道"明明可以照常出号。
+
+    因此作用域收敛为：**只有真正有可用 LLM 通道的用户，严格模式才对他生效**；
+    没有通道的用户**绕过**门控，走纯统计出号，并在响应里如实说明原因
+    （`strict_bypassed` + 提示文案）—— 既不静默降级，也不算"出号成功"。
+    """
+    if not bool(getattr(config, "STRICT_MODE", False)):
+        return False, ""
+    try:
+        from . import user_llm_store
+        uid = current_user_id()
+        eff = user_llm_store.effective_for_user(uid)
+        if eff.get("llm_available"):
+            return True, ""
+        _why = eff.get("reason") or "未配置 LLM"
+        return False, (
+            f"严格模式对当前账号**不生效**：没有可用的 LLM 通道（{_why}）。"
+            f"本次已按纯统计通道出号。若希望强制 LLM 出号，请在设置页配置自己的"
+            f" API Key（或由管理员配置共享通道）后重试。")
+    except Exception as e:      # noqa: BLE001
+        # 判定失败**不**升级成"拒绝出号"：宁可出一份纯统计票，也不要让用户
+        # 因为"读取配置抛了个异常"就拿不到任何结果。
+        return False, f"严格模式作用域判定失败（{type(e).__name__}），已按纯统计通道出号。"
+
+
 def _strict_mode_reject_response(draws, issue):
     """V11 严格模式门控：出号必须由 LLM 分析规律完成。
 
@@ -437,7 +476,7 @@ def predict(use_llm: Optional[bool] = None,
     # V11 严格模式门控（**必须在缓存检查之前**）：无可用规律或 LLM 通道
     # 不可用时拒绝出号；通过校验则强制现算（regenerate=True），不允许
     # 用旧缓存绕过门控。这是 2026-10-18 修复的顺序缺陷。
-    _strict_active = bool(getattr(config, "STRICT_MODE", False))
+    _strict_active, _strict_bypass = _strict_scope_for_current_user()
     if _strict_active:
         _rej = _strict_mode_reject_response(draws, issue)
         if _rej is not None:
@@ -486,12 +525,50 @@ def predict(use_llm: Optional[bool] = None,
     # 出号注数：显式传参数 > 环境配置 > 默认 5（用户要求默认 5 注、可配置）
     _n_req = int(n_tickets) if n_tickets is not None else int(config.N_TICKETS)
 
-    # 严格模式已在前置门控校验并强制 regenerate=True；这里补 use_llm 强制
-    _strict_active = bool(getattr(config, "STRICT_MODE", False))
+    # 严格模式已在前置门控校验并强制 regenerate=True；这里补 use_llm 强制。
+    # 注意 _strict_active 来自 _strict_scope_for_current_user()（按用户判定），
+    # **不能**重新读 config.STRICT_MODE —— 那会把刚绕过门控的用户的 use_llm
+    # 又强制成 True，于是绕过门控却仍然去调 LLM，必然抛 LLMChannelError → 503。
     _strict_notes = []
     if _strict_active:
         use_llm = True                                   # 严格模式强制走 LLM
         _strict_notes.append("严格模式：出号强制依赖 LLM + 规律，本次为现算（未走缓存）")
+    elif _strict_bypass:
+        # 绕过严格模式：**必须**如实告诉用户发生了什么，否则他会以为自己的
+        # "必须 LLM 出号"设置生效了，而实际拿到的是纯统计票。
+        use_llm = False
+        _strict_notes.append(_strict_bypass)
+
+    # MU-2：按用户的共享通道配额（U2 §3.4）。**必须在严格模式决策之后判定**，
+    # 因为两者会冲突，而冲突的答案取决于严格模式是否对该用户生效：
+    #
+    #  * 严格模式生效（用户明确要求"必须 LLM 出号"）+ 额度用尽 →
+    #    返回明确错误。**不能**降级成纯统计：那正是严格模式禁止的静默降级，
+    #    用户会以为拿到的是 LLM 票。这里宁可如实失败。
+    #  * 非严格模式 + 额度用尽 → 降级为纯统计 + 提示（U2 §5.3：绝不阻断出号）。
+    #
+    # 配额只对**系统共享通道**生效：自备 Key 花的是自己的钱，不该被系统卡住。
+    _quota_note = ""
+    try:
+        from . import user_llm_store as _ULS
+        _eff = _ULS.effective_for_user(current_user_id())
+        if _eff.get("source") == "system":
+            _q = _ULS.quota_exceeded(int(current_user_id()))
+            if _q:
+                if _strict_active:
+                    return JSONResponse(
+                        {"ok": False, "strict_mode": True, "llm_required": True,
+                         "quota_exceeded": True,
+                         "error": (f"严格模式下不出号：{_q}"
+                                   "严格模式要求必须由大模型出号，而共享通道额度已用尽；"
+                                   "请配置自己的 API Key，或关闭严格模式（LOTT_STRICT_MODE=0）"
+                                   "以改用纯统计通道。")},
+                        status_code=429)
+                use_llm = False
+                _quota_note = _q
+    except Exception:      # noqa: BLE001 —— 配额判定失败绝不能阻断出号
+        _quota_note = ""
+
     try:
         res = engine.predict_next(draws, use_llm=use_llm, n_tickets=_n_req,
                                   llm_required=(use_llm is True),
@@ -511,6 +588,8 @@ def predict(use_llm: Optional[bool] = None,
     # 让前端能明确解释「为什么勾了使用大模型却没有 LLM 注」
     res["decision_channel_disabled"] = _decision_disabled
     res["strict_mode"] = bool(getattr(config, "STRICT_MODE", False))
+    if _quota_note:
+        _strict_notes.append(_quota_note)
     if _strict_notes:
         res["strict_notes"] = _strict_notes
     if _decision_disabled:
@@ -552,9 +631,14 @@ def last_predictions():
     issue = None
     # 取候选期号时**先按时间**再按数值：越界/异常期号在两张排序下都可能置顶
     # （例：2026401 > 2026119），因此以"时间戳最新的一批"为准，再在合法期号里取最大。
+    # ⚠️ U3 §3.7 缺陷 W2：这条内联 SQL 原先**不带 user_id**。
+    # 后果：用户 A 的"最近一期"会取到用户 B 的活动痕迹 → 前端显示别人的期号
+    # （信息泄漏 + 体验错乱）。这里必须走 resolve_tenant，与 db 层同一判据。
+    _uid = db.resolve_tenant()
     rows = db.get_conn().execute(
-        "SELECT issue, MAX(created_at) AS ts FROM predictions GROUP BY issue "
-        "ORDER BY ts DESC, CAST(issue AS INTEGER) DESC LIMIT 12").fetchall()
+        "SELECT issue, MAX(created_at) AS ts FROM predictions WHERE user_id=?"
+        " GROUP BY issue ORDER BY ts DESC, CAST(issue AS INTEGER) DESC LIMIT 12",
+        (_uid,)).fetchall()
     valid = _sanitize_issue_order([r["issue"] for r in rows])
     issue = max(valid, key=lambda x: int(x)) if valid else (
         (rows[0]["issue"] if rows else None))

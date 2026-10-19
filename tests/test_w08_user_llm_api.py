@@ -2,7 +2,12 @@
 
 本文件锁定三件事：
 
-1. **归属判定**：普通用户不能写全局配置（上线即发生的越权）。
+1. **归属判定**：普通用户不能写**别人**的配置（上线即发生的越权）。
+
+   ⚠️ MU-2 之后本文件若干断言已按新语义改写：`/api/user/llm/config` 从
+   "只有管理员能写、普通用户读到占位" 变成 **"每个登录用户读写自己那一行"**
+   （`user_llm_config` 表）。越权防护从"端点 403"下沉到"存储层 uid 只来自会话"，
+   所以下面测的重点是「A 写不到 B 的行」，而不是「普通用户不能写」。
 2. **密钥不外泄**：任何响应、任何角色的视图里都不能出现 api_key 明文。
 3. **路由分级**：`/api/user/**` 必须是 `"user"`，`/api/admin/**` 必须是 `"admin"`。
 
@@ -140,39 +145,59 @@ def test_anonymous_cannot_read_admin_default(client):
 # ---------------------------------------------------------------------------
 
 def test_normal_user_read_does_not_leak_global_config(client, users):
-    """普通用户读自己的配置：未隔离前必须如实报告「未配置」，**不得回落全局**。
+    """普通用户读到的是**自己的**视图，不得泄露管理员的通道参数。
 
-    回落全局的后果：泄露管理员的 base_url/model，且暗示「你可以用这个通道」，
-    而实际上他的按键会消耗管理员的额度。
+    多用户下这条比"能不能写"更容易出事：把管理员的 base_url/model 回显给
+    普通用户，等于告诉他"你也能用这个通道"，而实际消耗的是管理员的额度。
     """
-    _, alice_h = users
-    r = client.get("/api/user/llm/config", headers=alice_h)
-    assert r.status_code == 200
-    body = r.json()
+    admin_h, alice_h = users
+    # **必须显式关掉系统共享通道**：pytest 进程是从真实部署环境启动的，
+    # `.env` 里往往配着一套可用的 LLM。不关的话 alice 会合法地回落到共享通道
+    # （scope="system"），本用例就会因为"测试环境不自控"而假红。
+    from lottery import config as _c
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(_c, "LLM_DISABLED", True)
+    try:
+        client.post("/api/user/llm/config", headers=admin_h, json={
+            "use_custom_key": True, "base_url": "https://admin-secret.example.com/v1",
+            "api_key": TESTKEY, "model": "admin-model", "samples": 1})
+        body = client.get("/api/user/llm/config", headers=alice_h).json()
+    finally:
+        monkeypatch.undo()
     assert body["configured"] is False
-    assert body["scope"] == "unbound"
-    assert body["base_url"] == "" and body["model"] == ""
+    assert body["scope"] == "none"          # 既无个人配置，也无共享通道
+    assert body["model"] != "admin-model"
+    assert "admin-secret" not in json.dumps(body)
     assert body["has_api_key"] is False
+    assert body["degrade_hint"], "无可用通道时必须提示'仍可纯统计出号'"
 
 
-def test_normal_user_cannot_write_global_config(client, users):
-    """**核心越权用例**：普通用户写配置必须 403，且全局文件不许被动过。"""
-    _, alice_h = users
-    before = (config.LLM_CONFIG_FILE.read_text(encoding="utf-8")
-              if config.LLM_CONFIG_FILE.exists() else None)
+def test_normal_user_can_write_own_but_not_others(client, users):
+    """**核心越权用例**（MU-2 语义）：
+
+    * 普通用户写**自己**的配置 → 允许（这正是需求本身）；
+    * 请求体里指定**别人的** user_id → 403，且不留副作用。
+    """
+    admin_h, alice_h = users
     r = client.post("/api/user/llm/config", headers=alice_h,
-                    json={"api_key": 'sk' + '-attacker', "model": "evil-model"})
-    assert r.status_code == 403, r.text
-    assert r.json()["reason"] == "not_isolated"
-    after = (config.LLM_CONFIG_FILE.read_text(encoding="utf-8")
-             if config.LLM_CONFIG_FILE.exists() else None)
-    assert before == after, "普通用户的写请求不得改动全局配置文件"
-    assert config.LLM_MODEL != "evil-model"
+                    json={"use_custom_key": True, "base_url": "https://a.example.com/v1",
+                          "model": "alice-model", "api_key": TESTKEY})
+    assert r.status_code == 200, r.text
+    assert r.json()["model"] == "alice-model"
+
+    from lottery import auth
+    admin_id = auth.get_user_by_username("admin")["user_id"]
+    before = client.get("/api/user/llm/config", headers=admin_h).json()
+    bad = client.post("/api/user/llm/config", headers=alice_h,
+                      json={"user_id": admin_id, "model": "pwned"})
+    assert bad.status_code == 403, bad.text
+    after = client.get("/api/user/llm/config", headers=admin_h).json()
+    assert after["model"] == before["model"] != "pwned"
 
 
 def test_normal_user_write_without_csrf_is_rejected(client, users):
     """无 CSRF 头时必须在鉴权阶段就被拒。"""
-    _, alice_h = users
+    _admin_h, alice_h = users
     r = client.post("/api/user/llm/config", json={"model": "x"})
     assert r.status_code == 403
     assert "CSRF" in r.json()["error"]
@@ -182,13 +207,18 @@ def test_normal_user_write_without_csrf_is_rejected(client, users):
 # 4. 管理员：读全局 / 写全局
 # ---------------------------------------------------------------------------
 
-def test_admin_reads_global_scope(client, users):
+def test_admin_reads_own_scope(client, users):
+    """管理员的 `/api/user/llm/config` 读的也是**自己那一行**。
+
+    MU-1 时它读全局文件（scope="global"）。MU-2 起语义统一为"我的配置"，
+    恰好与需求（每人的个人配置互相独立，管理员也不例外）一致。
+    """
     admin_h, _ = users
     r = client.get("/api/user/llm/config", headers=admin_h)
     assert r.status_code == 200
     body = r.json()
-    assert body["scope"] == "global"
-    assert body["source"] == "global_file"
+    assert body["scope"] in ("user", "system", "none")
+    assert "api_key" not in body
 
 
 def test_admin_write_round_trip(client, users):
@@ -206,20 +236,33 @@ def test_admin_write_round_trip(client, users):
     assert body["base_url"] == "https://llm.example.com/v1"
     assert body["model"] == "m-1"
     assert body["has_api_key"] is True
-    # 落盘确认（写的是真文件，而不是只改内存）
-    saved = json.loads(config.LLM_CONFIG_FILE.read_text(encoding="utf-8"))
-    assert saved["model"] == "m-1" and saved["api_key"] == TESTKEY
+    # 落库确认：MU-2 起存 user_llm_config 表，且必须是**密文**
+    from lottery import auth, user_llm_store
+    uid = auth.get_user_by_username("admin")["user_id"]
+    raw = user_llm_store.get_raw(uid)
+    assert raw["model"] == "m-1"
+    assert TESTKEY not in str(raw), "库里不得存明文 Key"
+    assert user_llm_store.get_api_key(uid) == TESTKEY
 
 
-def test_admin_default_endpoint_matches_user_view(client, users):
+def test_admin_default_and_user_view_are_distinct(client, users):
+    """`/api/admin/llm/default`（全局共享通道）与 `/api/user/llm/config`（我自己的）
+    是**两件不同的事**，MU-2 之后不该再逐字段相等。
+
+    MU-1 时两者恰好都指向全局文件，所以旧用例断言"一致"。现在：
+      * admin/default 描述 `data/llm_config.json`（共享通道，scope 恒 "global"）；
+      * user/config 描述当前用户自己的行（scope 由来源决定）。
+    """
     admin_h, _ = users
     client.post("/api/user/llm/config", headers=admin_h,
-                json={"base_url": "https://llm.example.com/v1", "api_key": 'sk' + '-xyzxyzxyz',
-                      "model": "m-2", "samples": 1, "disabled": True})
+                json={"use_custom_key": True, "base_url": "https://mine.example.com/v1",
+                      "api_key": TESTKEY, "model": "mine", "samples": 1})
     a = client.get("/api/admin/llm/default", headers=admin_h).json()
     b = client.get("/api/user/llm/config", headers=admin_h).json()
-    for k in ("scope", "configured", "base_url", "model", "samples", "disabled"):
-        assert a[k] == b[k], f"{k} 不一致"
+    assert a["scope"] == "global"
+    assert b["scope"] == "user"
+    assert b["model"] == "mine"
+    assert TESTKEY not in json.dumps(a) and TESTKEY not in json.dumps(b)
 
 
 def test_normal_user_cannot_reach_admin_default(client, users):

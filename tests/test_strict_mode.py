@@ -50,6 +50,37 @@ def _enable_strict(monkeypatch, enabled=True):
     monkeypatch.setattr(config, "STRICT_MODE", enabled, raising=False)
 
 
+def _give_user_llm_channel(monkeypatch, api_app):
+    """让**当前用户**拥有可用的 LLM 通道。
+
+    ## 为什么严格模式的测试必须先做这一步（MU-2 / Lead 裁决 2-A）
+
+    严格模式在 MU-2 之前是**部署级**开关：`LOTT_STRICT_MODE=1` 对所有人生效。
+    多用户后这条语义必须收敛为**按用户判定**，否则「默认不配置 LLM Key」的
+    新用户一进站就会被 422 锁死，而纯统计通道明明可以照常出号。
+
+    于是 `_strict_scope_for_current_user()` 的判定变成：
+    **只有真正有可用 LLM 通道的用户，严格模式才对他生效。**
+
+    这带来一个测试上的必然后果：光设 `config.STRICT_MODE=True` 已经**不会**
+    触发门控了（当前测试身份没有 Key）。本函数负责把"该用户有通道"这个前提
+    显式建起来，这样下面每个用例测的仍然是「严格模式生效时会拒绝什么」，
+    而不是被绕过逻辑静默短路成 200 —— 否则这些用例会变成永远绿的空壳。
+    """
+    from lottery import user_llm_store
+    # 需要一个确定的测试身份：无会话时 current_user_id() 返回 None，
+    # effective_for_user(None) 恒为 "无通道"，门控就永远不会被触发。
+    monkeypatch.setattr(api_app, "current_user_id", lambda: 7, raising=False)
+    monkeypatch.setattr(config, "STRICT_MODE", True, raising=False)
+    monkeypatch.setattr(config, "LLM_DISABLED", False, raising=False)
+    monkeypatch.setattr(config, "LLM_BASE_URL", "https://strict.example.com/v1", raising=False)
+    monkeypatch.setattr(config, "LLM_API_KEY", "strict-test-key-1234", raising=False)
+    monkeypatch.setattr(config, "LLM_MODEL", "strict-model", raising=False)
+    monkeypatch.setattr(config, "LLM_MODEL_LIST", ["strict-model"], raising=False)
+    # 共享通道即满足"该用户有可用 LLM 通道"，无需建 users 行
+    return user_llm_store
+
+
 def test_strict_off_returns_normal(monkeypatch, seeded_db):
     """严格模式关（默认）：正常出号，不受门控影响。"""
     from fastapi.testclient import TestClient
@@ -78,6 +109,7 @@ def test_strict_on_allows_when_rules_available(monkeypatch, seeded_db):
     from lottery.api_app import app
     seeded_db(600, seed=3)
     _enable_strict(monkeypatch, True)
+    _give_user_llm_channel(monkeypatch, api_app)
 
     monkeypatch.setattr(api_app.config, "DRAW_WEEKDAYS", (0, 1, 2, 3, 4, 5, 6))
     monkeypatch.setattr(api_app.config, "DRAW_TIME", "00:00")
@@ -113,6 +145,7 @@ def test_strict_on_rejects_when_llm_channel_off(monkeypatch, seeded_db):
     from lottery.api_app import app
     seeded_db(600, seed=3)
     _enable_strict(monkeypatch, True)
+    _give_user_llm_channel(monkeypatch, api_app)
 
     monkeypatch.setattr(api_app.config, "DRAW_WEEKDAYS", (0, 1, 2, 3, 4, 5, 6))
     monkeypatch.setattr(api_app.config, "DRAW_TIME", "00:00")
@@ -222,6 +255,7 @@ def test_strict_ignores_cache_and_validates_anyway(monkeypatch, seeded_db):
     from lottery.api_app import app
     seeded_db(600, seed=3)
     _enable_strict(monkeypatch, True)
+    _give_user_llm_channel(monkeypatch, api_app)
 
     monkeypatch.setattr(api_app.config, "DRAW_WEEKDAYS", (0, 1, 2, 3, 4, 5, 6))
     monkeypatch.setattr(api_app.config, "DRAW_TIME", "00:00")

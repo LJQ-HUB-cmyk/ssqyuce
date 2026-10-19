@@ -47,3 +47,7 @@ data/ml_diag_cache.json
 data/ml_diag_cache.json.tmp
 data/rule_lifecycle.json
 data/rule_lifecycle.json.tmp
+# MU-2：每用户 API Key 的主密钥（若落盘而非走 env）。**绝不能进仓库。**
+data/.secret_key
+# 追加型运行日志（内容随每次调用增长，不属于源码）
+data/llm_cost_log.jsonl

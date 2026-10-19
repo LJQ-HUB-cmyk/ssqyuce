@@ -111,61 +111,84 @@ def _public_view(data: Dict[str, Any], *, configured: bool,
 def get_user_llm_config(request: Request):
     """读**当前用户**的 LLM 配置视图。
 
-    未配置 = 一个 200 + `configured=false`，**不是** 404 ——
-    前端需要区分"没配"和"接口坏了"，404 会被统一错误处理当成异常弹窗。
+    未配置 = 200 + `configured=false`，**不是** 404 —— 前端要区分"没配"和
+    "接口坏了"，404 会被统一错误处理当成异常弹窗。
+
+    响应**绝不含明文 Key**，只给 `api_key_masked` 与 `has_api_key`。
     """
     sess = _session(request)
     if not sess:
         return _err("未登录", code=401)
     user = sess["user"]
+    uid = int(user["user_id"])
 
-    data = _read_global_file()
-    # MU-1 阶段的归属规则：只有管理员才有权使用全局通道；
-    # 普通用户在 MU-2 之前**没有**可用配置，如实返回未配置。
-    if user.get("role") == "admin":
-        from . import llm_client
-        learned = None
-        if config.LLM_BASE_URL and config.LLM_MODEL:
-            try:
-                learned = llm_client.learned_max_tokens(
-                    config.LLM_BASE_URL, config.LLM_MODEL)
-            except Exception:  # noqa: BLE001 —— 纯装饰信息，拿不到不影响主流程
-                learned = None
-        view = _public_view(data, configured=config.llm_configured(),
-                            scope="global", source="global_file")
-        view["learned_max_tokens"] = learned
-        view["user_id"] = user["user_id"]
-        return view
+    from . import user_llm_store
+    v = user_llm_store.get_view(uid)
+    eff = user_llm_store.effective_for_user(uid)
 
-    # 普通用户：MU-2 之前无个人配置。**不回落到全局**（那等于让所有人共用一把 key，
-    # 且泄露管理员的 base_url/model）。
-    return _public_view({}, configured=False, scope="unbound", source="none")
+    out = {
+        "ok": True,
+        "user_id": uid,
+        # scope 语义（前端据此决定界面语气与可编辑性）：
+        #   "user"   = 个人配置（本账号自己的，可编辑）
+        #   "system" = 正在用系统共享通道（个人未配，回落到管理员那份）
+        #   "none"   = 两条路都没有 → 纯统计出号
+        "scope": eff["source"],
+        "configured": bool(eff["llm_available"]),
+        "source": eff["source"],
+        "reason": eff.get("reason") or "",
+        "use_custom_key": bool(v["use_custom_key"]),
+        "disabled": bool(v["disabled"]),
+        "base_url": v["base_url"],
+        "model": v["model"],
+        "model_list": v["model_list"],
+        "samples": int(v["samples"]),
+        "api_key_masked": v["api_key_masked"],
+        "has_api_key": bool(v["has_api_key"]),
+        "daily_token_quota": int(v["daily_token_quota"]),
+        "today_tokens_used": int(v["today_tokens_used"]),
+        "today_calls_used": int(v["today_calls_used"]),
+        "qps_limit": int(v["qps_limit"]),
+        "updated_at": v["updated_at"],
+        # 兜底提示：没有可用通道时明确告诉用户"你仍然可以出号"
+        "degrade_hint": ("" if eff["llm_available"] else
+                         "当前账号没有可用的 LLM 通道，预测会走纯统计模式照常出号"
+                         "（不需要任何 Key）。如需启用大模型，请在下方填写自己的配置。"),
+        # 系统共享通道是否已被管理员配置（普通用户看得到"有没有"，看不到具体值）
+        "system_channel_configured": bool(config.llm_configured()),
+    }
+    # learned_max_tokens 只对"当前实际生效的通道"有意义
+    if eff["llm_available"] and eff["base_url"] and eff["model"]:
+        try:
+            from . import llm_client
+            out["learned_max_tokens"] = llm_client.learned_max_tokens(
+                eff["base_url"], eff["model"])
+        except Exception:      # noqa: BLE001 —— 纯装饰信息
+            out["learned_max_tokens"] = None
+    return out
 
 
 @router.post("/api/user/llm/config")
 async def save_user_llm_config(request: Request):
-    """保存**当前用户**的 LLM 配置。
+    """保存**当前用户自己的** LLM 配置（MU-2 起对所有登录用户开放）。
 
-    当前仅管理员可写（写入全局文件），普通用户返回 403 并说明原因。
-    MU-2 落地后本函数改为写 `user_llm_config` 表，届时普通用户自然获得写权限。
+    ## 为什么这里不再有 `role != admin → 403`
+
+    MU-1 阶段这条端点的语义是"管理全局配置"，所以普通用户被拒。MU-2 之后它
+    写的是 `user_llm_config` 里**这个用户自己那一行**，把"管理我自己的配置"
+    判成需要管理员权限，与需求（每用户隔离配置）直接矛盾。
+
+    越权防护改由**存储层**保证：`user_llm_store.save(uid, ...)` 的 uid 只来自
+    会话，绝不接受请求体里的 user_id —— 用户无法给别人的行写配置。
     """
     sess = _session(request)
     if not sess:
         return _err("未登录", code=401)
     user = sess["user"]
+    uid = int(user["user_id"])
 
     if not _csrf_ok(request, sess):
         return _err("CSRF 校验失败", code=403)
-
-    if user.get("role") != "admin":
-        from . import auth_api
-        auth.audit("authz.denied", actor_id=user["user_id"],
-                   ip=auth_api.client_ip(request), result="denied",
-                   detail={"path": "/api/user/llm/config", "reason": "llm_not_isolated_yet"})
-        return _err(
-            "个人 LLM 配置隔离尚未上线：当前只有管理员可以修改模型通道。"
-            "在此之前你可以直接使用统计通道出号（不需要任何 key）。",
-            code=403, reason="not_isolated")
 
     try:
         payload = await request.json()
@@ -174,14 +197,29 @@ async def save_user_llm_config(request: Request):
     if not isinstance(payload, dict):
         return _err("请求体必须是 JSON 对象")
 
-    # 复用既有保存逻辑（它已经处理好"只更新传入的键"与"保留未知键"）。
-    # 不在这里重写一遍，避免两处对同一文件的写入规则漂移。
-    from . import api_app
-    res = api_app.update_llm_config(payload)
-    if not isinstance(res, dict) or not res.get("ok"):
-        return _err((res or {}).get("error") or "保存失败", code=500)
-    return _public_view(_read_global_file(), configured=config.llm_configured(),
-                        scope="global", source="global_file")
+    # 显式拒绝越权字段：即便存储层有白名单，也要让"试图改别人"变成可见错误，
+    # 而不是被白名单静默忽略（后者会让攻击者误以为可能有效，排查时也无痕迹）。
+    if "user_id" in payload and int(payload.get("user_id") or 0) not in (0, uid):
+        from . import auth_api
+        auth_api.auth.audit(
+            "authz.denied", actor_id=uid, ip=auth_api.client_ip(request),
+            result="denied",
+            detail={"path": "/api/user/llm/config", "reason": "user_id_mismatch"})
+        return _err("不能修改其他用户的配置", code=403)
+
+    from . import user_llm_store
+    try:
+        user_llm_store.save(uid, payload)
+    except Exception as e:      # noqa: BLE001
+        # SecretBoxUnavailable（主密钥不可用）必须明确告知，**不能**静默存明文
+        return _err(f"保存失败：{e}", code=503)
+
+    from . import auth_api
+    auth_api.auth.audit(
+        "llm_config.user_save", actor_id=uid, ip=auth_api.client_ip(request),
+        detail={"keys": sorted(k for k in payload if k != "api_key"),
+                "key_changed": bool(payload.get("api_key"))})
+    return get_user_llm_config(request)
 
 
 # ---------------------------------------------------------------------------

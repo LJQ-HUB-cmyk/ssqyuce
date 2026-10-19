@@ -33,6 +33,11 @@ services:
       # **没有任何默认值**：未配置则引导通道整个关闭。
       # 引导成功后必须从 .env 删除并重启（后端的 consume_bootstrap_token 只清进程内 env）。
       - LOTT_BOOTSTRAP_TOKEN=${LOTT_BOOTSTRAP_TOKEN:-}
+      # MU-2：每用户 API Key 的加密主密钥（Fernet）。
+      # **空值 = 容器首次启动时自动生成到 data/.secret_key（0600）**。
+      # 生产建议在 .env 显式固定：换掉它会让所有已保存的用户 Key 解不开
+      # （解密失败会安全降级为"未配置"，但用户需要重新填一次）。
+      - LOTT_MASTER_KEY=${LOTT_MASTER_KEY:-}
       - LOTT_SESSION_TTL=${LOTT_SESSION_TTL:-1209600}
       - LOTT_COOKIE_NAME=${LOTT_COOKIE_NAME:-__Host-ssq_sid}
       # 生产经 nginx 443 → Secure 必须为 1（本地 http 调试才设 0）

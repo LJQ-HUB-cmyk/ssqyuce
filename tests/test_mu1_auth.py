@@ -149,7 +149,9 @@ def test_migration_creates_three_tables(isolated_env):
     names = {r[0] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"users", "user_sessions", "user_audit_log"} <= names
-    assert migrations_current() == 5
+    # MU-2 追加了 6/7/8，所以这里断言">= 5"而不是"== 5"：
+    # 迁移号只增不减，钉死等号会让每一个后续迁移都得改这条与身份无关的用例。
+    assert migrations_current() >= 5
 
 
 def migrations_current() -> int:
