@@ -179,7 +179,11 @@ def test_app_version_and_milestone_bumped():
 def test_rigor_endpoints_registered():
     """三个 V4 端点必须已注册，且不在导入期因缺 rigor 而失败。"""
     from lottery.api_app import app
-    paths = {getattr(r, "path", None) for r in app.routes}
+    # **必须用 _collect_route_paths**：FastAPI 0.142 的 include_router 是惰性的，
+    # 直接遍历 `app.routes` 只能看到占位对象，看不到 router 挂进来的端点。
+    # 这个坑本轮已经踩过一次（见 test_mu1_auth 的同名说明与元测试）。
+    from tests.test_mu1_auth import _collect_route_paths
+    paths = set(_collect_route_paths(app))
     assert "/api/rigor/randomness" in paths
     assert "/api/rigor/signal" in paths
     assert "/api/portfolio/expected-value" in paths
