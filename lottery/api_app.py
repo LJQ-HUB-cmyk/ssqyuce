@@ -427,9 +427,12 @@ def _idle_mining_loop():
     while True:
         try:
             r = _idle_mining_step()
+            # 日志要能分辨「候选」（单候选过 α 阈、未校正）与「可用」
+            # （通过 e-BH 族级校正）—— 两者混在一起会让运维以为挖到了假规律。
             print("[idle] 挖掘轮次:", {k: r.get(k) for k in
                                        ("ok", "processed", "completed_total",
-                                        "usable", "interrupted", "reason")})
+                                        "candidates", "usable", "interrupted",
+                                        "remaining", "reason")})
         except Exception as e:  # noqa: BLE001 —— 后台任务绝不能拖垮前台
             print("[idle] 异常:", e)
         _time.sleep(IDLE_MINING_INTERVAL)
