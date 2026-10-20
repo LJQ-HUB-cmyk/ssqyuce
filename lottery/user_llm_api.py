@@ -257,8 +257,8 @@ async def save_global_llm_default(request: Request):
         return _err("请求体必须是 JSON")
     if not isinstance(payload, dict):
         return _err("请求体必须是 JSON 对象")
-    from . import api_app
-    res = api_app.update_llm_config(payload)
+    from . import llm_config_store
+    res = llm_config_store.save(payload)
     if not isinstance(res, dict) or not res.get("ok"):
         return _err((res or {}).get("error") or "保存失败", code=500)
     auth_api.auth.audit("llm_config.global_save",

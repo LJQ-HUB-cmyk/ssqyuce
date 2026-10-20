@@ -1,0 +1,146 @@
+"""V13 P2：模块化第一步的守护测试（依赖方向 + 打桩点一致性）。
+
+## 这一步做了什么
+
+把 `_current_user_id` contextvar 从 `api_app.py` 搬到 `lottery/request_context.py`，
+并把 `db.py` / `llm_client.py` / `user_llm_api.py` 的反向依赖改掉：
+
+改造前（倒置）：
+```
+db.py          ──> api_app.py
+llm_client.py  ──> api_app.py
+user_llm_api   ──> api_app.py
+```
+改造后（单向）：
+```
+api_app.py ──> request_context.py <── db.py
+                                  <── llm_client.py
+api_app.py ──> llm_config_store.py <── user_llm_api.py
+```
+
+## 为什么这个方法值得测
+
+`api_app.py` 是 3500 行的 Web 应用模块。底层库为了读一个 contextvar 而依赖它，
+后果是：无法独立测试、循环依赖只能靠"把 import 写进函数体"来躲（M1 §1.2
+统计有 70+ 处这种懒加载）、切分 api_app 时处处受阻。
+
+**没有测试守着的"重构"会悄悄回滚**：下次有人图省事再写一句
+`from . import api_app`，一切照常运行，没人会发现分层又倒了。
+"""
+from __future__ import annotations
+
+import ast
+import re
+from pathlib import Path
+
+LOTTERY = Path(__file__).resolve().parent.parent / "lottery"
+
+
+def _imports_of(path: Path):
+    """返回该文件里所有 `from . import X` / `from lottery import X` 的模块名集合。
+
+    用 AST 而不是 grep：grep 会把注释与字符串里的同名字样算进去
+    （本项目已多次因此误判）。
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if node.level == 1 and node.module is None:
+                for a in node.names:
+                    names.add(a.name)
+            elif node.level == 1 and node.module:
+                names.add(node.module)
+    return names
+
+
+def test_no_low_level_module_imports_api_app():
+    """**核心**：底层库不得反向依赖 Web 应用模块 `api_app`。
+
+    这不只是洁癖 —— 它决定了 `db`/`llm_client` 能否被单独 import 与单独测试。
+    """
+    # 允许出现的例外（都是有理由的、且不在底层）
+    allowed = {"auth_api", "user_llm_api"}
+    offenders = []
+    for p in sorted(LOTTERY.glob("*.py")):
+        if p.name in ("api_app.py",) or p.name in allowed:
+            continue
+        if "api_app" in _imports_of(p):
+            offenders.append(p.name)
+    assert not offenders, (
+        f"这些模块反向 import 了 api_app：{offenders}\n"
+        "底层库请改用 lottery.request_context（纯状态）或 "
+        "lottery.llm_config_store（配置读写），不要依赖 Web 应用模块。")
+
+
+def test_request_context_is_pure_state():
+    """`request_context` 必须是纯状态模块：不 import 任何业务模块。
+
+    一旦它开始 import db/config 之类，就会重新变成一个新的循环依赖中心。
+    """
+    names = _imports_of(LOTTERY / "request_context.py")
+    banned = {"db", "config", "api_app", "llm_client", "engine"}
+    assert not (names & banned), (
+        f"request_context 不应依赖业务模块，实际依赖：{names & banned}")
+
+
+def test_llm_config_store_does_not_import_api_app():
+    names = _imports_of(LOTTERY / "llm_config_store.py")
+    assert "api_app" not in names
+
+
+def test_api_app_reexports_contextvar_for_compat():
+    """`api_app._current_user_id` 等名字必须仍可用。
+
+    既有测试与中间件都按这些名字访问；搬迁不该改契约。
+    """
+    from lottery import api_app, request_context
+    assert api_app._current_user_id is request_context._current_user_id
+    assert api_app.current_user_id is request_context.current_user_id
+
+
+def _goes_through_low_level(window: str) -> bool:
+    """该测试片段是否经由底层库（它们直接 import request_context）。"""
+    markers = ("llm_client", "db.", "engine", "_run_chat", "chat_json",
+               "save_predictions", "record_usage", "resolve_tenant")
+    return any(mk in window for mk in markers)
+
+
+def test_stub_points_match_real_dependency_sources():
+    """**打桩点一致性**：测试里 monkeypatch 的名字必须是真正的依赖源。
+
+    P2 搬迁时踩到的真问题：测试打桩 `api_app.current_user_id`，而搬迁后
+    `llm_client` 直接调 `request_context.current_user_id` —— 打桩**静默失效**，
+    用例照样通过，但它测的已经不是生产路径了。
+
+    这类"打桩点与依赖源脱节"是本项目假绿的老来源（W06 的路由枚举、
+    路由分级测试都是同一类）。这里用静态扫描把它钉死。
+    """
+    tests_dir = Path(__file__).resolve().parent
+    offenders = []
+    for p in sorted(tests_dir.glob("test_*.py")):
+        text = p.read_text(encoding="utf-8")
+        for m in re.finditer(
+                r'monkeypatch\.setattr\(\s*api_app\s*,\s*"current_user_id"', text):
+            # 同一次 setattr 附近 400 字符内必须同时打到 request_context
+            window = text[m.start(): m.start() + 400]
+            # 判断"这条用例测的是哪条路径"：
+            #  * 直接调 `api_app.<某函数>`（不经过底层库）→ 只打 api_app 是对的；
+            #  * 走 llm_client / db / engine（它们 import request_context）→ 必须两边都打。
+            # 用"同一函数体内是否出现底层库调用"来区分。
+            if "request_context" not in window and _goes_through_low_level(window):
+                line = text[:m.start()].count("\n") + 1
+                offenders.append(f"{p.name}:{line}")
+    assert not offenders, (
+        f"这些地方只打了 api_app.current_user_id，没有同时打 request_context：{offenders}\n"
+        "两条路径都要打桩，否则会被静默短路。")
+
+
+def test_llm_config_endpoints_delegate_to_store():
+    """`/api/config/llm` 的实现应在 `llm_config_store`，api_app 只留薄壳。"""
+    text = (LOTTERY / "api_app.py").read_text(encoding="utf-8")
+    assert "llm_config_store" in text
+    # 具体验证：update_llm_config 的函数体里应调用 store.save
+    seg = text[text.index("def update_llm_config("):]
+    seg = seg[:seg.index("@app.")] if "@app." in seg else seg
+    assert "llm_config_store.save" in seg

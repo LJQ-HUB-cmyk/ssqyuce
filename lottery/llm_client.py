@@ -235,8 +235,9 @@ def _bill_finish(bill: Dict, *, ok: bool, error: Optional[str] = None) -> Dict:
     # 深层库，正是 Lead 裁决 9 里"contextvar 只留给这类库"的场景。
     # 无上下文（后台线程/调度器）时返回 None → 记为系统消费，不记到某个人头上。
     try:
-        from . import api_app
-        _uid = api_app.current_user_id()
+        # P2：改依赖 `request_context`（纯状态模块），不再反向 import `api_app`
+        from . import request_context
+        _uid = request_context.current_user_id()
         if _uid is not None:
             from . import user_llm_store
             user_llm_store.record_usage(

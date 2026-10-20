@@ -32,15 +32,19 @@ from . import features as F, diagnose as D, mining as M
 # 那条路径必须用显式参数 —— 裸 threading.Thread 不继承 contextvar，
 # 丢失后会静默落到 SYSTEM 写错数据，而且测试不会红。见 Lead 裁决 9。）
 #
-# 存在价值：留给 `llm_client` 这类**无法改签名**的深层库读取"当前是谁"，
-# 以便按用户选 LLM 配置（U2 落地时使用）。
-_current_user_id: "contextvars.ContextVar[int | None]" = contextvars.ContextVar(
-    "current_user_id", default=None)
-
-
-def current_user_id():
-    """供深层库读取当前用户；无上下文时返回 None（绝不回退 admin）。"""
-    return _current_user_id.get()
+# P2：contextvar 本身已搬到 `lottery/request_context.py`。原因是依赖方向倒置——
+# `db.py` 和 `llm_client.py` 是**底层库**，却为了读一个 contextvar 反向依赖
+# 3500 行的 Web 应用模块（靠把 import 写进函数体来躲循环）。搬到独立模块后
+# 变成 `api_app → request_context ← db`，方向单向。
+#
+# 这里保留同名别名，是为了不破坏既有调用点与测试里的
+# `monkeypatch.setattr(api_app, "_current_user_id", ...)`。
+from .request_context import (                    # noqa: E402
+    _current_user_id,
+    current_user_id,
+    reset_current_user_id,
+    set_current_user_id,
+)
 
 app = FastAPI(
     title="双色球智能预测分析系统",
@@ -909,79 +913,20 @@ def predictions_history(limit: int = Query(50, ge=1, le=200)):
 
 @app.get("/api/config/llm")
 def get_llm_config():
-    from . import config, llm_client
-    cur = config.LLM_MODEL or ""
-    learned = None
-    if config.LLM_BASE_URL and cur:
-        learned = llm_client.learned_max_tokens(config.LLM_BASE_URL, cur)
-    return {
-        "disabled": config.LLM_DISABLED,
-        "base_url": config.LLM_BASE_URL,
-        "model": config.LLM_MODEL,
-        # 多模型轮转列表（设置页保存的模型是唯一事实来源；附加通道见 extra_models）
-        "model_list": list(config.LLM_MODEL_LIST),
-        "samples": config.LLM_SAMPLES,
-        "max_tokens": config.LLM_MAX_TOKENS,
-        "learned_max_tokens": learned,
-        "total_timeout": config.LLM_TOTAL_TIMEOUT,
-        "verify": config.LLM_VERIFY_ENABLED,
-        "configured": config.llm_configured(),
-    }
+    """全局默认通道（管理员专用）。P2：实现已搬到 `llm_config_store.read()`。"""
+    from . import llm_config_store
+    return llm_config_store.read()
 
 
 @app.post("/api/config/llm")
 def update_llm_config(payload: dict):
-    from . import config
-    import os
-    if "base_url" in payload:
-        config.LLM_BASE_URL = (payload.get("base_url") or "").strip().rstrip("/") or None
-        os.environ["LOTT_LLM_BASE_URL"] = config.LLM_BASE_URL or ""
-    if "api_key" in payload:
-        config.LLM_API_KEY = (payload.get("api_key") or "").strip() or None
-        os.environ["LOTT_LLM_API_KEY"] = config.LLM_API_KEY or ""
-    if "model" in payload:
-        config.LLM_MODEL = (payload.get("model") or "").strip() or "minimax-m3"
-        os.environ["LOTT_LLM_MODEL"] = config.LLM_MODEL
-        # 设置页保存的模型是唯一事实来源：**替换**（而非前插）模型列表。
-        # 前插会把 .env 里遗留的旧模型留在观察轮轮转列表里——新模型一旦失败，
-        # 旧模型的 404 就成了最终报错，把真实原因（如推理型模型未产出正文）
-        # 彻底掩盖掉。多模型容错请用 LOTT_LLM_EXTRA_MODELS / 附加通道。
-        config.LLM_MODEL_LIST = [config.LLM_MODEL]
-    if "samples" in payload:
-        try:
-            config.LLM_SAMPLES = max(1, min(20, int(payload["samples"])))
-        except (TypeError, ValueError):
-            config.LLM_SAMPLES = 3
-        os.environ["LOTT_LLM_SAMPLES"] = str(config.LLM_SAMPLES)
-    if "disabled" in payload:
-        config.LLM_DISABLED = bool(payload["disabled"])
-        os.environ["LOTT_LLM_DISABLED"] = "1" if config.LLM_DISABLED else "0"
+    """保存全局默认通道（管理员专用）。P2：实现已搬到 `llm_config_store.save()`。
 
-    # 持久化到数据目录（挂载卷，容器重启不丢失）；保留文件里已有的其它键
-    # （例如手工写入的 extra_body / total_timeout），避免设置页保存时被抹掉。
-    config.LLM_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    conf = {}
-    try:
-        if config.LLM_CONFIG_FILE.exists():
-            existing = json.loads(config.LLM_CONFIG_FILE.read_text(encoding="utf-8"))
-            if isinstance(existing, dict):
-                conf.update(existing)
-    except (ValueError, OSError):
-        pass
-    conf.update({
-        "disabled": config.LLM_DISABLED,
-        "base_url": config.LLM_BASE_URL or "",
-        "api_key": config.LLM_API_KEY or "",
-        "model": config.LLM_MODEL or "",
-        "samples": config.LLM_SAMPLES,
-    })
-    try:
-        config.LLM_CONFIG_FILE.write_text(
-            json.dumps(conf, ensure_ascii=False, indent=2), encoding="utf-8")
-    except OSError as e:
-        return {"ok": False, "error": f"配置写入失败: {e}"}
-    return {"ok": True, "configured": config.llm_configured(),
-            "model_list": list(config.LLM_MODEL_LIST)}
+    保留这个薄壳的原因：`user_llm_api` 与既有测试都按这个名字调用，
+    名字是契约，实现位置不是。
+    """
+    from . import llm_config_store
+    return llm_config_store.save(payload)
 
 
 @app.post("/api/llm/test")

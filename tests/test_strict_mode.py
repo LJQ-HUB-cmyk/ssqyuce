@@ -70,7 +70,14 @@ def _give_user_llm_channel(monkeypatch, api_app):
     from lottery import user_llm_store
     # 需要一个确定的测试身份：无会话时 current_user_id() 返回 None，
     # effective_for_user(None) 恒为 "无通道"，门控就永远不会被触发。
+    # P2：**两处都要打桩**，因为它们走的是两条路：
+    #   * `api_app` 内部的 `_strict_scope_for_current_user` 调的是本模块的
+    #     同名别名（从 request_context 转发进来）；
+    #   * `llm_client` / `db` 这些底层库直接 import `request_context`。
+    # 只打一处会让另一条路径拿到真值，表现为"用例跑通但测的不是生产路径"。
+    from lottery import request_context
     monkeypatch.setattr(api_app, "current_user_id", lambda: 7, raising=False)
+    monkeypatch.setattr(request_context, "current_user_id", lambda: 7, raising=False)
     monkeypatch.setattr(config, "STRICT_MODE", True, raising=False)
     monkeypatch.setattr(config, "LLM_DISABLED", False, raising=False)
     monkeypatch.setattr(config, "LLM_BASE_URL", "https://strict.example.com/v1", raising=False)

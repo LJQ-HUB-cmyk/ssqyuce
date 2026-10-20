@@ -70,8 +70,12 @@ def env(tmp_path, monkeypatch):
 
 def _run_chat(monkeypatch, user_id, resp):
     """跑一次 chat()，并把请求替换成固定响应（不发真网络）。"""
-    from lottery import api_app
-    monkeypatch.setattr(api_app, "current_user_id", lambda: user_id, raising=False)
+    # P2：打桩点必须是**真正的依赖源** `request_context`。
+    # 打 `api_app.current_user_id` 在 P2 之前有效（llm_client 当时反向 import
+    # api_app），搬迁后会让打桩静默失效 —— 测试照样通过，但它测的已经不是
+    # 生产路径了。这类"打桩点与依赖源脱节"是本项目反复出现的假绿来源。
+    from lottery import request_context
+    monkeypatch.setattr(request_context, "current_user_id", lambda: user_id, raising=False)
     monkeypatch.setattr(llm_client.requests, "post", lambda *a, **k: resp)
     return llm_client.chat("sys", "user")
 
@@ -100,8 +104,8 @@ def test_no_context_does_not_attribute_to_anyone(env, monkeypatch):
     """后台线程没有 contextvar → **不得**把消费记到某个具体用户头上。"""
     uid = env
     user_llm_store.save(uid, {"daily_token_quota": 100000})
-    from lottery import api_app
-    monkeypatch.setattr(api_app, "current_user_id", lambda: None, raising=False)
+    from lottery import request_context
+    monkeypatch.setattr(request_context, "current_user_id", lambda: None, raising=False)
     monkeypatch.setattr(llm_client.requests, "post",
                         lambda *a, **k: _ok_with_usage(500, 500))
     llm_client.chat("sys", "user")

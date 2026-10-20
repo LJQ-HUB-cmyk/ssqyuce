@@ -417,11 +417,13 @@ def resolve_tenant(user_id: Optional[int] = None) -> int:
     if user_id is not None:
         return int(user_id)
     try:
-        from . import api_app
-        uid = api_app.current_user_id()
+        # P2：改依赖 `request_context`（纯状态模块），不再反向 import `api_app`。
+        # 依赖方向：db → request_context ← api_app，单向。
+        from . import request_context
+        uid = request_context.current_user_id()
         if uid:
             return int(uid)
-    except Exception:      # noqa: BLE001 —— 循环导入/无请求上下文
+    except Exception:      # noqa: BLE001 —— 无请求上下文
         pass
     admin = _single_tenant_admin_id()
     if admin:
