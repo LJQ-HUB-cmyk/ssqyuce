@@ -33,6 +33,8 @@ from . import routes_methods
 from . import routes_ml
 from . import routes_rigor
 from . import routes_portfolio
+from . import routes_data
+from . import routes_patterns
 # P2：`_jsonable` 已被 10 个端点共用，提到 jsonutil 以免各域反向依赖 api_app。
 # 保留同名别名，既有调用点与测试零改动。
 from .jsonutil import jsonable as _jsonable
@@ -53,6 +55,9 @@ from .routes_portfolio import (  # noqa: F401
     ticket_expected_prize,
 )
 TICKET_PRICE = config.TICKET_PRICE   # noqa: F401  已提到 config（领域常量）
+# 数据域端点同样按名字被测试引用（`from lottery.api_app import app_info`），
+# 再导出以保持契约。
+from .routes_data import app_info, health  # noqa: F401
 from . import migrations
 from . import features as F, diagnose as D, mining as M
 
@@ -235,6 +240,8 @@ app.include_router(routes_methods.router)
 app.include_router(routes_ml.router)
 app.include_router(routes_rigor.router)
 app.include_router(routes_portfolio.router)
+app.include_router(routes_data.router)
+app.include_router(routes_patterns.router)
 
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
@@ -242,126 +249,6 @@ STATIC_DIR = WEB_DIR / "static"
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
 
 app.mount("/static", _NoCacheStaticFiles(directory=str(STATIC_DIR)), name="static")
-
-
-# ---------- 数据 ----------
-
-@app.get("/api/data/reconcile")
-def data_reconcile():
-    from . import data_check
-    return data_check.run()
-
-
-@app.get("/api/data/reconcile/history")
-def reconcile_history(limit: int = Query(30, ge=1, le=500)):
-    """返回多源对账审计记录，便于追踪告警与恢复。"""
-    return {"items": db.load_reconcile_runs(limit)}
-
-
-@app.get("/api/health")
-def health():
-    # V10-00d：对外暴露 schema_version，部署/回滚时可直接确认库结构版本
-    # （迁移是懒加载自动执行的，没有这个字段只能靠连库 PRAGMA 猜）。
-    try:
-        schema = migrations.status(db.get_conn())
-    except Exception as e:  # noqa: BLE001 - 健康检查不能因此 500
-        schema = {"version": None, "latest": migrations.latest_version(),
-                  "error": f"{type(e).__name__}: {e}"}
-    return {
-        "status": "ok",
-        "version": config.APP_VERSION,
-        "issues": db.count_draws(),
-        "max_issue": db.max_issue(),
-        "eval_methods": [r["method"] for r in db.cumulative_eval(limit=1).get("methods", [])],
-        "app_build": config.APP_BUILD,
-        "schema_version": schema["version"],
-        "schema_latest": schema["latest"],
-        "uptime_seconds": max(0, int(__import__('time').time() - config.STARTED_AT)),
-        "api_auth_enabled": bool(config.API_TOKEN),
-        "recent_tasks": db.list_tasks(limit=5),
-    }
-
-
-@app.get("/api/info")
-def app_info():
-    """系统版本与里程碑状态（主页页脚徽标与「关于」展示用）。"""
-    from . import methods as METH
-    return {
-        "name": "双色球智能预测分析系统",
-        "version": config.APP_VERSION,
-        "build": config.APP_BUILD,
-        "milestones": config.APP_MILESTONES,
-        "plan": "docs/UPGRADE_PLAN.md + docs/M3_M4_PLAN.md",
-        # U2/U3：投注模式与蓝球口径、方法自适应降权状态
-        "bet_mode": config.BET_MODE,
-        "blue_mode": config.BLUE_MODE,
-        "blue_cover": config.BLUE_COVER,
-        "adaptive": METH.adaptive_status(),
-        # V4：前端样本量门槛的唯一出处（避免前后端各写一个数）
-        "method_min_issues": config.METHOD_RECOMMENDATION_MIN_ISSUES,
-        # V10-04b：本期出号通道（resolve_channels() 是唯一判据）。前端用它回填
-        # 「启用 LLM」复选框的默认值 —— HTML 里**不再**硬编码 checked，
-        # 否则前端会吃掉后端默认 off。这里用无副作用的现算，不改全局快照。
-        "channels": METH.resolve_channels(),
-        "honesty_boundary": "双色球为独立随机事件，本系统不承诺中奖率",
-    }
-
-
-@app.post("/api/refresh")
-def refresh():
-    """抓取远程最新开奖并增量入库（返回统计信息）。"""
-    try:
-        info = data_fetcher.fetch_and_update()
-    except Exception as e:  # noqa: BLE001
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=502)
-    return {"ok": True, **info}
-@app.get("/api/draws/history")
-def draw_history(n: int = Query(500, ge=1, le=3490)):
-    """返回按序号排列的开奖历史（用于走势图）。"""
-    draws = db.load_last_draws(n)
-    return {
-        "issues": [d["issue"] for d in draws],
-        "sums": [sum(d["reds"]) for d in draws],
-        "blues": [d["blue"] for d in draws],
-        "reds": [d["reds"] for d in draws],
-    }
-
-
-@app.get("/api/features")
-def get_features():
-    """最新一期的多尺度统计报告（含长/中/短窗口）。"""
-    draws = db.load_draws()
-    return F.compute_features(draws)
-
-
-# ---------- 规律 ----------
-
-@app.get("/api/patterns")
-def get_patterns():
-    return {
-        "items": db.load_patterns(),
-        "summary": _pattern_summary(db.load_patterns(grade_filter=None)),
-    }
-
-
-def _pattern_summary(patterns: List[Dict]) -> Dict:
-    g = {"A": 0, "B": 0, "C": 0}
-    for p in patterns:
-        g[p.get("grade", "C")] = g.get(p.get("grade", "C"), 0) + 1
-    return {"A": g["A"], "B": g["B"], "C": g["C"]}
-
-
-@app.post("/api/patterns/backtest")
-def run_backtests():
-    from . import backtest as BT
-    draws = db.load_draws()
-    results = BT.run_all_backtests(draws, min_start=300)
-    return {
-        "items": db.load_patterns(),
-        "summary": _pattern_summary(results),
-        "note": ("walk-forward 样本外回测：只用目标期之前的历史，禁用未来信息。"
-                 "A=显著，B=弱信号，C=不通过。"),
-    }
 
 
 # ---------- 预测 ----------
