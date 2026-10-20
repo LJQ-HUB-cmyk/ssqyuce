@@ -400,7 +400,50 @@ def _scheduler_loop():
         _time.sleep(1800)
 
 
-# ---------- 启动：开奖日自动调度（可选） ----------
+# ---------- 闲时挖掘常驻循环（可选，LOTT_IDLE_MINING=1） ----------
+
+#: 两轮挖掘之间的间隔（秒）。20 分钟一轮、每轮默认 200 个候选，
+#: 124 维度全部走完约需一轮多的量级 —— 也就是「一天内细水长流跑完」
+#: 而不是「一次占满 CPU 跑几小时」。
+IDLE_MINING_INTERVAL = 1200
+
+
+def _idle_mining_step() -> dict:
+    """跑一轮闲时挖掘。**失败只降级，绝不抛出**。
+
+    与 `_scheduler_step` 的关键区别：这里**没有开奖日/时间的门控**。
+    闲时挖掘的语义是「有空就跑一点」的常驻任务，不是「开奖日 21:35 后的
+    一次性动作」。塞进 `_scheduler_step` 会让它一周只跑 3 次、每次只跑一轮，
+    直接违背 P4 的细水长流设计（124 维度要分批走完）。
+    """
+    from . import idle_mining
+    if not idle_mining.enabled():
+        return {"ok": False, "reason": "idle_mining_disabled"}
+    return idle_mining.run_once()
+
+
+def _idle_mining_loop():
+    import time as _time
+    while True:
+        try:
+            r = _idle_mining_step()
+            print("[idle] 挖掘轮次:", {k: r.get(k) for k in
+                                       ("ok", "processed", "completed_total",
+                                        "usable", "interrupted", "reason")})
+        except Exception as e:  # noqa: BLE001 —— 后台任务绝不能拖垮前台
+            print("[idle] 异常:", e)
+        _time.sleep(IDLE_MINING_INTERVAL)
+
+
+# ---------- 启动：开奖日自动调度 + 闲时挖掘（均默认关闭，各自独立开关） ----------
 if config.SCHEDULER_ENABLED:
     import threading
     threading.Thread(target=_scheduler_loop, daemon=True).start()
+
+# P4：闲时挖掘用**独立线程**，不受 SCHEDULER_ENABLED 影响 ——
+# 两个开关语义不同：LOTT_SCHEDULER 管「开奖日自动出号」，
+# LOTT_IDLE_MINING 管「有空时慢慢挖规律」。绑在一起会让
+# 「只想挖规律、不想自动出号」的场景无法配置。
+if (os.environ.get("LOTT_IDLE_MINING") or "0").strip() == "1":
+    import threading as _threading
+    _threading.Thread(target=_idle_mining_loop, daemon=True).start()

@@ -53,3 +53,7 @@ data/.secret_key
 data/llm_cost_log.jsonl
 # V13 P1a：归档的废弃数据文件（保留可恢复，不进版本库）
 data/archive/
+
+# P4 闲时挖掘断点（运行时状态：游标、判定计数、可用候选，且会随挖掘推进持续变化）
+data/idle_mining_state.json
+data/idle_mining_state.json.tmp

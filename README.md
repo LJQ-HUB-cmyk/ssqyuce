@@ -446,6 +446,7 @@ set -a && source .env && set +a      # 让 .env 里的环境变量生效（Windo
 | `LOTT_N_TICKETS` | `10` | 输出注数（LLM-only 模式下为**上限**，不保证补满） |
 | `LOTT_BET_MODE` | `single` | 投注模式：`single` / `blue_compound`（蓝球复式）/ `dan_tuo`（红胆拖） |
 | `LOTT_SCHEDULER` | `0` | `1` = 开奖日（周二/四/日）21:35 后自动 抓取+对照+预测 |
+| `LOTT_IDLE_MINING` | `0` | `1` = 闲时挖掘常驻线程（每 20 分钟一轮，124 维度分批走完）。与 `LOTT_SCHEDULER` **互相独立**；进度见 `/api/health` 的 `idle_mining` 字段，断点写 `data/idle_mining_state.json` |
 | `LOTT_BOOT_PREDICT` | `1` | 容器启动时若下期无预测则自动生成 |
 | `PORT` | `18000` | Web 服务端口（Docker/环境变量） |
 | `LOTT_DB` | `data/ssq.db` | 数据库路径 |

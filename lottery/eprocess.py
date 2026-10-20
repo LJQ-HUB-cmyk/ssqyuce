@@ -41,7 +41,7 @@ e-process 是专为这种场景设计的：它对**任意停止规则**都有效
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Set
 
 #: 默认先验尺度（M2 §4.3 标定结果）
 DEFAULT_TAU = 0.10
@@ -156,3 +156,61 @@ def expected_crossing_issues(delta: float, sigma: float = 0.8678,
         if s_over_denom - 0.5 * math.log(1.0 + tau2 * t) >= log_thr:
             return t
     return None
+
+
+# --------------------------------------------------------------------------
+# 多重检验治理：e-BH
+# --------------------------------------------------------------------------
+
+def ebh_selected(e_values: Sequence[float], m_total: Optional[int] = None,
+                 alpha: float = DEFAULT_ALPHA) -> Set[int]:
+    """e-BH（Wang & Ramdas 2022）：在**大量并行假设**下控制 FDR。
+
+    ## 为什么必须有这一层
+
+    e-process 的 anytime-valid 保证是**针对单个假设**的：一个假设被反复查看、
+    随时停止，错误率都不膨胀。但它**不对「同时检验 40 万个不同假设」负责** ——
+    那是族错误率（FWER）/ 假发现率（FDR）的问题，单个 e-process 无能为力。
+
+    闲时挖掘把候选空间从 124 扩到数万（单因子网格 + 跨族交叉）之后，这一层
+    就不再是可选项：纯随机数据上必然有一定数量的候选「e-value 越过 1/α」，
+    直接把它们报成「找到规律」就是在骗自己。实测抓到过 4 条这样的假阳性
+    （`hot{window:5,k:16}` 等），这正是本函数存在的理由。
+
+    ## 判据
+
+    把 m 个 e-value 降序排列 ``e_(1) ≥ … ≥ e_(m)``，取最大的 k 使
+    ``e_(k) ≥ m / (k·α)``，则前 k 个被选中。此时 FDR ≤ α。
+
+    注意阈值随 k 变化：k 越大阈值 ``m/(kα)`` 越小。因此 ``e < 1`` 的候选
+    永远不会被选中（阈值最小也有 ``1/α``），调用方可以只传 ``e ≥ 1`` 的候选，
+    用 ``m_total``（**总检验数**，含未入选者）保证分母正确。
+
+    ## 已知局限（必须说清楚，实测数据支撑）
+
+    **m 越大，单个发现所需的 e-value 越高（≈ m/α）。** 这不是实现缺陷，
+    而是多重检验的固有代价 —— 但与本项目的数据现实结合后，结论很尖锐：
+
+    * 验收口径里的强注入偏置「cold +50%/号」，600 期单候选 e-value 实测 **28.1**；
+    * 而 m=44（一个中等族的档位数）时阈值已达 880，m=306 时 6120。
+
+    也就是说：**只要做了族级校正，连强注入偏置都检不出。** 因此
+    `idle_mining` 把「单候选过阈」与「通过 e-BH」分成两级分别记录
+    （`candidates` / `usable`），前端必须分开呈现，不能让未经校正的
+    候选冒充结论。`usable` 长期为 0 是这张数据上的**数学必然**，
+    3516 期真实开奖与均匀随机不可区分（红球卡方 p=0.061）。
+
+    想放宽只能在**减小搜索空间**（少挖几个维度）上做，不能靠调小 m ——
+    调小 m 等于偷偷降低显著性门槛，会直接制造假发现。
+    """
+    m = int(m_total) if m_total is not None else len(e_values)
+    if m <= 0 or not e_values:
+        return set()
+    alpha = float(alpha) if alpha else DEFAULT_ALPHA
+    order = sorted(range(len(e_values)), key=lambda i: -float(e_values[i]))
+    k_star = 0
+    for rank, idx in enumerate(order, start=1):
+        e = float(e_values[idx])
+        if e >= m / (rank * alpha):
+            k_star = rank
+    return set(order[:k_star])

@@ -54,6 +54,49 @@ PRESSURE_SLEEP = 0.5
 #: 判定所需最小观测数（低于此不下结论）
 MIN_OBS = 30
 
+#: 候选空间版本。2 = 生成式开放空间（单因子网格 + 跨族交叉）。
+#: 旧断点（1 = 封闭的 124 维遍历）语义不兼容，读到就重置游标。
+SPACE_VERSION = 2
+#: 只保留 e_value 最高的若干个 monitor 候选（避免断点膨胀到几十 MB）
+MAX_MONITOR_TOP = 50
+
+
+def _fresh_state() -> Dict[str, Any]:
+    """断点的初始结构（新空间语义）。"""
+    return {
+        "space_version": SPACE_VERSION,
+        "cursors": {"single": 0, "cross": 0},
+        "by_decision": {},
+        "candidates": {},
+        "usable": {},
+        "monitor_top": {},
+        "n_checked": 0,
+        "runs": 0,
+        "total_candidates": 0,
+        "updated_at": None,
+    }
+
+
+def _migrate_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    """把旧版断点迁移到当前候选空间语义。
+
+    旧断点用 `completed_dimensions`（124 个「族:参数」字符串）记录进度。
+    新空间是**开放**的且层内顺序不同 —— 旧的已完成集合无法映射成游标，
+    强行保留会导致「以为挖过、其实没挖」。因此版本不符时重置游标，
+    只保留 runs 等无害计数，并留一条 `migrated_from` 说明。
+    """
+    if int(state.get("space_version") or 0) >= SPACE_VERSION:
+        return state
+    old_checked = len(state.get("completed_dimensions") or {})
+    fresh = _fresh_state()
+    fresh["runs"] = int(state.get("runs") or 0)
+    fresh["migrated_from"] = {
+        "space_version": int(state.get("space_version") or 1),
+        "old_completed_dimensions": old_checked,
+        "note_zh": "候选空间已改为生成式开放空间，旧进度不兼容，游标重置",
+    }
+    return fresh
+
 
 def enabled() -> bool:
     """总开关。**默认关闭** —— 新机制先观察再开。"""
@@ -74,8 +117,7 @@ def load_state() -> Dict[str, Any]:
                 return data
     except (ValueError, OSError):
         pass
-    return {"completed_dimensions": [], "verdicts": {}, "updated_at": None,
-            "runs": 0, "total_candidates": 0}
+    return _fresh_state()
 
 
 def save_state(state: Dict[str, Any]) -> None:
@@ -119,10 +161,25 @@ def judge_candidate(z_scores: List[float], *,
 
 def run_once(*, budget_candidates: int = 200,
              min_start: int = 300) -> Dict[str, Any]:
-    """跑一轮闲时挖掘（可中断、可续跑）。
+    """跑一轮闲时挖掘（可中断、可续跑、**只挖没挖过的**）。
 
     `budget_candidates` 是**本轮上限**（不是总量）：闲时挖掘应当"细水长流"，
     每次只推进一点，避免一次跑几个小时把机器占满。
+
+    ## 与旧实现的关键区别：从「遍历封闭集合」改为「推进开放空间」
+
+    旧实现遍历 `discovery.FAMILY_BY_KEY` 里写死的 124 个组合，跑完即
+    `processed=0` 永久空转 —— 那是**重复验证**，不是挖掘。
+    现在改为在 `candidate_space` 的**开放空间**上按游标单向推进：
+    单因子 692 项 → 跨族交叉 406 368 项，且交叉层是现有 29 族
+    **从未检验过**的搜索空间。
+
+    ## 为什么不做「回头复检 monitor」
+
+    单向推进意味着一个候选只判定一次，monitor 不再回头观察。
+    这是刻意的取舍：用户的诉求是「去找新的、之前没检验过的规律」，
+    而不是反复验证同一批。回头复检属于另一件事（数据增长带来的持续观察），
+    若要做应作为独立的复检队列，不该占用挖掘预算。
 
     返回运行摘要（也写进断点）。
     """
@@ -130,44 +187,51 @@ def run_once(*, budget_candidates: int = 200,
         return {"ok": False, "reason": "idle_mining_disabled",
                 "note_zh": "闲时挖掘未启用（LOTT_IDLE_MINING=0）"}
 
-    from . import discovery
+    from . import candidate_space as CS, discovery
 
     draws = db.load_draws()
     if len(draws) < min_start + 50:
         return {"ok": False, "reason": "insufficient_data",
                 "note_zh": f"数据不足（需 ≥{min_start + 50} 期，当前 {len(draws)}）"}
 
-    state = load_state()
-    done_dims = set(state.get("completed_dimensions") or [])
-    verdicts: Dict[str, Any] = dict(state.get("verdicts") or {})
+    state = _migrate_state(load_state())
+    cursors: Dict[str, int] = dict(state.get("cursors") or {})
+    by_decision: Dict[str, int] = dict(state.get("by_decision") or {})
+    # ``candidates`` = 单候选过 α 阈的（尚未做族级校正）；
+    # ``usable`` 由轮末 e-BH 从 candidates 里筛出，不在这里累加。
+    candidates: Dict[str, Any] = dict(state.get("candidates") or {})
+    monitor_top: Dict[str, Any] = dict(state.get("monitor_top") or {})
+    n_checked = int(state.get("n_checked") or 0)
 
-    # P4-2: 枚举 discovery 的全部真实维度组合
-    combos = []
-    for f_key, fam in discovery.FAMILY_BY_KEY.items():
-        for params in fam.get("params", []):
-            try:
-                flt = discovery.make_filter(f_key, params)
-                combos.append(flt)
-            except Exception:
-                continue
-
-    processed = 0
-    interrupted = False
     n_draws = len(draws)
     scan_window = min(500, n_draws - min_start)
     quick_start = max(min_start, n_draws - scan_window)
 
-    for flt in combos:
-        dim_key = f"{flt['key']}:{json.dumps(flt.get('params', {}), sort_keys=True)}"
-        if dim_key in done_dims:
-            continue                      # 续跑：跳过已完成维度
+    processed = 0
+    skipped = 0
+    interrupted = False
+    layers_done: List[str] = []
+    max_skip = CS.layer_size(CS.LAYER_SINGLE) + CS.layer_size(CS.LAYER_CROSS) + 8
 
-        if processed >= budget_candidates:
-            interrupted = True
+    while processed < budget_candidates and skipped < max_skip:
+        layer = _next_layer(cursors, CS)
+        if layer is None:
+            layers_done = [CS.LAYER_SINGLE, CS.LAYER_CROSS]
             break
 
+        idx = int(cursors.get(layer) or 0)
+        if idx >= CS.layer_size(layer):
+            cursors[layer] = CS.layer_size(layer)
+            continue
+
+        got = CS.candidate_at(layer, idx)
+        cursors[layer] = idx + 1        # 游标无论如何前进（不重复挖同一个索引）
+        if not got:
+            skipped += 1                # 非法候选：不消耗预算
+            continue
+
+        flt, fp = got
         try:
-            # 真实计算 asof_scan 并转换为 z_scores 序列
             scan = discovery.asof_scan(draws, flt, start=quick_start, end=n_draws)
             obs = scan.get("obs") or []
             exp = scan.get("exp") or []
@@ -176,49 +240,150 @@ def run_once(*, budget_candidates: int = 200,
                 sigma = 0.8678 if flt.get("target") == "red" else 0.24
                 z_scores = [(float(o) - float(e)) / sigma for o, e in zip(obs, exp)]
                 v = judge_candidate(z_scores)
-                verdicts[dim_key] = v
+                v["layer"] = layer
+                v["index"] = idx
+                v["label"] = flt.get("name_zh") or flt.get("key")
+                v["target"] = flt.get("target")
+                d = v.get("decision") or "unknown"
+                by_decision[d] = by_decision.get(d, 0) + 1
+                if d == "usable":
+                    # **单候选过阈只是「候选」，不是「可用」** ——
+                    # e-process 的 anytime-valid 只对单个假设负责，
+                    # 族级假发现率必须由 e-BH 在轮末统一治理（见 _recompute_usable）。
+                    candidates[fp] = v
+                else:
+                    _keep_monitor_top(monitor_top, fp, v)
             else:
-                verdicts[dim_key] = {"decision": "underpowered", "n_obs": len(obs), "reason": "insufficient_samples"}
-        except Exception as e:
-            verdicts[dim_key] = {"decision": "error", "error": str(e)}
+                d = "underpowered"
+                by_decision[d] = by_decision.get(d, 0) + 1
+        except Exception as e:  # noqa: BLE001 —— 单个候选失败不中断整轮
+            d = "error"
+            by_decision[d] = by_decision.get(d, 0) + 1
+            monitor_top.pop(fp, None)
 
-        done_dims.add(dim_key)
+        n_checked += 1
         processed += 1
         if processed % BATCH_SIZE == 0:
             time.sleep(PRESSURE_SLEEP if _online_pressure() else BASE_SLEEP)
 
-    state["completed_dimensions"] = sorted(done_dims)
-    state["verdicts"] = verdicts
+    if processed >= budget_candidates:
+        interrupted = True
+
+    # 轮末统一做族级校正：把「候选」里经 e-BH 仍成立的升级为「可用」。
+    usable = _recompute_usable(candidates, n_checked)
+
+    state.update({
+        "cursors": cursors,
+        "by_decision": by_decision,
+        "candidates": candidates,
+        "usable": usable,
+        "monitor_top": monitor_top,
+        "n_checked": n_checked,
+    })
     state["runs"] = int(state.get("runs") or 0) + 1
-    state["total_candidates"] = int(state.get("total_candidates") or 0) + processed
+    state["total_candidates"] = n_checked
     save_state(state)
 
-    usable = sum(1 for v in verdicts.values() if v.get("decision") == "usable")
+    remain_single = max(0, CS.layer_size(CS.LAYER_SINGLE)
+                        - int(cursors.get(CS.LAYER_SINGLE) or 0))
+    remain_cross = max(0, CS.layer_size(CS.LAYER_CROSS)
+                       - int(cursors.get(CS.LAYER_CROSS) or 0))
     return {
         "ok": True,
         "processed": processed,
-        "completed_total": len(done_dims),
-        "usable": usable,
+        "completed_total": n_checked,
+        "usable": len(usable),
+        "candidates": len(candidates),
         "interrupted": interrupted,
-        "note_zh": (f"本轮处理 {processed} 个候选（累计 {len(done_dims)}）；"
-                    f"usable={usable}。闲时挖掘的产物是**判定记录**，"
-                    f"不是「找到 N 条规律」—— 真实数据上 usable 长期为 0 是诚实结果。"),
+        "layers_done": layers_done,
+        "remaining": {"single": remain_single, "cross": remain_cross},
+        "cursors": dict(cursors),
+        "note_zh": (f"本轮判定 {processed} 个**此前未检验过**的候选"
+                    f"（累计 {n_checked}）；单候选过阈 {len(candidates)} 条，"
+                    f"经 e-BH 族级校正后可用 {len(usable)} 条。"
+                    f"剩余：单因子 {remain_single} + 跨族交叉 {remain_cross}。"),
     }
 
 
+def _recompute_usable(candidates: Dict[str, Any],
+                      n_checked: int) -> Dict[str, Any]:
+    """用 e-BH 对全部「单候选过阈」的候选做族级 FDR 校正。
+
+    m 用**累计检验总数**（`n_checked`），不是候选字典长度 ——
+    分母必须是「一共检验过多少个假设」，否则校正形同虚设。
+    """
+    if not candidates:
+        return {}
+    fps = list(candidates.keys())
+    e_vals = [float((candidates[fp] or {}).get("e_value") or 0.0) for fp in fps]
+    sel = eprocess.ebh_selected(e_vals, m_total=max(len(fps), int(n_checked)))
+    return {fps[i]: candidates[fps[i]] for i in sel}
+
+
+def _next_layer(cursors: Dict[str, int], CS) -> Optional[str]:
+    """按 single → cross 的顺序找出下一个**尚有余量**的层。"""
+    for layer in (CS.LAYER_SINGLE, CS.LAYER_CROSS):
+        if int(cursors.get(layer) or 0) < CS.layer_size(layer):
+            return layer
+    return None
+
+
+def _keep_monitor_top(top: Dict[str, Any], fp: str, v: Dict[str, Any]) -> None:
+    """保留 e_value 最高的若干 monitor 候选，供「最接近发现」展示。
+
+    只留 top-N：monitor 是绝大多数（几十万），全存会让断点膨胀到几十 MB。
+    """
+    if v.get("decision") != "monitor":
+        return
+    top[fp] = {k: v.get(k) for k in ("e_value", "n_obs", "label", "layer", "index")}
+    if len(top) > MAX_MONITOR_TOP:
+        worst = min(top, key=lambda k: float(top[k].get("e_value") or 0.0))
+        top.pop(worst, None)
+
+
+
 def status() -> Dict[str, Any]:
-    """供 /api/health 与运维查看的配额/进度快照。"""
-    state = load_state()
-    verdicts = state.get("verdicts") or {}
-    by_decision: Dict[str, int] = {}
-    for v in verdicts.values():
-        d = v.get("decision") or "unknown"
-        by_decision[d] = by_decision.get(d, 0) + 1
+    """供 /api/health 与运维查看的进度快照。
+
+    关键字段是 **`progress`（开放空间的挖掘进度）** —— 这是「闲时挖掘到哪了、
+    还剩多少没挖」的唯一可信来源。旧实现只有一个 `completed_dimensions` 计数，
+    看不出空间有多大、是否已经空转。
+    """
+    from . import candidate_space as CS
+
+    state = _migrate_state(load_state())
+    cursors = state.get("cursors") or {}
+    space = CS.stats()
+    single_done = min(int(cursors.get(CS.LAYER_SINGLE) or 0), space["single_total"])
+    cross_done = min(int(cursors.get(CS.LAYER_CROSS) or 0), space["cross_total"])
+    checked = int(state.get("n_checked") or 0)
+    total_space = space["single_total"] + space["cross_total"]
     return {
         "enabled": enabled(),
-        "completed_dimensions": len(state.get("completed_dimensions") or []),
+        "space_version": SPACE_VERSION,
+        # 兼容旧字段名：语义已变为「累计判定过的候选数」
+        "completed_dimensions": checked,
+        "checked": checked,
         "runs": int(state.get("runs") or 0),
-        "total_candidates": int(state.get("total_candidates") or 0),
-        "by_decision": by_decision,
+        "total_candidates": checked,
+        "by_decision": dict(state.get("by_decision") or {}),
+        # **区分「候选」与「可用」**：前者只是单候选过了 α 阈（数万级搜索里
+        # 纯随机也会跑出一批），后者才通过 e-BH 族级校正。两者混为一谈就是骗自己。
+        "candidate_count": len(state.get("candidates") or {}),
+        "usable_count": len(state.get("usable") or {}),
+        "progress": {
+            "single_done": single_done,
+            "single_total": space["single_total"],
+            "cross_done": cross_done,
+            "cross_total": space["cross_total"],
+            "space_total": total_space,
+            "remaining": max(0, total_space - single_done - cross_done),
+            "pct": round(100.0 * (single_done + cross_done) / total_space, 4)
+            if total_space else 0.0,
+        },
+        "monitor_top": sorted(
+            (state.get("monitor_top") or {}).items(),
+            key=lambda kv: -float((kv[1] or {}).get("e_value") or 0.0))[:5],
         "updated_at": state.get("updated_at"),
+        "migrated_from": state.get("migrated_from"),
     }

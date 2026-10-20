@@ -24,6 +24,10 @@ services:
       - TZ=Asia/Shanghai
       - PORT=18000
       - LOTT_SCHEDULER=${LOTT_SCHEDULER:-1}
+      # P4：闲时挖掘必须透传，否则改 .env 不生效（与 LOTT_STRICT_MODE 同坑）。
+      # 默认 0 = 关闭：新机制先观察再开。开启后由独立线程常驻跑，
+      # 不受 LOTT_SCHEDULER 影响（两者语义不同）。
+      - LOTT_IDLE_MINING=${LOTT_IDLE_MINING:-0}
       - LOTT_BOOT_PREDICT=${LOTT_BOOT_PREDICT:-1}
       - LOTT_TOKEN=${LOTT_TOKEN:-}
       # W08：多用户鉴权。off = 只解析身份不拦截（灰度）；enforce = deny-by-default。
