@@ -213,6 +213,38 @@ METHOD_RECOMMENDATION_ALPHA = float(os.environ.get("LOTT_METHOD_RECOMMENDATION_A
 # 所以 1 个命中（+1.0）足以在池内挪动一两位，但打不过「整体高 4 分以上」的注——
 # 这正是"温和偏置"想要的力度。调大（如 3.0）会让规律压过概率模型，不建议。
 RULE_CONF_BOOST = float(os.environ.get("LOTT_RULE_CONF_BOOST", "1.0"))
+
+# ---------------------------------------------------------------------------
+# 候选置信度的**族偏置**（P5′，M3 §8.3 H1 修复）
+# ---------------------------------------------------------------------------
+#
+# ## 修的是什么
+#
+# 历史实现里 LLM 族有**恒定 +20** 的置信度加成（外加 0.45 vs 0.25 的斜率）：
+#
+#     llm:  conf = 20 + 0.45 * (0.5*自评 + 0.5*ensemble)    # ≈ 50–51
+#     其它: conf = 10 + 0.25 * ensemble                     # ≈ 10–35
+#
+# 后果是 LLM 注**必然**排在候选池最前（排序纯按 confidence 降序），
+# 实测某期 25 注里 24 注来自 LLM，而 `llm_output_mode="off"` 只控制"注数"、
+# 不影响力排序。于是 V10 "LLM 不做主力"的诚实默认被实质推翻，
+# 而界面上还按旧口径叙事。
+#
+# 更严重的后果（M3 H1）：**它让"LLM 到底行不行"永久不可测**。
+# 唯一能评估 LLM 的对照臂 `battle.llm_arm_report` 需要同期的非 LLM 票作分母，
+# 而偏置把非 LLM 票全挤掉了 → `n_pairs` 恒为 0。
+#
+# ## 为什么做成可配置且默认为 0
+#
+# 默认 0 = 各族用**同一公式**排行，对照实验重新变得可能。
+# 保留配置项是为了：若确实想跑"LLM 优先"的实验，可以显式设置并留下痕迹，
+# 而不是把它写死在代码里、让所有人默默承受。
+#
+# 注意：置信度本身是**结构分，不是中奖概率**（UI 文案已声明）。
+# 这里调整的只是"谁排在前面"，不改变任何号码的概率。
+LLM_CONF_BIAS = float(os.environ.get("LOTT_LLM_CONF_BIAS", "0"))
+#: 其它族（stat/ml/blend）的偏置，默认 0（与 LLM 族同一起跑线）
+OTHER_CONF_BIAS = float(os.environ.get("LOTT_OTHER_CONF_BIAS", "0"))
 # LOTT_METHODS（逗号/空格分隔，未设置 = 全部启用）：可关闭/保留任意方法通道
 # （stat 各基线 / ML / LLM / uniform），令牌可写全名（stat:freq）或族名（stat）。
 # LOTT_METHOD_MODE：production（默认，严格按开关过滤）/ research（忽略开关、全部启用，

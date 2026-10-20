@@ -2473,12 +2473,28 @@ def predict_next(draws: List[Dict], use_llm: Optional[bool] = None,
         if key in seen:
             continue
         seen.add(key)
+        # ------------------------------------------------------------------
+        # 候选置信度（P5′：M3 §8.3 H1 修复）
+        # ------------------------------------------------------------------
+        #
+        # 历史实现给 LLM 族恒定 **+20** 的偏置（外加 0.45 vs 0.25 的斜率），
+        # 于是 LLM 注**必然**排在候选池最前 —— 而排序纯按 confidence 降序。
+        # 实测某期 25 注里 24 注来自 LLM，尽管 `llm_output_mode="off"`。
+        #
+        # 危害不是"排序偏好"这么轻，而是**让「LLM 行不行」永久不可测**：
+        # 唯一能评估它的对照臂 `battle.llm_arm_report` 需要同期的非 LLM 票作分母，
+        # 偏置把非 LLM 票全挤掉 → `n_pairs` 恒为 0 → 永远得不到结论。
+        #
+        # 现在：两族**同一基准**（`LLM_CONF_BIAS` / `OTHER_CONF_BIAS` 默认都是 0），
+        # 形状上的差异（LLM 有自评项）保留 —— 那是族内信息，不是族间偏袒。
+        #
+        # ⚠️ 置信度是**结构分，不是中奖概率**。这里改的只是"谁排在前面"，
+        # 不改变任何号码出现的概率（LEAD_VERDICT §8.1）。
+        em = ensemble_mass(red_blend, blue_blend, t["reds"], t["blue"])
         if t["method"].startswith("llm:"):
-            em = ensemble_mass(red_blend, blue_blend, t["reds"], t["blue"])
-            conf = round(20 + 0.45 * (0.5 * t.get("confidence", 50) + 0.5 * em), 1)
+            conf = round(config.LLM_CONF_BIAS + 0.45 * (0.5 * t.get("confidence", 50) + 0.5 * em), 1)
         else:
-            em = ensemble_mass(red_blend, blue_blend, t["reds"], t["blue"])
-            conf = round(10 + 0.25 * em, 1)
+            conf = round(config.OTHER_CONF_BIAS + 0.25 * em, 1)
         t["confidence"] = min(100.0, max(1.0, conf))
         scored.append(t)
 
