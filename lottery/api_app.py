@@ -25,6 +25,7 @@ class _NoCacheStaticFiles(StaticFiles):
 from . import config, data_fetcher, db
 from . import auth_api
 from . import user_llm_api
+from . import routes_llm
 from . import migrations
 from . import features as F, diagnose as D, mining as M
 
@@ -198,6 +199,8 @@ def _unauthorized_bearer() -> JSONResponse:
 app.include_router(auth_api.router)
 # W08a：按用户隔离的 LLM 配置（当前归属规则见 user_llm_api 模块 docstring）
 app.include_router(user_llm_api.router)
+# P2：按域切分的路由模块。api_app 只负责组装（建 app / 中间件 / include / 静态）。
+app.include_router(routes_llm.router)
 
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
@@ -907,84 +910,6 @@ def predictions_history(limit: int = Query(50, ge=1, le=200)):
             out.append({"issue": issue, "predictions": preds})
     return out
 
-
-
-# ---------- LLM 配置管理（前台「设置」页，写入 data/llm_config.json） ----------
-
-@app.get("/api/config/llm")
-def get_llm_config():
-    """全局默认通道（管理员专用）。P2：实现已搬到 `llm_config_store.read()`。"""
-    from . import llm_config_store
-    return llm_config_store.read()
-
-
-@app.post("/api/config/llm")
-def update_llm_config(payload: dict):
-    """保存全局默认通道（管理员专用）。P2：实现已搬到 `llm_config_store.save()`。
-
-    保留这个薄壳的原因：`user_llm_api` 与既有测试都按这个名字调用，
-    名字是契约，实现位置不是。
-    """
-    from . import llm_config_store
-    return llm_config_store.save(payload)
-
-
-@app.post("/api/llm/test")
-def test_llm_connection():
-    """用当前配置做一次**贴合真实预测**的结构化出文探测。
-
-    只回一句「连接成功」的轻量 ping 会掩盖真实故障：推理型模型在小请求下能出文，
-    而预测用的长提示会把整个 max_tokens 预算耗在 reasoning_content 上（content
-    为空），于是出现「测试成功、生成失败」。这里直接复用观察轮的真实提示与同一套
-    预算自适应逻辑，并回报实际使用的输出预算与耗时。
-    """
-    from . import config, llm_client
-    import time
-    from .llm_client import LLMChannelError
-    if config.LLM_DISABLED:
-        return {"ok": False, "error": "LLM 已停用（在设置中启用后重试）"}
-    cfgs = config.llm_model_list()
-    if not cfgs:
-        return {"ok": False, "error": "LLM 未配置（请先填写 API 地址 / Key / 模型并保存）"}
-    cfg = cfgs[0]
-    # 尽量用真实观察轮提示（数据不足时退化为一个小型 JSON 自检）
-    user_prompt = '请只输出 JSON：{"ok": true, "note": "结构化输出自检"}'
-    realistic = False
-    try:
-        from . import engine as E
-        draws = db.load_draws()
-        if len(draws) >= 60:
-            stats = F.compute_features(draws)
-            ctx = E.build_context(draws, stats, db.load_patterns())
-            user_prompt = llm_client.observations_prompt(
-                llm_client.compact_stats(ctx["stats"]), ctx["recent"], ctx["patterns"])
-            realistic = True
-    except Exception as e:  # noqa: BLE001
-        print(f"[llm] 测试探测构建真实提示失败，退化为自检提示: {e}")
-    t0 = time.time()
-    try:
-        res = llm_client.chat_json(
-            llm_client.SYSTEM_BASE, user_prompt, max_tokens=1600, temperature=0.0,
-            timeout=config.LLM_TIMEOUT, model_cfg=cfg, strict=True,
-            deadline=time.time() + max(60.0, config.LLM_TOTAL_TIMEOUT))
-    except LLMChannelError as e:
-        return {"ok": False, "model": cfg.get("model"), "realistic": realistic,
-                "time_ms": int((time.time() - t0) * 1000), "error": str(e),
-                "hint": ("若提示「只返回推理内容」，说明该模型把输出预算全花在 reasoning 上："
-                         f"可调大 LOTT_LLM_MAX_TOKENS（当前 {config.LLM_MAX_TOKENS}），"
-                         "或改用不这样做的模型（例如 discovery-api-intern-ai-org/deepseek-v4-flash-0731）")}
-    dt_ms = int((time.time() - t0) * 1000)
-    learned = llm_client.learned_max_tokens(cfg["base_url"], cfg["model"])
-    if not res:
-        return {"ok": False, "model": cfg.get("model"), "realistic": realistic,
-                "time_ms": dt_ms,
-                "error": "模型有返回但无法解析为 JSON（请检查模型是否遵循 JSON 输出要求）"}
-    keys = list(res.keys())[:6] if isinstance(res, dict) else []
-    return {"ok": True, "model": cfg.get("model"), "realistic": realistic,
-            "time_ms": dt_ms, "max_tokens": learned or 1600,
-            "reasoning_model": bool(learned and learned > 1600),
-            "json_keys": keys,
-            "reply": json.dumps(res, ensure_ascii=False)[:160]}
 
 
 # ---------- M4.2 方法 A/B 开关（Web 设置页配置，写入 data/methods_config.json） ----------

@@ -128,11 +128,37 @@ def _auto_isolate_lottery_paths(request):
     于是那个常量**永远不会被真正验证**——"有测试"变成"有测试文件"。
     默认关闭，避免污染常规回归（隔离本身是为修"字母序巧合全绿"才加的）。
     """
+    # **登录限流桶是进程级全局状态**，必须在每个用例之间清空。
+    #
+    # 背景（本轮实测）：`auth._RATE` 是模块级 dict，跨用例累积。
+    # `test_mu2_tenancy` 每个用例登录 2 次，跑几个就把
+    # `LOGIN_RATE_MAX_PER_IP=10` 的桶灌满 → **排在后面的 test_mu1_auth 全部 429**。
+    # 表现为"某个文件单独跑全绿、和另一个文件一起跑就红"，极难排查。
+    #
+    # 曾经只在 test_w08_user_llm_api 的 fixture 里 reset 过一次 —— 那是**局部修复**，
+    # 只保护了当次踩坑的那一个文件。放在 autouse 里才是全局解决：
+    # 任何文件、任何顺序都不会互相影响。
+    try:
+        from lottery import auth
+        auth.reset_rate_limits()
+    except Exception:      # noqa: BLE001 —— 尚未 import 到也无妨
+        pass
+
     if _os.environ.get("LOTT_TEST_REAL_DB") == "1":
         yield None
+        try:
+            from lottery import auth as _a
+            _a.reset_rate_limits()
+        except Exception:  # noqa: BLE001
+            pass
         return
     request.getfixturevalue("isolated_env")
     yield None
+    try:
+        from lottery import auth as _a
+        _a.reset_rate_limits()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 @pytest.fixture

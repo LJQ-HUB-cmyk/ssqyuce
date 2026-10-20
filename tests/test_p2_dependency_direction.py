@@ -137,10 +137,43 @@ def test_stub_points_match_real_dependency_sources():
 
 
 def test_llm_config_endpoints_delegate_to_store():
-    """`/api/config/llm` 的实现应在 `llm_config_store`，api_app 只留薄壳。"""
-    text = (LOTTERY / "api_app.py").read_text(encoding="utf-8")
-    assert "llm_config_store" in text
-    # 具体验证：update_llm_config 的函数体里应调用 store.save
+    """`/api/config/llm` 的实现应在 `llm_config_store`，路由层只留薄壳。
+
+    P2 第二步后，端点本体已搬进 `routes_llm.py`，所以这里检查的是路由模块。
+    """
+    candidates = [LOTTERY / "routes_llm.py", LOTTERY / "api_app.py"]
+    holder = None
+    for p in candidates:
+        if p.exists() and "def update_llm_config(" in p.read_text(encoding="utf-8"):
+            holder = p
+            break
+    assert holder is not None, "找不到 update_llm_config 的定义处"
+    text = holder.read_text(encoding="utf-8")
     seg = text[text.index("def update_llm_config("):]
-    seg = seg[:seg.index("@app.")] if "@app." in seg else seg
-    assert "llm_config_store.save" in seg
+    end = seg.find("\ndef ")
+    seg = seg[:end] if end > 0 else seg
+    assert "llm_config_store.save" in seg, (
+        f"update_llm_config 在 {holder.name} 里没有委托给 llm_config_store.save")
+
+
+def test_route_modules_do_not_import_api_app():
+    """域路由模块不得 import api_app（否则切分等于白做）。"""
+    offenders = []
+    for p in sorted(LOTTERY.glob("routes_*.py")):
+        if "api_app" in _imports_of(p):
+            offenders.append(p.name)
+    assert not offenders, f"路由模块反向 import 了 api_app：{offenders}"
+
+
+def test_api_app_keeps_only_assembly_responsibilities():
+    """`api_app.py` 的角色应收缩为「组装」：顶层 `@app.` 端点数量持续下降。
+
+    这不是硬性上限，而是一条**防回滚**哨兵：P2 的目标是把端点下沉到域模块，
+    如果有人习惯性地往 api_app 里加新端点，数量会涨上去并触发提醒。
+    需要调高阈值时，请先确认新端点确实无法归入任何现有域。
+    """
+    text = (LOTTERY / "api_app.py").read_text(encoding="utf-8")
+    n = text.count("\n@app.")
+    assert n <= 71, (
+        f"api_app.py 里仍有 {n} 个端点（阈值 71）。P2 的目标是把它们下沉到 "
+        f"routes_*.py；新增端点请放进对应域模块。")
