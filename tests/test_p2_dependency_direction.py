@@ -156,6 +156,50 @@ def test_llm_config_endpoints_delegate_to_store():
         f"update_llm_config 在 {holder.name} 里没有委托给 llm_config_store.save")
 
 
+def test_route_modules_have_no_undefined_globals():
+    """**静态检查**：域模块里用到的全局名必须都有定义（import 或本模块内定义）。
+
+    这是 P2 切分时踩到的真问题：用脚本把端点块从 api_app 搬到域模块，
+    **块里用到的 `JSONResponse` 没有跟着搬**（它原本在 api_app 的顶层 import 里）。
+    3 个模块同时缺，只有 `test_m4_2_api::test_methods_config_validation` 抓到，
+    因为另外两条路径的用例没触发那个分支。
+
+    运行期才炸的 NameError 属于"分文件时最容易漏、最难预判"的一类，值得用
+    静态分析兜住：宁可让这条测试告诉我要补哪个 import，也不要等线上 500。
+    """
+    import builtins
+    missing = {}
+    for p in sorted(LOTTERY.glob("routes_*.py")):
+        tree = ast.parse(p.read_text(encoding="utf-8"))
+        defined = set(dir(builtins))
+        for n in ast.walk(tree):
+            if isinstance(n, ast.ImportFrom):
+                for a in n.names:
+                    defined.add(a.asname or a.name)
+            elif isinstance(n, ast.Import):
+                for a in n.names:
+                    defined.add((a.asname or a.name).split(".")[0])
+            elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                defined.add(n.name)
+            elif isinstance(n, ast.Assign):
+                for t in n.targets:
+                    if isinstance(t, ast.Name):
+                        defined.add(t.id)
+            elif isinstance(n, ast.arg):
+                defined.add(n.arg)
+            elif isinstance(n, ast.ExceptHandler) and n.name:
+                defined.add(n.name)      # `except Exception as e:`
+            elif isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                defined.add(n.id)
+        used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+        bad = sorted(used - defined)
+        if bad:
+            missing[p.name] = bad
+    assert not missing, (
+        "这些域模块用到了未定义的名字（切分时漏搬 import）：\n" +
+        "\n".join(f"  {k}: {v}" for k, v in missing.items()))
+
+
 def test_route_modules_do_not_import_api_app():
     """域路由模块不得 import api_app（否则切分等于白做）。"""
     offenders = []
