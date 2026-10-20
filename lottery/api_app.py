@@ -402,10 +402,21 @@ def _scheduler_loop():
 
 # ---------- 闲时挖掘常驻循环（可选，LOTT_IDLE_MINING=1） ----------
 
-#: 两轮挖掘之间的间隔（秒）。20 分钟一轮、每轮默认 200 个候选，
-#: 124 维度全部走完约需一轮多的量级 —— 也就是「一天内细水长流跑完」
-#: 而不是「一次占满 CPU 跑几小时」。
-IDLE_MINING_INTERVAL = 1200
+#: 两轮挖掘之间的间隔（秒）。可用 `LOTT_IDLE_INTERVAL` 覆盖。
+#:
+#: 调参依据（2026-10-20 实测）：单候选墙钟约 100 ms（全史 3216 期 + 限流）。
+#: 空间总量 72656 个，纯计算约 2.0 小时。用户给定「3 天观察窗口」，
+#: 要让 3 天覆盖全部空间，每轮的吞吐只要满足 72656 / 259200s ≈ 0.28 候选/秒即可。
+#:
+#: 默认 40 候选/轮 × 300 秒间隔 ≈ 0.133 候选/秒 → 3 天约 34 600 个（覆盖 48%）。
+#: 要 3 天全覆盖则设 `LOTT_IDLE_INTERVAL=120`（40 候选/120s ≈ 0.33 候选/秒）。
+#: CPU 侧不受影响：限流按真实 CPU 时间闭环控制，间隔只决定「多久启动下一批」。
+IDLE_MINING_INTERVAL = int(os.environ.get("LOTT_IDLE_INTERVAL", "300") or "300")
+
+#: 每轮判定的候选上限。可用 `LOTT_IDLE_BUDGET` 覆盖。
+#: 轮要小、轮要多 —— 这样断点更细（中断损失小），也让 CPU 占空比更平稳，
+#: 优于「一次跑几小时」把机器吃得忽高忽低。
+IDLE_MINING_BUDGET = int(os.environ.get("LOTT_IDLE_BUDGET", "40") or "40")
 
 
 def _idle_mining_step() -> dict:
@@ -419,7 +430,7 @@ def _idle_mining_step() -> dict:
     from . import idle_mining
     if not idle_mining.enabled():
         return {"ok": False, "reason": "idle_mining_disabled"}
-    return idle_mining.run_once()
+    return idle_mining.run_once(budget_candidates=IDLE_MINING_BUDGET)
 
 
 def _idle_mining_loop():

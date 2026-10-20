@@ -150,7 +150,8 @@ def test_idle_mining_step_calls_run_once_when_enabled(idle_env, monkeypatch):
     r = api_app._idle_mining_step()
     assert r["ok"] is True
     assert called is not None            # 证明 run_once 被真正调用
-    assert "budget_candidates" not in called  # 用默认预算，不越权改参
+    # 预算由 LOTT_IDLE_BUDGET 控制（轮要小、轮要多：断点细、CPU 平稳）
+    assert called.get("budget_candidates") == api_app.IDLE_MINING_BUDGET
 
 
 def test_idle_mining_step_noop_when_disabled(idle_env, monkeypatch):
@@ -196,3 +197,78 @@ def test_idle_mining_independent_of_scheduler_switch(idle_env, monkeypatch):
     # 接线代码读的是 LOTT_IDLE_MINING，不是 config.SCHEDULER_ENABLED
     src = __import__("inspect").getsource(api_app._idle_mining_loop)
     assert "LOTT_IDLE_MINING" not in src        # 门控在模块级，不在循环里
+
+
+# ---------- CPU 限流（用户硬约束：整机 ≤60%） ----------
+
+def test_cpu_limit_defaults_to_60pct():
+    """用户约束：本 VPS 4 核，闲时挖掘整机占用不得超过 60%。"""
+    assert idle_mining.CPU_LIMIT_PCT == pytest.approx(60.0)
+
+
+def test_throttle_sleeps_longer_for_more_cpu_used(idle_env, monkeypatch):
+    """占空比闭环：本批用的 CPU 越多，应休眠越久（否则会超限额）。"""
+    slept = []
+    monkeypatch.setattr(idle_mining.time, "sleep", lambda s: slept.append(s))
+    monkeypatch.setattr(idle_mining, "_system_cpu_pct", lambda: 5.0)
+    monkeypatch.setattr(idle_mining, "_online_pressure", lambda: False)
+
+    idle_mining._throttle(0.1)
+    idle_mining._throttle(0.5)
+    assert len(slept) == 2
+    assert slept[1] > slept[0], "CPU 用得多时睡得应更久"
+
+
+def test_throttle_formula_matches_duty_cycle(idle_env, monkeypatch):
+    """验证数学：t_sleep ≥ t_work·(1-r)/r，r=0.60 ⇒ sleep ≥ 0.667·work。"""
+    slept = []
+    monkeypatch.setattr(idle_mining.time, "sleep", lambda s: slept.append(s))
+    monkeypatch.setattr(idle_mining, "_system_cpu_pct", lambda: None)  # 读不到就只用基础公式
+    monkeypatch.setattr(idle_mining, "_online_pressure", lambda: False)
+    idle_mining._throttle(1.0)
+    assert slept[0] >= 1.0 * (1 - 0.60) / 0.60 - 1e-9
+
+
+def test_throttle_backs_off_when_system_already_at_limit(idle_env, monkeypatch):
+    """整机已达/超 60% 时，本批应让路（长休眠），绝不硬挤。"""
+    slept = []
+    monkeypatch.setattr(idle_mining.time, "sleep", lambda s: slept.append(s))
+    monkeypatch.setattr(idle_mining, "_system_cpu_pct", lambda: 85.0)  # 已超限额
+    idle_mining._throttle(0.3)
+    assert slept and slept[0] >= idle_mining.CPU_SAMPLE_WINDOW, "超限额时应当让路"
+
+
+def test_throttle_never_sleeps_absurdly_long(idle_env, monkeypatch):
+    """休眠有上限：否则 3 天观察窗口会被无意义的长眠吃掉。"""
+    slept = []
+    monkeypatch.setattr(idle_mining.time, "sleep", lambda s: slept.append(s))
+    monkeypatch.setattr(idle_mining, "_system_cpu_pct", lambda: 1.0)
+    monkeypatch.setattr(idle_mining, "_online_pressure", lambda: True)
+    idle_mining._throttle(100.0)
+    assert slept[0] <= 30.0
+
+
+# ---------- 分层 e-BH（D2） ----------
+
+def test_ebh_stays_local_to_its_layer(idle_env, monkeypatch):
+    """交叉层用**单组** m，不是全局 72 656 —— 否则阈值 1 447 000 等于放弃该层。"""
+    cands = {
+        'cross|0|hot:{"window":10,"k":5}|cold:{"window":10,"k":5}':
+            {"e_value": 5000.0},
+        'cross|0|hot:{"window":10,"k":6}|cold:{"window":10,"k":5}':
+            {"e_value": 3000.0},
+        'single|hot|{"window":10,"k":5}': {"e_value": 800.0},
+    }
+    got = idle_mining._recompute_usable(cands, n_checked=72656)
+    # 交叉组 m≈135 ⇒ k=1 阈值 2700，e=5000 应通过；3000 也过
+    assert any(k.startswith('cross|0|hot') for k in got), "交叉层在本层 m 下应当有候选通过"
+    for k, v in got.items():
+        assert v.get("ebh_threshold_k1", 1) < 20000, "阈值不应被全局 m 抬死"
+
+
+def test_ebh_zero_when_nothing_exceeds_local_threshold(idle_env):
+    """弱证据在本层阈值下仍然不通过（不报假规律的底线）。"""
+    cands = {'single|hot|{"window":10,"k":5}': {"e_value": 25.0}}
+    got = idle_mining._recompute_usable(cands, n_checked=306)
+    # 单因子层 m≈306 ⇒ 阈值 6120；e=25 差太远
+    assert got == {}

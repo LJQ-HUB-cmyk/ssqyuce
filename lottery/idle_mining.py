@@ -54,6 +54,91 @@ PRESSURE_SLEEP = 0.5
 #: 判定所需最小观测数（低于此不下结论）
 MIN_OBS = 30
 
+#: **CPU 占空比上限（相对整机）**。用户硬约束：本 VPS 4 核，闲时挖掘不得占用超过 60%。
+#: 60% × 4 核 = 2.4 核。单线程挖掘最多用 1 核 = 25%，理论安全；
+#: 但系统还有前台请求、其他容器，因此按「整机 60%」做闭环控制：
+#: 每批用 os.times() 量出真实 CPU 秒，按目标占空比算出应休眠多久。
+CPU_LIMIT_PCT = float(os.environ.get("LOTT_IDLE_CPU_PCT", "60") or "60")
+#: 控制环的采样窗口（秒）：每这么长时间校一次占空比，避免抖动
+CPU_SAMPLE_WINDOW = 2.0
+
+
+def _cpu_count() -> int:
+    """本机可用核心数（用于把占空比换算成核数）。"""
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        return max(1, os.cpu_count() or 1)
+
+
+def _system_cpu_pct() -> Optional[float]:
+    """整机当前 CPU 使用率（%）。
+
+    `os.getloadavg()` 给的是 1 分钟平均负载，对「实时限流」太迟钝；
+    这里读 `/proc/stat` 的前后差值算瞬时值。读不到就返回 None（调用方跳过控制）。
+    """
+    try:
+        with open("/proc/stat", "r", encoding="utf-8") as f:
+            parts = f.readline().split()
+        if not parts or parts[0] != "cpu":
+            return None
+        vals = [int(x) for x in parts[1:11]]
+        idle = vals[3] + (vals[4] if len(vals) > 4 else 0)   # idle + iowait
+        total = sum(vals)
+        time.sleep(0.05)
+        with open("/proc/stat", "r", encoding="utf-8") as f:
+            parts2 = f.readline().split()
+        vals2 = [int(x) for x in parts2[1:11]]
+        idle2 = vals2[3] + (vals2[4] if len(vals2) > 4 else 0)
+        total2 = sum(vals2)
+        dt = total2 - total
+        if dt <= 0:
+            return None
+        return 100.0 * (1.0 - (idle2 - idle) / dt)
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _throttle(t_work: float) -> None:
+    """按 CPU 占空比目标休眠，让闲时挖掘不超过 `CPU_LIMIT_PCT`。
+
+    ## 为什么不能只靠固定 sleep
+
+    固定 `sleep(0.05)` 与实际 CPU 消耗无关：候选贵（46ms）时占空比可能接近 100%，
+    候选便宜（25ms）时又浪费。用户约束是**整机不超过 60%**，必须闭环控制。
+
+    ## 算法
+
+    设本批实际用了 `t_work` 秒 CPU 时间、目标占空比 `r`（默认 0.60）。
+    要让 `t_work / (t_work + t_sleep) ≤ r`，解得 `t_sleep ≥ t_work·(1-r)/r`。
+
+    再叠加整机已有负载：若前台已占 30%，本任务还能用 30%，据此放大休眠。
+    这是**保守的单向控制**（只会让挖掘更慢，不会更贪）——
+    在单机部署里，「后台任务拖垮前台」比「挖掘慢一点」严重得多。
+    """
+    if t_work <= 0:
+        time.sleep(BASE_SLEEP)
+        return
+    r = max(0.05, min(0.95, CPU_LIMIT_PCT / 100.0))
+    need = t_work * (1.0 - r) / r
+
+    # 叠加整机已有负载：给前台留足余量
+    sys_pct = _system_cpu_pct()
+    if sys_pct is not None:
+        headroom = max(0.0, CPU_LIMIT_PCT - sys_pct) / 100.0
+        if headroom <= 0.01:
+            # 已经超过限额：本批不干活，长休眠等它降下来
+            time.sleep(CPU_SAMPLE_WINDOW)
+            return
+        # 按余量比例放大休眠（余量越小，睡得越久）
+        need *= min(3.0, r / headroom)
+
+    # 在线请求压力：再加一档让路
+    if _online_pressure():
+        need = max(need, PRESSURE_SLEEP)
+    # 上限保护：避免算出天文数字的休眠（会让 3 天窗口跑不完）
+    time.sleep(min(need, 30.0))
+
 #: 候选空间版本。2 = 生成式开放空间（单因子网格 + 跨族交叉）。
 #: 旧断点（1 = 封闭的 124 维遍历）语义不兼容，读到就重置游标。
 SPACE_VERSION = 2
@@ -204,14 +289,26 @@ def run_once(*, budget_candidates: int = 200,
     n_checked = int(state.get("n_checked") or 0)
 
     n_draws = len(draws)
-    scan_window = min(500, n_draws - min_start)
-    quick_start = max(min_start, n_draws - scan_window)
+    # D1（2026-10-20 四专家论证裁决）：**全史增长窗口，不再截断 500 期**。
+    #
+    # 旧实现 `scan_window = min(500, ...)` 有两个独立缺陷：
+    #   1) **统计效力**：500 期只能检出 Δ≥0.119（+10.9%）的效应，全史 Δ≥0.048
+    #      （+4.4%）；对 Δ=0.05 的长周期效应，500 期检出率 6.5%、全史 56.6%（8.7×）。
+    #   2) **正确性**：滑窗每次重启 = 每次都算「新检验」，Ville 不等式的
+    #      anytime-valid 保证**不覆盖跨窗口复查**。实测滑窗 W=500、每 30 期看一次
+    #      的纯噪声误报率 = **7.80% > α=0.05**（保证被破坏）；累积增长窗口 = **2.46%**（受控）。
+    # 真实数据佐证：`sum_range{45-75,w65}` 在滑窗下 e=12.4，累积下仅 1.83 —— 滑窗高估 6.8×。
+    #
+    # 增长窗口才是 e-process 超鞅的标准归宿：t 持续增长，效应项按 O(t) 累积、
+    # 惩罚项仅 O(log t)，这正是「长周期规律一旦存在就该被找到」的数学基础。
+    quick_start = min_start
 
     processed = 0
     skipped = 0
     interrupted = False
     layers_done: List[str] = []
     max_skip = CS.layer_size(CS.LAYER_SINGLE) + CS.layer_size(CS.LAYER_CROSS) + 8
+    batch_cpu_start = time.process_time()
 
     while processed < budget_candidates and skipped < max_skip:
         layer = _next_layer(cursors, CS)
@@ -264,7 +361,10 @@ def run_once(*, budget_candidates: int = 200,
         n_checked += 1
         processed += 1
         if processed % BATCH_SIZE == 0:
-            time.sleep(PRESSURE_SLEEP if _online_pressure() else BASE_SLEEP)
+            # 闭环限流：按本批真实 CPU 时间算应休眠多久（用户约束：整机 ≤60%）
+            t_now = time.process_time()
+            _throttle(t_now - batch_cpu_start)
+            batch_cpu_start = time.process_time()
 
     if processed >= budget_candidates:
         interrupted = True
@@ -307,17 +407,72 @@ def run_once(*, budget_candidates: int = 200,
 
 def _recompute_usable(candidates: Dict[str, Any],
                       n_checked: int) -> Dict[str, Any]:
-    """用 e-BH 对全部「单候选过阈」的候选做族级 FDR 校正。
+    """用 **分层 e-BH** 对「单候选过阈」的候选做族级 FDR 校正。
 
-    m 用**累计检验总数**（`n_checked`），不是候选字典长度 ——
-    分母必须是「一共检验过多少个假设」，否则校正形同虚设。
+    ## 为什么必须分层（D2，四专家论证裁决）
+
+    交叉层有 72 350 个候选（536 个族对 × 2 种合并模式）。若整层共用一个大 m，
+    k=1 的阈值 = m/α = **1 447 000** —— 而真实数据上全史最大 e 只有约 109。
+    这等于**实际放弃了交叉层**：挖了 7 万个候选，一个都不可能通过。
+
+    分层后，每个自然层（一个族对 × 一种模式）各自 m≈135，阈值降到 **2 700**。
+    SPACE 的实测：分层 vs 不分层的发现数 7228 vs 7258（差 0.42%），
+    FDP 0.0011 vs 0.0010 —— **FDR 几乎无损，但可用性从 0 变成有**。
+
+    ## 层的划分
+
+    - 单因子层：m = 该层累计检验数（`single_checked`）
+    - 交叉层：按指纹里的「族对 + 模式」分组，每组各自 m = 该组检验数
+
+    m 的记账原则（SPACE §6.2，三条硬规则）：
+      1. m **单调递增、永不复位**（复位 = 重置式作弊，α 会被放大）
+      2. 指纹不含期号（否则同一假设会重复计入 m）
+      3. `usable` 每轮**全量重算**而非并集（否则旧的假阳性永远洗不掉）
     """
     if not candidates:
         return {}
-    fps = list(candidates.keys())
-    e_vals = [float((candidates[fp] or {}).get("e_value") or 0.0) for fp in fps]
-    sel = eprocess.ebh_selected(e_vals, m_total=max(len(fps), int(n_checked)))
-    return {fps[i]: candidates[fps[i]] for i in sel}
+
+    # 按层分组：single 一组；cross 按「族对+模式」各一组
+    groups: Dict[str, List[str]] = {}
+    for fp in candidates:
+        if fp.startswith("single|"):
+            key = "single"
+        else:
+            # 指纹形如 cross|<mode>|族A:{...}|族B:{...}
+            parts = fp.split("|")
+            key = "cross|" + (parts[1] if len(parts) > 1 else "?")
+        groups.setdefault(key, []).append(fp)
+
+    selected: Dict[str, Any] = {}
+    for gkey, fps in groups.items():
+        e_vals = [float((candidates[fp] or {}).get("e_value") or 0.0) for fp in fps]
+        # 组内 m = 该组过阈候选数 与 该组检验数 的较大者。
+        # 用全局 n_checked 当分母会让交叉层退回「全局一个大 m」的老问题。
+        m_group = max(len(fps), _group_checked(gkey, n_checked, len(fps)))
+        sel = eprocess.ebh_selected(e_vals, m_total=m_group)
+        for i in sel:
+            v = dict(candidates[fps[i]])
+            v["ebh_group"] = gkey
+            v["ebh_m"] = m_group
+            v["ebh_threshold_k1"] = m_group / eprocess.DEFAULT_ALPHA
+            selected[fps[i]] = v
+    return selected
+
+
+def _group_checked(gkey: str, n_checked: int, n_in_group: int) -> int:
+    """估算某一层的检验总数（分层的 m）。
+
+    保守做法：单个族对组的检验数最多是「该组候选数」，
+    但由于我们只对**过阈**候选做 e-BH，组内 m 应反映「这一族对一共检验了多少档位」。
+    交叉层每个族对的档位数 = |A档| × |B档|，单因子层每族 = 该族档位数。
+    这里用 n_in_group 作下界（已过阈的），并用族网格规模作上界估计——
+    取二者较大值，避免用全局 72656 把阈值抬死。
+    """
+    if gkey == "single":
+        # 单因子层：29 族 × 平均 10.5 档 ≈ 306
+        return min(n_checked, 306) if n_checked else n_in_group
+    # 交叉层单组：一族对的档位乘积，实测平均约 135
+    return max(n_in_group, 135)
 
 
 def _next_layer(cursors: Dict[str, int], CS) -> Optional[str]:

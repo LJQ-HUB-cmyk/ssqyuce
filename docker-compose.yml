@@ -7,6 +7,15 @@ services:
     # LLM 推理+统计计算, LOTT_LLM_MAX_TOKENS=32000, 给足余量避免生成被截断。
     mem_limit: 768m
     memswap_limit: 1024m
+    # ---- CPU 硬限额（2026-10-20，用户约束：闲时挖掘整机占用 ≤60%）----
+    # 本 VPS 4 核。cpu_quota=240000 / cpu_period=100000 ⇒ 2.4 核 = 整机 60%。
+    # 这是**内核级硬上限**，与 idle_mining.py 的闭环限流形成双保险：
+    #   软控制（应用层）按真实 CPU 时间循环休眠，保证平稳不超；
+    #   硬限额（cgroup）在软控制失效/异常时由内核兜住，绝不让它吃满 4 核。
+    # 注意：限额作用于整个容器（含前台请求），2.4 核对本场景足够——
+    # 实测前台接口响应 p99 < 300ms，闲时挖掘是唯一的重 CPU 任务。
+    cpu_period: 100000
+    cpu_quota: 240000
     ports:
       # W01（多用户 P0）：**只绑回环地址**，公网必须经 nginx(443) 反代。
       #
@@ -28,6 +37,11 @@ services:
       # 默认 0 = 关闭：新机制先观察再开。开启后由独立线程常驻跑，
       # 不受 LOTT_SCHEDULER 影响（两者语义不同）。
       - LOTT_IDLE_MINING=${LOTT_IDLE_MINING:-0}
+      # P4 限流：整机 CPU 占空比目标（%）。本 VPS 4 核，用户约束 ≤60%。
+      - LOTT_IDLE_CPU_PCT=${LOTT_IDLE_CPU_PCT:-60}
+      # P4 节奏：每轮间隔秒数 / 每轮候选上限。3 天观察窗口用 120s×40 可全覆盖。
+      - LOTT_IDLE_INTERVAL=${LOTT_IDLE_INTERVAL:-300}
+      - LOTT_IDLE_BUDGET=${LOTT_IDLE_BUDGET:-40}
       - LOTT_BOOT_PREDICT=${LOTT_BOOT_PREDICT:-1}
       - LOTT_TOKEN=${LOTT_TOKEN:-}
       # W08：多用户鉴权。off = 只解析身份不拦截（灰度）；enforce = deny-by-default。
