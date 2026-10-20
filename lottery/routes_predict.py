@@ -82,8 +82,13 @@ def _strict_mode_reject_response(draws, issue):
     不允许用旧缓存绕过门控（2026-10-18 顺序缺陷修复）。
 
     两条硬性校验（任一不满足即拒绝，绝不静默降级到统计基线）：
-      ① 可用规律（counts.usable）必须 > 0；
+      ① **可回放的可用规律**（counts.usable_replayable）必须 > 0；
       ② LLM 出号通道必须可用（llm_can_pick=True）。
+
+    ① 的口径（P3 / M3 §7）：从"有可用规律"收紧为"有**可回放**的可用规律"。
+    理由：严格模式的语义是「没有真凭实据就不出号」，而不可回放的规律
+    无法被独立复核 —— 把它当依据等于用不可验证的东西做不可验证的承诺。
+    当前该值为 0 时系统会**不出号**，这正是用户要的语义且理由是真实的。
     """
     from . import methods as _METH
     _errs = []
@@ -125,6 +130,28 @@ def _strict_mode_reject_response(draws, issue):
               f"历史数据不足或异常）。注意：L2 可用只说明形态约束成立，"
               f"**不代表**存在可预测下期的规律。请确认历史数据齐全，"
               f"或关闭严格模式（LOTT_STRICT_MODE=0）。")))
+
+    # ①-b P3：可回放的可用规律必须 > 0
+    #
+    # 注意这里**不**用 counts.usable：那个字段的语义历史上被"L1 检出"与
+    # "阶段可用"混用过（见 patterns_runtime 的注释）。usable_replayable 是
+    # 语义单一的计数：**既可用、又可被确定性代码重放**。
+    _n_replayable = None
+    try:
+        from . import patterns_runtime as _PRT
+        _snap = _PRT.load_snapshot()
+        if _snap:
+            _n_replayable = int((_snap.get("counts") or {}).get("usable_replayable") or 0)
+    except Exception:      # noqa: BLE001
+        _n_replayable = None
+    if _n_replayable is not None and _n_replayable <= 0:
+        _errs.append(
+            ("replayable_rules",
+             ("严格模式下不出号：**通过前置注册且可被确定性代码重放**的规律为 0 条。"
+              "严格模式的含义是「没有可复核的真凭实据就不出号」，"
+              "而不可回放的规律无法被独立验证，不能作为依据。"
+              "这是**正确结果**不是故障 —— 3516 期真实数据上尚未检出可复现规律。"
+              "如需出号请关闭严格模式（LOTT_STRICT_MODE=0）走纯统计通道。")))
 
     # ② LLM 通道必须可用
     _ch = _METH.resolve_channels()

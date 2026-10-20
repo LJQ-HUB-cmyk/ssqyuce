@@ -124,10 +124,13 @@ def test_strict_on_allows_when_rules_available(monkeypatch, seeded_db):
                         lambda d: {"issue": str(int(d[-1]["issue"]) + 1)})
     monkeypatch.setattr(api_app.db, "load_predictions", lambda i: [])
 
-    # 有规律
+    # 有**可回放**的可用规律（P3 起门控依据是 counts.usable_replayable，
+    # 不是 counts.usable —— 后者语义被历史混用过，见 patterns_runtime 注释）
     import lottery.patterns_runtime as PR
     monkeypatch.setattr(PR, "load_snapshot",
-                        lambda *a, **k: {"counts": {"usable": 3}}, raising=False)
+                        lambda *a, **k: {"counts": {"usable": 3,
+                                                    "usable_replayable": 3}},
+                        raising=False)
     # LLM 通道**可用**（默认 llm_can_pick=False，需显式打开才能放行 —— 这正是指令①）
     import lottery.methods as METH
     monkeypatch.setattr(METH, "resolve_channels",

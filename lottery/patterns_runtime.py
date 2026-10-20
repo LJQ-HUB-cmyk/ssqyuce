@@ -107,6 +107,7 @@ def build_snapshot(draws: Sequence[Dict], scan: Optional[Dict] = None,
     if scan is None:
         scan = discovery.discover(draws, top=12)
     rules: List[Dict] = []
+    _n_replayable_usable = 0      # P3：可回放且可用的条数（严格模式门控依据）
     # 1) 假说库（统计 + LLM 工坊注册 + 已验证结构类）
     hyps = evolution._as_hyp_list(hypothesis.load_registry())
     for h in hyps:
@@ -151,6 +152,12 @@ def build_snapshot(draws: Sequence[Dict], scan: Optional[Dict] = None,
                 and _is_replayable
             )
         usable = bool(_long_term_ok or _phase_ok)
+        # P3：单独统计「可回放且可用」的条数 —— 这是严格模式门控的正确依据。
+        # 与 `usable` 的区别：usable 已经把不可回放的 LLM 规律排除了，
+        # 但历史上 usable 的语义被「L1 检出/未检出」与「阶段可用」多次混用，
+        # 这里给出一个**语义单一**的计数供门控使用。
+        if usable and _is_replayable:
+            _n_replayable_usable += 1
         rules.append({
             "id": h.get("id"), "source": h.get("source") or "stat",
             # V12-04（裁决 R-2）：**`layer` 为必填字段**，值只能是 L1/L2/L3。
@@ -227,6 +234,8 @@ def build_snapshot(draws: Sequence[Dict], scan: Optional[Dict] = None,
         _t = str(_r.get("tier") or "monitor")
         _slot[_t] = int(_slot.get(_t, 0)) + 1
     counts = {
+        # P3：可回放且可用的条数（严格模式门控依据，语义单一）
+        "usable_replayable": _n_replayable_usable,
         # V12-04（裁决 R-2）：**拆分跨层求和**。
         #
         # 旧写法 ``"usable": _n_long + _n_phase``（注释「与旧口径兼容」）把两种
