@@ -454,7 +454,11 @@ def test_strict_mode_active_for_user_with_llm(env, monkeypatch):
     monkeypatch.setattr(config, "STRICT_MODE", True)
     user_llm_store.save(uid, {"use_custom_key": True, "base_url": "https://u.example.com/v1",
                               "model": "m", "api_key": TESTKEY})
-    monkeypatch.setattr(api_app, "current_user_id", lambda: uid)
+    # P2：`_strict_scope_for_current_user` 已搬到 `routes_predict`，它按
+    # `request_context.current_user_id()` 取名（不是在 import 时绑定），
+    # 所以打桩点就是 `request_context` 本身。
+    from lottery import request_context
+    monkeypatch.setattr(request_context, "current_user_id", lambda: uid)
     active, _ = api_app._strict_scope_for_current_user()
     assert active is True
 

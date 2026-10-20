@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 from typing import Dict, Iterable, List, Optional
 
@@ -171,38 +172,112 @@ CREATE TABLE IF NOT EXISTS mining_runs (
 );
 """
 
-_CONN: sqlite3.Connection | None = None
+# ---------------------------------------------------------------------------
+# 连接管理（P2 稳定性修复：单连接 → 每线程连接）
+# ---------------------------------------------------------------------------
+#
+# ## 修复的真实故障（2026-10-20 生产）
+#
+# `/api/auth/login` 持续 500：`sqlite3.OperationalError: database is locked`，
+# 容器重启即恢复、但会复发。根因是历史实现：
+#
+#     _CONN = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=5.0)
+#
+# **一条连接 + check_same_thread=False + 40 线程池，且没有任何锁**。
+# `check_same_thread=False` 只是关掉 Python 的跨线程检查，并没有让连接变线程安全。
+# 多线程同时向同一条连接发语句时：
+#   * 事务边界互相串（A 的 commit 提交了 B 未完成的写）；
+#   * 一个线程开着写事务没提交，另一个线程来写 → **自己等自己的锁** →
+#     `database is locked`。这是 `busy_timeout` 救不了的情形：它等的是同进程内
+#     另一条语句持有的锁，不会因为时间流逝而释放。
+#
+# ## 修法：每线程一条连接
+#
+# 这是 SQLite 官方推荐的多线程用法，也是**改动面最小**的正确解法：
+# `get_conn()` 签名不变，200+ 处调用点一行都不用改。
+#
+# WAL 模式下多连接并发是安全且高效的：读不阻塞写、写不阻塞读，
+# 写与写之间由 SQLite 自己的文件锁 + `busy_timeout` 串行化（这是跨连接的情形，
+# 与"同进程自锁"本质不同，busy_timeout 在这里**能**正常工作）。
+#
+# ## 注意事项
+#
+# * 每个线程的连接在首次调用时建立；`close()` 只关当前线程的。
+# * 进程内可能积累若干空闲连接。单机部署下数量 = 线程数（≤40），可忽略。
+# * `SCHEMA` / 迁移只在**建库时**跑一次，用进程级锁保证不会被并发重复执行。
+
+_TLS = threading.local()
+# 只在"首次建库/迁移"时用到，保证 SCHEMA + 迁移不被多个线程重复执行
+_INIT_LOCK = threading.Lock()
+_initialized = False
+
+
+def _configure(conn: sqlite3.Connection) -> None:
+    """连接级 pragma（每个连接都要设一遍）。
+
+    1) `busy_timeout=5000` —— 跨连接写冲突时**等待**而不是立刻抛错；
+    2) `journal_mode=WAL` —— 读不阻塞写、写不阻塞读。WAL 是**持久属性**
+       （写在库文件头），设一次长期生效，重复设置无害；
+    3) `synchronous=NORMAL` —— WAL 下的推荐值：崩溃安全性与 FULL 等价
+       （不丢已提交事务），但少一次 fsync。
+    """
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+
+
+def _ensure_initialized(conn: sqlite3.Connection) -> None:
+    """建表 + 迁移（幂等，进程内只真正执行一次）。"""
+    global _initialized
+    if _initialized:
+        return
+    with _INIT_LOCK:
+        if _initialized:
+            return
+        config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        conn.executescript(SCHEMA)
+        from . import migrations
+        migrations.apply(conn)
+        _ensure_columns(conn)
+        conn.commit()
+        _initialized = True
 
 
 def get_conn() -> sqlite3.Connection:
-    global _CONN
-    if _CONN is None:
-        config.DATA_DIR.mkdir(parents=True, exist_ok=True)
-        # W01（多用户 P0 部署前置）：连接建立时立刻设三个 pragma。
-        #
-        # 1) `busy_timeout=5000` —— sqlite3 默认 busy timeout 由 `timeout=` 参数决定，
-        #    这里用 PRAGMA 显式写死 5s：并发写撞锁时**等待**而不是立刻抛
-        #    `database is locked`。全站 79 个同步端点共享这一条连接（40 worker 池），
-        #    没有它时任何一次长写事务都会让其它请求直接报错。
-        # 2) `journal_mode=WAL` —— 默认 rollback journal 在写事务期间对全库加排他锁，
-        #    读请求会被阻塞；WAL 让读不阻塞写、写不阻塞读，是单进程多线程场景的正确模式。
-        #    注意：WAL 是**持久化**属性（写入库文件头），设一次即长期生效；重复设置无害。
-        #    副作用：会产生 `-wal` / `-shm` 旁文件，备份时必须一起处理（见 DEPLOY 备份说明）。
-        # 3) `synchronous=NORMAL` —— WAL 模式下的推荐值：崩溃安全性与 FULL 等价
-        #    （不会丢已提交事务），但少一次 fsync，显著降低写延迟。
-        #
-        # 三者都必须在 `executescript(SCHEMA)` **之前**设置：迁移与建表本身也要写库。
-        _CONN = sqlite3.connect(str(config.DB_PATH), check_same_thread=False, timeout=5.0)
-        _CONN.row_factory = sqlite3.Row
-        _CONN.execute("PRAGMA busy_timeout=5000")
-        _CONN.execute("PRAGMA journal_mode=WAL")
-        _CONN.execute("PRAGMA synchronous=NORMAL")
-        _CONN.executescript(SCHEMA)
-        from . import migrations
-        migrations.apply(_CONN)
-        _ensure_columns(_CONN)
-        _CONN.commit()
-    return _CONN
+    """返回**当前线程**的连接（首次调用时建立）。
+
+    签名与历史实现一致 —— 这是刻意为之：改造的是内部实现，
+    不是 200+ 处调用点。
+    """
+    conn = getattr(_TLS, "conn", None)
+    if conn is not None:
+        return conn
+    conn = sqlite3.connect(str(config.DB_PATH), timeout=5.0)
+    _configure(conn)
+    _ensure_initialized(conn)
+    _TLS.conn = conn
+    return conn
+
+
+def close():
+    """关闭**当前线程**的连接，并允许下次调用时重新初始化。
+
+    测试大量依赖它做隔离（`db.close()` 后再连临时库）。多线程下只关当前
+    线程是正确语义 —— 关别人的连接会让那个线程下一次操作炸掉。
+
+    同时重置 `_initialized`：测试会把 `config.DB_PATH` 换到新库，
+    若保留"已初始化"标记，新库就永远不会建表。
+    """
+    global _initialized
+    conn = getattr(_TLS, "conn", None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:      # noqa: BLE001 —— 已坏的连接关闭也可能抛
+            pass
+        _TLS.conn = None
+    _initialized = False
 
 
 def _ensure_columns(conn: sqlite3.Connection) -> None:
@@ -216,11 +291,6 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def close():
-    global _CONN
-    if _CONN is not None:
-        _CONN.close()
-        _CONN = None
 
 
 # ---------- draws ----------
