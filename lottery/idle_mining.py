@@ -141,25 +141,48 @@ def run_once(*, budget_candidates: int = 200,
     done_dims = set(state.get("completed_dimensions") or [])
     verdicts: Dict[str, Any] = dict(state.get("verdicts") or {})
 
-    # 维度族：用 discovery 的组合空间枚举（不自己另造一套定义）
-    try:
-        combos = discovery.enumerate_combos() if hasattr(discovery, "enumerate_combos") else []
-    except Exception:      # noqa: BLE001
-        combos = []
+    # P4-2: 枚举 discovery 的全部真实维度组合
+    combos = []
+    for f_key, fam in discovery.FAMILY_BY_KEY.items():
+        for params in fam.get("params", []):
+            try:
+                flt = discovery.make_filter(f_key, params)
+                combos.append(flt)
+            except Exception:
+                continue
 
     processed = 0
     interrupted = False
-    for combo in combos:
-        key = str(combo.get("key") if isinstance(combo, dict) else combo)
-        if key in done_dims:
-            continue                      # 续跑：跳过已完成
+    n_draws = len(draws)
+    scan_window = min(500, n_draws - min_start)
+    quick_start = max(min_start, n_draws - scan_window)
+
+    for flt in combos:
+        dim_key = f"{flt['key']}:{json.dumps(flt.get('params', {}), sort_keys=True)}"
+        if dim_key in done_dims:
+            continue                      # 续跑：跳过已完成维度
+
         if processed >= budget_candidates:
             interrupted = True
             break
-        # TODO(P4-2)：这里接真实的维度检验序列（需要 discovery 提供 as-of 逐期序列）。
-        # 当前先记录"已访问"，判定留给下一步 —— 宁可先跑通调度与断点，
-        # 也不要为了填满流程而伪造统计结论。
-        done_dims.add(key)
+
+        try:
+            # 真实计算 asof_scan 并转换为 z_scores 序列
+            scan = discovery.asof_scan(draws, flt, start=quick_start, end=n_draws)
+            obs = scan.get("obs") or []
+            exp = scan.get("exp") or []
+            if len(obs) >= MIN_OBS and len(obs) == len(exp):
+                # 红球标准差约 0.8678，蓝球方差 p*(1-p)
+                sigma = 0.8678 if flt.get("target") == "red" else 0.24
+                z_scores = [(float(o) - float(e)) / sigma for o, e in zip(obs, exp)]
+                v = judge_candidate(z_scores)
+                verdicts[dim_key] = v
+            else:
+                verdicts[dim_key] = {"decision": "underpowered", "n_obs": len(obs), "reason": "insufficient_samples"}
+        except Exception as e:
+            verdicts[dim_key] = {"decision": "error", "error": str(e)}
+
+        done_dims.add(dim_key)
         processed += 1
         if processed % BATCH_SIZE == 0:
             time.sleep(PRESSURE_SLEEP if _online_pressure() else BASE_SLEEP)

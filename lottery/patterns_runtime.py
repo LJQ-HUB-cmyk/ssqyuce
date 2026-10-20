@@ -122,14 +122,23 @@ def build_snapshot(draws: Sequence[Dict], scan: Optional[Dict] = None,
         # 三条件缺一不可：阶段持续 + A/B 通过(validated) + 前置注册通过(prereg_ok)。
         # 【关键】prereg_ok 由 hypothesis.evaluate_prereg() 在每期调度器里写；
         #         缺字段即视为 False（安全默认），否则"前置注册"就白做了。
-        # 【关键】source=="llm" 永不 usable：llm 不可回放 + 规律本不存在，
-        #         "llm 且 passed" 的集合恒为空；放行会让死锁从后门复活（V10 G1）。
-        _src = (h.get("source") or "stat")
+        # P3 改造（依据 M3 §7 判据 R1–R5）：
+        # 以前硬编码 `source != "llm"` 是因为把 LLM 的一次性文本输出当成不可回放规律。
+        # 现在改为检验可回放性 `_replay_ok(h)`：
+        #   - 非 LLM 规律保持原有路径（完全不改行为）；
+        #   - LLM 规律如果能编译为确定性可重放的规格 spec 并通过 R1-R5，则允许纳入。
+        from . import spec_replay
+        def _replay_ok(hyp: Dict) -> bool:
+            if (hyp.get("source") or "stat") != "llm":
+                return True
+            return bool(spec_replay.replayable(hyp).get("ok"))
+
+        _is_replayable = _replay_ok(h)
         _long_term_ok = (
             (status in USABLE_STATUSES)
             and h.get("status") == "validated"
             and h.get("prereg_ok") is True
-            and _src != "llm"
+            and _is_replayable
         )
         # V11 阶段可用档：默认关闭；打开后 emerging/fading 也进候选，
         # 但必须过前置注册、且 A/B 未被判负（status 不是 rejected）。
@@ -139,7 +148,7 @@ def build_snapshot(draws: Sequence[Dict], scan: Optional[Dict] = None,
                 status in PHASE_STATUSES
                 and h.get("status") in ("validated", "proposed")
                 and h.get("prereg_ok") is True
-                and _src != "llm"
+                and _is_replayable
             )
         usable = bool(_long_term_ok or _phase_ok)
         rules.append({

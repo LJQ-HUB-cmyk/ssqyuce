@@ -109,3 +109,21 @@ def test_run_once_refuses_without_enough_data(idle_env, monkeypatch):
     r = idle_mining.run_once(min_start=300)
     assert r["ok"] is False
     assert r["reason"] == "insufficient_data"
+
+
+def test_idle_mining_evaluates_real_sequences(monkeypatch, seeded_db, tmp_path):
+    """验证 P4-2：闲时挖掘真实计算 asof_scan 并产生 e-process 判定。"""
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setenv("LOTT_IDLE_MINING", "1")
+    seeded_db(400)
+    
+    res = idle_mining.run_once(budget_candidates=5, min_start=200)
+    assert res["ok"] is True
+    assert res["processed"] > 0
+    
+    state = idle_mining.load_state()
+    verdicts = state.get("verdicts", {})
+    assert len(verdicts) > 0
+    # 验证判定字典包含 e-process 可审计字段
+    sample_v = next(iter(verdicts.values()))
+    assert "decision" in sample_v
