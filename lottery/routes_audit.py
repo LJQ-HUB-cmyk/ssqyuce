@@ -26,7 +26,10 @@ from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
 
 from . import config, db
-from .bg_tasks import _bg_run
+# 不要写 `from .bg_tasks import _bg_run`：那会在本模块产生独立绑定，
+# 打桩 `api_app._bg_run` 就管不到这里（测试会静默失效 —— 本项目已踩过两次
+# 同类坑，见 tests/test_p2_dependency_direction.py 的守护测试）。
+from . import bg_tasks
 from .jsonutil import jsonable as _jsonable
 
 router = APIRouter()
@@ -133,7 +136,7 @@ async def llm_audit_run(request: Request,
         res["note_zh"] = res.get("note_zh") or "AI 核对完成"
         return res
 
-    tid = _bg_run("llm_audit", _fn)
+    tid = bg_tasks._bg_run("llm_audit", _fn)
     return {"ok": True, "task_id": tid, "post": post,
             "note_zh": "已进入后台任务，前端轮询 /api/tasks/{id}"}
 
@@ -314,7 +317,7 @@ def audit_anomaly_run(use_llm: int = Query(1, ge=0, le=1),
                                     w_seg=int(w_seg), n_perm=int(n_perm),
                                     seed=int(seed), progress=progress)
 
-    tid = _bg_run("data_audit", _work)
+    tid = bg_tasks._bg_run("data_audit", _work)
     return {"ok": True, "task_id": tid,
             "note_zh": ("数据审计已在后台运行（LLM 提名 + 确定性判定），"
                         "完成后 GET /api/audit/anomaly/latest 可读结果")}

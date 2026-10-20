@@ -207,7 +207,8 @@ def test_api_run_endpoint_uses_same_step_as_scheduler(monkeypatch):
         called["force"] = force
         return {"ok": True, "verified": 0}
 
-    monkeypatch.setattr(api_app, "_evolution_step", _step)
+    from lottery import evolution_service
+    monkeypatch.setattr(evolution_service, "_evolution_step", _step)
     client = TestClient(api_app.app)
     r = client.post("/api/evolution/run?limit=400&use_llm=0")
     assert r.status_code == 200, r.text

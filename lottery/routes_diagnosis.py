@@ -24,7 +24,10 @@ from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse
 
 from . import config, db
-from .bg_tasks import _bg_run
+# 不要写 `from .bg_tasks import _bg_run`：那会在本模块产生独立绑定，
+# 打桩 `api_app._bg_run` 就管不到这里（测试会静默失效 —— 本项目已踩过两次
+# 同类坑，见 tests/test_p2_dependency_direction.py 的守护测试）。
+from . import bg_tasks
 from .jsonutil import jsonable as _jsonable
 
 router = APIRouter()
@@ -297,7 +300,7 @@ def _kick_ml_diag_bg(draws, colors_t, max_issues, max_numbers, n_null,
                                        max_issues, max_numbers, n_null)
             _save_ml_diag_cache({"key": cache_key, "at": time.time(), "value": payload})
 
-    tid = _bg_run("ml_diagnosis", _work, on_done=_on_done)
+    tid = bg_tasks._bg_run("ml_diagnosis", _work, on_done=_on_done)
     _ML_DIAG_JOB["running"] = True
     _ML_DIAG_JOB["task_id"] = tid
     return tid

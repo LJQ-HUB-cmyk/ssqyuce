@@ -173,7 +173,9 @@ def test_async_closed_loop_endpoint_returns_task_id(monkeypatch, seeded_db):
         captured["kind"] = kind
         return "task_xyz"
 
-    monkeypatch.setattr(api_app, "_bg_run", fake_bg)
+    # P2：`_bg_run` 已搬到 `bg_tasks`，打桩点必须跟着搬到**真正的依赖源**
+    from lottery import bg_tasks
+    monkeypatch.setattr(bg_tasks, "_bg_run", fake_bg)
     r = c.post("/api/rules/closed-loop/async?rounds=1&use_llm=0")
     assert r.status_code == 200
     j = r.json()
@@ -187,7 +189,8 @@ def test_async_llm_lab_endpoint_returns_task_id(monkeypatch, seeded_db):
     from lottery import api_app
     seeded_db(600)      # V10-00b：同上，端点要求库非空
     c = TestClient(api_app.app)
-    monkeypatch.setattr(api_app, "_bg_run", lambda kind, fn, on_done=None: f"t_{kind}")
+    from lottery import bg_tasks
+    monkeypatch.setattr(bg_tasks, "_bg_run", lambda kind, fn, on_done=None: f"t_{kind}")
     r = c.post("/api/llm_lab/run/async?rounds=1&use_llm=0")
     assert r.status_code == 200 and r.json()["task_id"] == "t_llm_lab"
 
