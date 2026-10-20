@@ -55,7 +55,19 @@ def health():
         "uptime_seconds": max(0, int(__import__('time').time() - config.STARTED_AT)),
         "api_auth_enabled": bool(config.API_TOKEN),
         "recent_tasks": db.list_tasks(limit=5),
+        # P4：闲时挖掘配额与进度（V13 P4 验收要求"配额在 health 可见"）。
+        # 默认关闭，所以这里通常只显示 enabled=False —— 这是刻意暴露的，
+        # 让运维能确认"挖掘到底有没有在跑"，而不是靠猜。
+        "idle_mining": _idle_mining_status(),
     }
+
+
+def _idle_mining_status() -> dict:
+    try:
+        from . import idle_mining
+        return idle_mining.status()
+    except Exception as e:      # noqa: BLE001 —— 健康检查不能因它 500
+        return {"enabled": False, "error": f"{type(e).__name__}: {e}"}
 
 
 @router.get("/api/info")
