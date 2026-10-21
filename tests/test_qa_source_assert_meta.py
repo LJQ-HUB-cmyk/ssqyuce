@@ -67,12 +67,39 @@ A_BASELINE = 0
 #: B 类（外部文件 read_text 子串断言）的基线，按**比较数**计。
 #: 实测 2026-10-21：115 处 / 15 个文件。
 #: 改一处就下调一处 —— 基线只许降，不许升。
-B_BASELINE = 96     # 2026-10-21 16:1x 对齐：实测 96（D-18a/_js_code 合并后较原 115 减 19）
+B_BASELINE = 138    # 2026-10-21 16:4x 对齐：_classify 扩到别名追踪后实测 138
+                #   （原 96 是误设 —— _classify 未追踪 _js_code 薄别名时的可见数，
+                #     李工指出那是元守卫盲区，不是断言减少。修复后回升至 138）
+                #   教训：元守卫可见数上升=修复分类器；下降=断言被删或盲区扩大。
+                #   基线必须反映"分类器修复后"的真实，否则"不增长"防的是空气。
 
 
 def _classify(tree: ast.AST) -> dict:
-    """找出「被赋值为源码/文件文本」的变量名 → 类别。"""
-    out = {}
+    """找出「被赋值为源码/文件文本」的变量名 → 类别。
+
+    ## D-18b 漏检修复：追踪一层别名（2026-10-21）
+
+    旧实现只认**直接赋值** `inspect.getsource(fn)` / `path.read_text()`。
+    但实测 `_js_code()` 合并到 `_source_assert` 后，各测试文件的局部
+    `_js_code()` 变成了**薄别名**：内部调用 `_source_assert.js_code(APP_JS.read_text(...))`。
+
+    于是 `read_text` 不再是被断言直接使用的变量名 ⇒ 旧 `_classify` 看不到它们 ⇒
+    **元守卫漏检了那两个文件**（`test_mu2_frontend_llm` / `test_v10_channel_wiring`）。
+
+    **后果**：任何人写一个本地包装函数
+        def _my_js(): return APP_JS.read_text()
+        assert "禁止相加" in _my_js()
+    就能绕过元守卫 —— 因为 `_my_js()` 不是"直接 read_text 的变量"。
+
+    ## 修法：分两步收集
+
+    1. **文本源**：被赋值为 `getsource`/`read_text` 的变量；
+    2. **别名**：被赋值为「返回文本的函数调用」的变量。
+
+    返回文本的函数 = 函数体里 `return` 了 文本源 或 调用（递归一层）。
+    """
+    sources = {}
+    # 第一遍：找直接文本源
     for node in ast.walk(tree):
         if not isinstance(node, (ast.Assign, ast.AnnAssign)) or node.value is None:
             continue
@@ -83,11 +110,47 @@ def _classify(tree: ast.AST) -> dict:
             kind = "file_text"
         else:
             continue
-        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-        for t in targets:
+        for t in (node.targets if isinstance(node, ast.Assign) else [node.target]):
             if isinstance(t, ast.Name):
-                out[t.id] = kind
-    return out
+                sources[t.id] = kind
+
+    # 第二遍：找「返回文本的函数」→ 把这些函数的名字也标成对应类别
+    # 这样 `def _js_code(): return _source_assert.js_code(APP_JS.read_text())`
+    # 里 `_js_code` 会被标成 file_text（因为它内部最终读到文本）。
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        ret_kinds = set()
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Return) and sub.value is not None:
+                d = ast.dump(sub.value)
+                if "read_text" in d or "getsource" in d:
+                    ret_kinds.add("file_text" if "read_text" in d else "py_source")
+                # return 里调用了已标为文本源的变量/函数
+                for name, kind in sources.items():
+                    if name in d:
+                        ret_kinds.add(kind)
+        if ret_kinds:
+            # 只有一个类别时标注；多个类别取 file_text（读文件的更常见）
+            kind = "file_text" if "file_text" in ret_kinds else "py_source"
+            sources[node.name] = kind
+
+    # 第三遍：本地变量被赋值为「已标记函数」的调用 → 也标同类
+    # 例：`js = _js_code()` 而 `_js_code` 已标为 file_text ⇒ `js` 也是 file_text。
+    # 只追一层：`js = wrap(_js_code())` 中 `wrap` 不是已标记函数，不追踪（已知边界）。
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)) or node.value is None:
+            continue
+        if not isinstance(node.value, ast.Call):
+            continue
+        func = node.value.func
+        callee = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+        if callee in sources:
+            for t in (node.targets if isinstance(node, ast.Assign) else [node.target]):
+                if isinstance(t, ast.Name):
+                    sources[t.id] = sources[callee]
+
+    return sources
 
 
 def _count(kind_wanted: str) -> tuple:
