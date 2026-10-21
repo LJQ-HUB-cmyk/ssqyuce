@@ -17,21 +17,15 @@ from pathlib import Path
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 INDEX_HTML = WEB_DIR / "index.html"
 APP_JS = WEB_DIR / "static" / "app.js"
+STYLE_CSS = WEB_DIR / "static" / "style.css"
 
 def _js_code() -> str:
-    """剥离注释后的 app.js。
-
-    ⚠️ 为什么需要（2026-10-21）：本文件有断言用「字符串是否出现」来验证前端行为。
-    若该字符串**同时出现在注释里**，删掉实现后断言仍然通过 —— 典型假绿。
-    实测发现本文件 ``\u201c照常出号\u201d``、``\u201c不受系统配额限制\u201d`` 两处在注释中也有，
-    故改用本函数。新增此类断言一律用它。
+    """剥离注释后的 app.js（D-18b 合并：实现统一在 `_source_assert.js_code`）。
+    ⚠️ 四份测试文件原各写一份，正则相同。合并消除「第二真源」——
+       任一份被改另外三份不会跟着变且无人发现。
     """
-    import re as _re
-    js = APP_JS.read_text(encoding="utf-8")
-    js = _re.sub(r"/\*.*?\*/", "", js, flags=_re.S)
-    js = _re.sub(r"(?<![:\"'])\s*//[^\n]*", "", js)
-    return js
-STYLE_CSS = WEB_DIR / "static" / "style.css"
+    from _source_assert import js_code as _js_code_impl
+    return _js_code_impl(APP_JS.read_text(encoding="utf-8"))
 
 
 def _html() -> str:
@@ -87,7 +81,11 @@ def test_scope_three_states_are_explained():
     # renderLlmScope 的三个分支
     assert "user:" in js and "system:" in js and "none:" in js
     assert "照常出号" in js, "none 状态必须说明仍会正常出号"
-    assert "不受系统配额限制" in js or "不受配额" in js
+    # `or "不受配额"` 已删（D-18b 实测）：该短语在剥离注释后的 js 里 **0 次**，
+    # 只存在于 4108 行的 `//` 注释 —— 它是个永远为假的分支，不掩盖任何东西，
+    # 但会让读者以为「有个备用文案」。实测：删掉 3640 行的真实短语后断言会红，
+    # 说明左半有牙；右半是纯死代码。
+    assert "不受系统配额限制" in js, "user 态必须说明不受系统配额限制"
 
 
 # ---------------------------------------------------------------------------

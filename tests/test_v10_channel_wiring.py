@@ -27,18 +27,12 @@ INDEX_HTML = WEB_DIR / "index.html"
 APP_JS = WEB_DIR / "static" / "app.js"
 
 def _js_code() -> str:
-    """剥离注释后的 app.js。
-
-    ⚠️ 为什么需要（2026-10-21）：本文件有断言用「字符串是否出现」来验证前端行为。
-    若该字符串**同时出现在注释里**，删掉实现后断言仍然通过 —— 典型假绿。
-    实测发现本文件 ``\u201c照常出号\u201d``、``\u201c不受系统配额限制\u201d`` 两处在注释中也有，
-    故改用本函数。新增此类断言一律用它。
+    """剥离注释后的 app.js（D-18b 合并：实现统一在 `_source_assert.js_code`）。
+    ⚠️ 四份测试文件原各写一份，正则相同。合并消除「第二真源」——
+       任一份被改另外三份不会跟着变且无人发现。
     """
-    import re as _re
-    js = APP_JS.read_text(encoding="utf-8")
-    js = _re.sub(r"/\*.*?\*/", "", js, flags=_re.S)
-    js = _re.sub(r"(?<![:\"'])\s*//[^\n]*", "", js)
-    return js
+    from _source_assert import js_code as _js_code_impl
+    return _js_code_impl(APP_JS.read_text(encoding="utf-8"))
 
 
 # ---------------------------------------------------------------- 公共构造器

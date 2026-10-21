@@ -39,24 +39,12 @@ def _css() -> str:
 
 
 def _js_code() -> str:
-    """返回**剥离注释后**的 JS 源码。
-
-    ⚠️ 为什么必须剥注释（2026-10-21 实测教训）：
-    本用例最初用 ``assert "www-authenticate" in js.lower()`` 断言三形态判定存在。
-    做变异测试时把代码里的 ``headers.get("www-authenticate")`` 全删掉，
-    测试**仍然通过** —— 因为文件顶部的文档注释里写着 ``WWW-Authenticate``，
-    转小写后正好满足断言。也就是说那条断言测的是"注释里提过这个词"，
-    不是"代码实现了这个判断"。
-
-    一个抓不住回归的断言，比没有断言更危险：它给人"已验证"的错觉。
-    所以所有涉及"代码是否存在某行为"的断言，一律用本函数剥离注释后再比。
+    """剥离注释后的 app.js（D-18b 合并：实现统一在 `_source_assert.js_code`）。
+    ⚠️ 四份测试文件原各写一份，正则相同。合并消除「第二真源」——
+       任一份被改另外三份不会跟着变且无人发现。
     """
-    js = _js()
-    # 去掉 /* ... */ 块注释（含 JSDoc），保留字符串字面量里的内容
-    js = re.sub(r"/\*.*?\*/", "", js, flags=re.S)
-    # 去掉 // 行注释（避开 http:// 这类出现在字符串里的情况：要求 // 前不是 ':'）
-    js = re.sub(r"(?<![:\"'])\s*//[^\n]*", "", js)
-    return js
+    from _source_assert import js_code as _js_code_impl
+    return _js_code_impl(APP_JS.read_text(encoding="utf-8"))
 
 
 def _ids_in_html() -> set:

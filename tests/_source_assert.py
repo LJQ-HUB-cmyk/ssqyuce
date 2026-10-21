@@ -151,3 +151,32 @@ def has_compare(fn: Callable, *, op: type, string_const: Optional[str] = None,
                 continue
         return True
     return False
+
+
+def js_code(app_js_text: str) -> str:
+    """剥掉 JS 注释，只留有效代码。
+
+    ## 为什么需要（2026-10-21 实测教训）
+
+    一批测试用「字符串是否出现」验证前端行为。若该字符串**同时出现在注释里**，
+    删掉实现后断言**仍然通过** —— 典型假绿。
+
+    实测（`test_mu2_frontend_llm.py` / `test_v10_channel_wiring.py` /
+    `test_v10_frontend_cards.py` / `test_w08_frontend_auth.py` 四份文件分别踩到）：
+    「照常出号」「不受系统配额限制」「WWW-Authenticate」都曾只存在于注释，
+    导致对应断言假绿。
+
+    本函数是从四份文件各自手写的 `_js_code()` **合并而来** ——
+    四份正则完全一致，只 docstring 不同。合并消除「第二真源」：
+    任何一份被单独修改，另外三份不会跟着变、且没人发现。
+
+    ## 剥注释规则
+
+    * `/* */` 块注释 —— 直接删
+    * `//` 行注释 —— 删，但避开 `http://` 这类 URL 里的 `//`
+    * 保留引号内的内容（用后视 `(?<![:"'])` 防止把 `"...//..."` 当注释）
+    """
+    import re as _re
+
+    code = _re.sub(r"/\*.*?\*/", "", app_js_text, flags=_re.S)
+    return _re.sub(r"(?<![:\"'])\s*//[^\n]*", "", code)

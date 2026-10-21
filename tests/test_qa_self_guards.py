@@ -183,3 +183,53 @@ def test_pass_constraints_parity_is_isolated_from_other_dims():
     assert deny is False, (
         "同一样本仅把 odd_range 从 [3] 换成 [2,4] 后结果未翻转 —— "
         "奇偶分支未真正起作用（可能被删除，或被其他维度掩盖）")
+
+
+# ---------- 3. 变异探针残留守卫（严QA，2026-10-21 事故后补） ----------
+
+def test_no_mutation_probe_functions_in_tests():
+    """不得残留**变异探针函数**（`test_probe_*` / `test_mutation_*`）。
+
+    ## 为什么上面那条（`test_zz*`）不够 —— 真实事故
+
+    上面的守卫只查**文件名**为 `test_zz*` 的临时**文件**。
+    而 2026-10-21 我做的变异是**往已有文件追加一个临时测试函数**（文件名不变）：
+
+        # 加到 tests/test_qa_self_guards.py 末尾
+        def test_probe_b():
+            blob = (WEB/"index.html").read_text()
+            assert "生成预测" in blob
+
+    随后我删掉了它，但**在删除与重跑之间，别人跑全量时看到了它** ——
+    而且它不是「无害噪声」，它是**方向反了的守卫**：
+
+        它断言页面**必须有**「生成预测」，
+        而本轮工作正是**把「生成预测」改成「生成候选注单」**。
+
+    **即：它会把正确改动判成错误。** 这是第 4 类守卫病（反向误报）。
+
+    ## 教训
+
+    **变异探针只能「加进去、立刻删」，且删完必须 `grep` 确认。**
+    更稳妥的做法：**不要往共享文件追加探针**，改用
+    - 独立的 `test_zz_*.py` 文件（上面的守卫会盯着），或
+    - 直接命令行注入（`python -c`），不经文件。
+
+    本守卫是最后一道网：扫**函数名**，不扫文件名。
+    """
+    import re as _re
+
+    offenders = []
+    pat = _re.compile(r"^def (test_(?:probe|mutation)\w*)\(", _re.M)
+    for p in sorted((REPO / "tests").glob("test_*.py")):
+        try:
+            text = p.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for name in pat.findall(text):
+            offenders.append(f"{p.name}::{name}")
+
+    assert not offenders, (
+        "发现残留的变异探针函数（它们可能断言过时文案，把正确改动判成错）：\n  "
+        + "\n  ".join(offenders)
+        + "\n删掉它们，并用 grep 确认；或改用 test_zz_*.py 独立文件。")

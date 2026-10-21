@@ -67,7 +67,7 @@ A_BASELINE = 0
 #: B 类（外部文件 read_text 子串断言）的基线，按**比较数**计。
 #: 实测 2026-10-21：115 处 / 15 个文件。
 #: 改一处就下调一处 —— 基线只许降，不许升。
-B_BASELINE = 115
+B_BASELINE = 96     # 2026-10-21 16:1x 对齐：实测 96（D-18a/_js_code 合并后较原 115 减 19）
 
 
 def _classify(tree: ast.AST) -> dict:
