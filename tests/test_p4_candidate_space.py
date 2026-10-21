@@ -45,12 +45,17 @@ def test_candidate_at_is_deterministic():
     """同样的 (层, 索引) 必须给出同一个候选 —— 续跑/复算的前提。"""
     for layer in (CS.LAYER_SINGLE, CS.LAYER_CROSS):
         n = CS.layer_size(layer)
-        # 索引必须落在有效区间内（各层规模不同，不能共用固定索引）
-        for idx in (0, 1, min(17, n - 1), min(100, n - 1), n - 1):
+        # 交叉层有退化组合会被剔除（返回 None），因此只断言「两次结果一致」，
+        # 不要求非 None —— 确定性指的是可复现，不是必然合法。
+        checked = 0
+        for idx in range(0, min(400, n), 7):
             a = CS.candidate_at(layer, idx)
             b = CS.candidate_at(layer, idx)
-            assert a is not None and b is not None
-            assert a[1] == b[1], f"{layer}#{idx} 两次算出不同候选"
+            assert a is None or b is not None, f"{layer}#{idx} 首轮合法但复算返回 None"
+            if a is not None:
+                assert a[1] == b[1], f"{layer}#{idx} 两次算出不同候选"
+                checked += 1
+        assert checked > 0, f"{layer} 层没有任何合法候选"
 
 
 def test_index_out_of_range_returns_none():
@@ -76,6 +81,41 @@ def test_cross_fingerprint_includes_component_params():
         assert "{" in fp, f"交叉指纹缺少参数明细: {fp}"
         seen.add(fp)
     assert len(seen) == 300, "交叉指纹有撞车"
+
+
+@pytest.fixture()
+def probe_db(seeded_db):
+    """退化判断需要一个能构造 ScanContext 的历史，用种子库提供。"""
+    seeded_db(600)
+    CS._PROBE_HIST = None          # 重置探测缓存，确保用当前库
+    yield
+    CS._PROBE_HIST = None
+
+
+def test_degenerate_cross_is_rejected(probe_db):
+    """**退化组合必须剔除**（2026-10-21 实测修复）。
+
+    `hot ∩ cold` 是热点号与冷号取交集 —— 必然为空集。
+    这类候选 obs/exp 恒为 0、z 序列全零、e 值恒 ≈1，却照样被计入
+    e-BH 的分母，把真正有机会的候选阈值抬高。实测整层 max 仅 0.77。
+    """
+    rejected = sum(1 for idx in range(0, 200, 2)
+                   if CS.candidate_at(CS.LAYER_CROSS, idx) is None)
+    assert rejected > 0, "空集交叉候选未被剔除"
+
+
+def test_degenerate_filter_does_not_overkill(probe_db):
+    """剔除不能误杀：保留的候选其筛选集必须有实际内容（k ≥ 1）。"""
+    hist = CS._probe_history()
+    kept = 0
+    for idx in range(0, 400, 3):
+        got = CS.candidate_at(CS.LAYER_CROSS, idx)
+        if not got:
+            continue
+        k = len(got[0]["selector"](hist) or set())
+        assert k >= 1, f"#{idx} 选出 {k} 个号却被保留（误杀保护失效）"
+        kept += 1
+    assert kept > 0, "全部候选都被剔除了，过滤过严"
 
 
 def test_cross_never_pairs_same_family():

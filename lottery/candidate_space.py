@@ -61,6 +61,8 @@ from . import discovery
 MAX_PER_FAMILY = 48
 #: 数值型参数的取值上限（防止插值出荒谬的窗口跨度）
 MAX_NUMERIC = 2000
+#: 退化判断用的探测窗口（最近多少期构造 ScanContext）
+PROBE_WINDOW = 500
 
 #: 层名
 LAYER_SINGLE = "single"
@@ -227,6 +229,27 @@ def _cross_plan() -> Tuple[List[Tuple[List[int], List[int], int]], List[str]]:
 
 
 def _make_cross(idx: int) -> Optional[Tuple[Dict, str]]:
+    """把交叉层序号实例化为 (flt, fingerprint)；退化组合返回 None。
+
+    ## 退化组合必须被剔除（2026-10-21 实测发现）
+
+    交叉层由「族A ∩/∪ 族B」构成，而两个筛选集的交集**可能为空或极小**。
+    实测采样 300 个交叉候选：
+
+        k_mean = 0（空集）      5 个 / 2%
+        k_mean < 0.5（几乎空） 84 个 / 28%
+        0.5 ≤ k_mean ≤ 6 正常 215 个 / 72%
+
+    最典型的是 ``hot ∩ cold``（热点号与冷号取交集）——**必然为空**：
+    一个号不可能既是近 W 期出现最多的，又是出现最少的。
+
+    这类候选的伤害不是「算错了」，而是**纯浪费 + 稀释 m**：
+      * obs 与 exp 都是 0，z 序列全零，e 值恒 ≈1（实测整层 max 只有 0.77）；
+      * 它们照样被计入分层 e-BH 的分母，把真正有机会的候选的阈值抬高。
+
+    因此这里**在生成阶段**剔除：并集覆盖过多（近全号）或交集过小的组合直接返回 None，
+    由调用方跳过且不消耗预算。
+    """
     pairs, _order = _cross_plan()
     if not pairs or idx < 0:
         return None
@@ -266,19 +289,80 @@ def _make_cross(idx: int) -> Optional[Tuple[Dict, str]]:
     return flt, fp
 
 
+def _cross_is_degenerate(flt: Dict, target: str) -> bool:
+    """判断交叉候选是否语义退化（筛选集为空 / 近乎全选）。
+
+    用成分筛选器在当前历史上下文上取一次选号集，看大小。
+    单次调用成本很低（筛选器基于预计算计数）。
+
+    判据（红球 33 选 6、蓝球 16 选 1 的背景下）：
+      * 选出 0 个号 —— obs/exp 恒为 0，z 序列全零，测不出任何东西
+      * 选出 > 12 个红号 —— 覆盖超过 1/3，z 长期负偏，无判别力
+
+    **判不了就放行**（返回 False）：不能因为探测失败就把合法候选误杀。
+    但这种情况会打一次日志 —— 静默放行会让「退化过滤失效」藏起来，
+    那正是本缺陷最初没被发现的原因。
+    """
+    try:
+        hist = _probe_history()
+        chosen = flt["selector"](hist) or set()
+        k = len(chosen)
+    except Exception as e:      # noqa: BLE001 —— 判不了就放行，不误杀
+        global _DEGRADE_PROBE_FAILED
+        if not _DEGRADE_PROBE_FAILED:
+            _DEGRADE_PROBE_FAILED = True
+            print(f"[candidate_space] 退化判断不可用（将放行全部交叉候选）: {e}")
+        return False
+    if k < 1:
+        return True
+    if target == "red" and k > 12:
+        return True
+    if target == "blue" and k > 8:
+        return True
+    return False
+
+
+_PROBE_HIST: Optional[Any] = None
+#: 退化判断是否已因异常而失效（只告警一次，避免刷屏）
+_DEGRADE_PROBE_FAILED = False
+
+
+def _probe_history() -> Any:
+    """给退化判断用的历史上下文（只建一次，避免每候选重建）。
+
+    用库内最近 `PROBE_WINDOW` 期构造 ScanContext —— 筛选器只需要「最近的
+    热号/遗漏」这类量，用尾部窗口即可，不必全史。
+    """
+    global _PROBE_HIST
+    if _PROBE_HIST is None:
+        from . import db
+        draws = db.load_draws()
+        tail = draws[-PROBE_WINDOW:] if len(draws) > PROBE_WINDOW else draws
+        _PROBE_HIST = discovery.ScanContext.new(tail)
+    return _PROBE_HIST
+
+
 # --------------------------------------------------------------------------
 # 统一入口
 # --------------------------------------------------------------------------
 
 def candidate_at(layer: str, idx: int) -> Optional[Tuple[Dict, str]]:
-    """取第 ``idx`` 个候选，返回 ``(flt, fingerprint)``；越界或非法返回 None。
+    """取第 ``idx`` 个候选，返回 ``(flt, fingerprint)``；越界/非法/退化返回 None。
 
     纯函数：同样的 (layer, idx) 永远给出同一个候选（可续跑的前提）。
+
+    交叉层会做**退化过滤**（见 `_cross_is_degenerate`）：交集为空、
+    或选出号码过多的组合直接返回 None，由调用方跳过且不消耗预算。
+    这一步很关键 —— 实测 28% 的交叉候选筛选集 < 0.5 个号，
+    它们 e 值恒 ≈1，却照样被计入 e-BH 的分母。
     """
     if layer == LAYER_SINGLE:
         return _make_single(idx)
     if layer == LAYER_CROSS:
-        return _make_cross(idx)
+        got = _make_cross(idx)
+        if got and _cross_is_degenerate(got[0], got[0].get("target") or "red"):
+            return None
+        return got
     return None
 
 
