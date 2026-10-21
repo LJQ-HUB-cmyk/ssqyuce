@@ -206,27 +206,41 @@ def test_cpu_limit_defaults_to_60pct():
     assert idle_mining.CPU_LIMIT_PCT == pytest.approx(60.0)
 
 
-def test_throttle_sleeps_longer_for_more_cpu_used(idle_env, monkeypatch):
-    """占空比闭环：本批用的 CPU 越多，应休眠越久（否则会超限额）。"""
+def test_throttle_runs_full_speed_when_headroom_is_ample(idle_env, monkeypatch):
+    """**整机余量充足时不额外休眠**（口径修正，2026-10-21）。
+
+    `CPU_LIMIT_PCT` 是整机百分比（4 核 60% = 2.4 核），而单线程最多 1 核 = 25%，
+    天然不可能突破上限。整机只用 10% 时不应为了「占空比」去睡 ——
+    那是第一版的错误，它把单候选墙钟从 0.05s 拖到 0.29s。
+    """
     slept = []
     monkeypatch.setattr(idle_mining.time, "sleep", lambda s: slept.append(s))
-    monkeypatch.setattr(idle_mining, "_system_cpu_pct", lambda: 5.0)
-    monkeypatch.setattr(idle_mining, "_online_pressure", lambda: False)
-
-    idle_mining._throttle(0.1)
-    idle_mining._throttle(0.5)
-    assert len(slept) == 2
-    assert slept[1] > slept[0], "CPU 用得多时睡得应更久"
-
-
-def test_throttle_formula_matches_duty_cycle(idle_env, monkeypatch):
-    """验证数学：t_sleep ≥ t_work·(1-r)/r，r=0.60 ⇒ sleep ≥ 0.667·work。"""
-    slept = []
-    monkeypatch.setattr(idle_mining.time, "sleep", lambda s: slept.append(s))
-    monkeypatch.setattr(idle_mining, "_system_cpu_pct", lambda: None)  # 读不到就只用基础公式
+    monkeypatch.setattr(idle_mining, "_system_cpu_pct", lambda: 10.0)   # 余量 50 点
     monkeypatch.setattr(idle_mining, "_online_pressure", lambda: False)
     idle_mining._throttle(1.0)
-    assert slept[0] >= 1.0 * (1 - 0.60) / 0.60 - 1e-9
+    assert slept and slept[0] <= 0.05, f"余量充足却睡了 {slept[0]:.2f}s，过严"
+
+
+def test_throttle_backs_off_when_headroom_below_one_core(idle_env, monkeypatch):
+    """整机余量 **不足一个核** 时应让路（这才是限流的真实触发条件）。"""
+    slept = []
+    monkeypatch.setattr(idle_mining.time, "sleep", lambda s: slept.append(s))
+    monkeypatch.setattr(idle_mining, "_cpu_count", lambda: 4)
+    monkeypatch.setattr(idle_mining, "_system_cpu_pct", lambda: 50.0)   # 余量 10 < 25
+    idle_mining._throttle(1.0)
+    assert slept and slept[0] > 0.05, "余量不足一个核却没有让路"
+
+
+def test_throttle_lets_more_work_sleep_more_under_pressure(idle_env, monkeypatch):
+    """在余量不足时，本批用的 CPU 越多应休眠越久。"""
+    slept = []
+    monkeypatch.setattr(idle_mining.time, "sleep", lambda s: slept.append(s))
+    monkeypatch.setattr(idle_mining, "_cpu_count", lambda: 4)
+    monkeypatch.setattr(idle_mining, "_system_cpu_pct", lambda: 52.0)   # 余量 8 < 25
+    idle_mining._throttle(0.2)
+    idle_mining._throttle(1.0)
+    assert len(slept) == 2
+    assert slept[1] > slept[0], "CPU 用得多时睡得应更久"
 
 
 def test_throttle_backs_off_when_system_already_at_limit(idle_env, monkeypatch):

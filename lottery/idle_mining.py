@@ -51,6 +51,8 @@ BATCH_SIZE = 8
 BASE_SLEEP = 0.05
 #: 检测到在线请求压力时加大的休眠
 PRESSURE_SLEEP = 0.5
+#: 无压力时批间的最小让出（给 GIL / SQLite 连接喘口气，不是为省 CPU）
+BATCH_GAP = 0.01
 #: 判定所需最小观测数（低于此不下结论）
 MIN_OBS = 30
 
@@ -100,44 +102,57 @@ def _system_cpu_pct() -> Optional[float]:
 
 
 def _throttle(t_work: float) -> None:
-    """按 CPU 占空比目标休眠，让闲时挖掘不超过 `CPU_LIMIT_PCT`。
+    """按 CPU 占空比目标休眠，让闲时挖掘不超过 `CPU_LIMIT_PCT`（整机口径）。
 
-    ## 为什么不能只靠固定 sleep
+    ## 口径（最容易搞错的地方，第一版就错在这里）
 
-    固定 `sleep(0.05)` 与实际 CPU 消耗无关：候选贵（46ms）时占空比可能接近 100%，
-    候选便宜（25ms）时又浪费。用户约束是**整机不超过 60%**，必须闭环控制。
+    `CPU_LIMIT_PCT` 是**整机百分比**：本 VPS 4 核，60% = **2.4 核**。
+    单个挖掘线程最多吃满 1 核 = 整机 **25%** —— 单线程天然不可能突破 60%。
+    限流的真实职责是「别让前台被挤」，不是「把单线程压到 60%」。
 
-    ## 算法
+    第一版把 `r` 当成「本进程可用的核心比例」，算出
+    `t_sleep ≥ 0.667·t_work`，等于把进程压到**单核 60%**，比整机目标
+    严了 4 倍。实测代价：单候选墙钟 0.05s 拖到 0.29s，
+    吞吐仅 2.9 候选/秒，1 天窗口完不成。
 
-    设本批实际用了 `t_work` 秒 CPU 时间、目标占空比 `r`（默认 0.60）。
-    要让 `t_work / (t_work + t_sleep) ≤ r`，解得 `t_sleep ≥ t_work·(1-r)/r`。
+    ## 修正后的判据
 
-    再叠加整机已有负载：若前台已占 30%，本任务还能用 30%，据此放大休眠。
-    这是**保守的单向控制**（只会让挖掘更慢，不会更贪）——
-    在单机部署里，「后台任务拖垮前台」比「挖掘慢一点」严重得多。
+    只在**整机余量不足一个核**时才让路：
+
+        one_core_pct = 100 / n_cores            # 4 核 → 25%
+        headroom = CPU_LIMIT_PCT - sys_pct      # 整机还剩多少百分点
+        headroom >= one_core_pct  → 不让路     # 余量够本线程吃满，直接跑
+        headroom <  one_core_pct  → 按缺口比例休眠
+
+    例：整机已用 50%、上限 60% ⇒ 余量 10 < 25 ⇒ 让路；
+        整机已用 10% ⇒ 余量 50 ≥ 25 ⇒ 全速跑。
     """
     if t_work <= 0:
         time.sleep(BASE_SLEEP)
         return
-    r = max(0.05, min(0.95, CPU_LIMIT_PCT / 100.0))
-    need = t_work * (1.0 - r) / r
 
-    # 叠加整机已有负载：给前台留足余量
+    one_core = 100.0 / _cpu_count()
     sys_pct = _system_cpu_pct()
+
     if sys_pct is not None:
-        headroom = max(0.0, CPU_LIMIT_PCT - sys_pct) / 100.0
-        if headroom <= 0.01:
-            # 已经超过限额：本批不干活，长休眠等它降下来
+        if sys_pct >= CPU_LIMIT_PCT:
+            # 整机已到/超限额：本批不干活，等它降下来
             time.sleep(CPU_SAMPLE_WINDOW)
             return
-        # 按余量比例放大休眠（余量越小，睡得越久）
-        need *= min(3.0, r / headroom)
+        headroom = CPU_LIMIT_PCT - sys_pct
+        if headroom < one_core:
+            # 余量已不足一个核：按缺口比例让路（最多压到不干活的一半）
+            frac = headroom / one_core              # 0..1
+            need = t_work * (1.0 - frac) / max(frac, 0.05)
+            time.sleep(min(max(need, 0.0), 30.0))
+            return
+    # 读不到整机占用时按「余量充足」处理 —— 仍有 cgroup 2.4 核硬限兜底
 
-    # 在线请求压力：再加一档让路
+    # 余量充足，但若有在线请求仍让一小档，保证前台响应延迟不劣化
     if _online_pressure():
-        need = max(need, PRESSURE_SLEEP)
-    # 上限保护：避免算出天文数字的休眠（会让 3 天窗口跑不完）
-    time.sleep(min(need, 30.0))
+        time.sleep(PRESSURE_SLEEP)
+    else:
+        time.sleep(BATCH_GAP)
 
 #: 候选空间版本。2 = 生成式开放空间（单因子网格 + 跨族交叉）。
 #: 旧断点（1 = 封闭的 124 维遍历）语义不兼容，读到就重置游标。
