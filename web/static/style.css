@@ -457,8 +457,10 @@ footer { color: var(--muted); font-size: 12px; text-align: center; margin-top: 2
 .ticket.mini.open .chev { transform: rotate(180deg); }
 .ticket.mini .t-body { display: none; margin-top: 8px; border-top: 1px dashed var(--border); padding-top: 8px; }
 .ticket.mini.open .t-body { display: block; }
-.stars { color: var(--gold); letter-spacing: 1px; font-size: 13px; white-space: nowrap; }
-.stars .off { color: var(--border); }
+/* 已删除 `.stars` / `.stars .off`（2026-10-21 产品审计移除星级，全库零使用点）。
+   留这条墓碑而不是直接抹掉，是因为 CSS 删除没有任何反向信号：
+   下一个想加星级的人必须先读到这里，才知道"不是漏写了，是有人决定不要"。
+   恢复前务必先解决「用户不点开任何东西也不会把星级读成中奖概率」——目前无解。 */
 .t-badge { font-size: 10.5px; padding: 2px 7px; border-radius: 10px; border: 1px solid var(--border); color: var(--muted); white-space: nowrap; }
 .t-badge.llm { color: var(--purple); border-color: var(--purple); }
 .ticket.mini .reasoning { margin-top: 4px; font-size: 12px; color: var(--muted); }
@@ -733,3 +735,100 @@ footer { color: var(--muted); font-size: 12px; text-align: center; margin-top: 2
 .input-with-btn { display: flex; gap: 8px; align-items: stretch; }
 .input-with-btn input { flex: 1; }
 .input-with-btn button { white-space: nowrap; }
+
+/* ==================== V14-B2/B3：蓝球覆盖 + 大众偏好度 ====================
+   纪律留痕：这一组样式只负责「让披露读得下去」，不负责「让数字好看」。
+   披露块刻意用中性/暗色而非高亮强调，避免把"净亏/返奖比恒定"渲染成卖点。 */
+
+/* 披露全文：逐行成段，行间留白，禁止用省略号截断 */
+.v14-disclosure-lines { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; }
+.v14-line {
+  font-size: 11.5px; line-height: 1.65; color: var(--text);
+  padding-left: 10px; border-left: 2px solid var(--border);
+}
+/* 后端披露文本里用 **粗体** 标记关键限定，前端按其语义加粗（不额外解释） */
+.v14-line strong { color: var(--gold); font-weight: 700; }
+
+/* honesty_flags：是/否 一眼可辨，不用颜色表达"好/坏"，只表达"是否" */
+.v14-flags { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 8px; }
+.v14-flag {
+  font-size: 10.5px; padding: 2px 7px; border-radius: 10px;
+  border: 1px solid var(--border); color: var(--muted);
+}
+.v14-flag.no { border-color: var(--border); }
+.v14-flag.yes { border-color: var(--gold); color: var(--gold); font-weight: 700; }
+
+/* 大众偏好度：档位徽标 */
+.v14-tier-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 4px 0 8px; }
+.v14-tier {
+  font-size: 15px; font-weight: 700; padding: 3px 10px;
+  border-radius: 8px; border: 1px solid var(--border);
+}
+.v14-tier.cool { color: #4a90d9; border-color: #4a90d9; }
+.v14-tier.common { color: var(--text); border-color: var(--border); }
+.v14-tier.hot { color: #d98c4a; border-color: #d98c4a; }
+.v14-reds { font-size: 11.5px; color: var(--muted); }
+.v14-reasons { margin: 4px 0 8px; padding-left: 18px; font-size: 11.5px; line-height: 1.7; }
+.v14-reasons li { color: var(--text); }
+.v14-r2 { margin-top: 4px; font-size: 10.5px; color: var(--muted); }
+
+/* ===== 诚实收益边界（首屏常驻、不可折叠）=====
+   设计意图：这四项是"最容易被误解的地方"，所以样式上要**中性**——
+   不用绿/红暗示好坏，不用大字号把"62.50%"做成卖点。
+   概率与成本并置，让"提高的是频率不是收益率"这句话读起来是结论，而不是免责声明。 */
+.honest-bounds {
+  margin: 12px 0 4px; padding: 12px 14px;
+  border: 1px solid var(--border); border-left: 3px solid var(--gold);
+  border-radius: 10px; background: rgba(212, 175, 55, .06);
+}
+.hb-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+.hb-head b { font-size: 14px; color: var(--gold); }
+.hb-sub { font-size: 11px; color: var(--muted); }
+.hb-grid { display: flex; flex-wrap: wrap; gap: 10px; }
+.hb-item {
+  flex: 1 1 180px; min-width: 160px; padding: 8px 10px;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--panel2, transparent);
+}
+.hb-k { font-size: 11px; color: var(--muted); }
+.hb-v { font-size: 17px; font-weight: 700; margin: 3px 0; color: var(--text); }
+.hb-arrow { color: var(--muted); font-weight: 400; }
+.hb-sub2 { font-size: 10.5px; color: var(--muted); line-height: 1.5; }
+.hb-sub2 b { color: var(--text); }
+.hb-foot {
+  margin-top: 10px; padding-top: 8px; border-top: 1px dashed var(--border);
+  font-size: 11px; line-height: 1.7; color: var(--muted);
+}
+.hb-foot b { color: var(--text); }
+.hb-links { display: inline-flex; gap: 12px; margin-left: 8px; }
+.hb-links a { font-size: 11px; color: var(--gold); text-decoration: none; }
+.hb-links a:hover { text-decoration: underline; }
+
+/* 跳到卡片时的短暂高亮（不改变布局，只提示"就是这张"） */
+.hb-flash {
+  animation: hbFlash 1.6s ease-out;
+}
+@keyframes hbFlash {
+  0%   { box-shadow: 0 0 0 3px rgba(212, 175, 55, .55); }
+  100% { box-shadow: 0 0 0 0 rgba(212, 175, 55, 0); }
+}
+
+/* 表头副标题：用于把比率类指标与样本量绑在一起（P2#8） */
+.th-sub { font-size: 9.5px; color: var(--muted); font-weight: 400; }
+
+/* footer 里的内联链接（目前只有「随机性诚实声明」一处）。
+   与 .hb-links 用同一金色，但下划线只在 hover 出现，避免把页脚弄得像菜单。 */
+.footer-link { color: var(--gold); text-decoration: none; border-bottom: 1px dotted var(--gold); }
+.footer-link:hover { border-bottom-style: solid; }
+
+/* 首屏卡取值来源标注（D3）：实时值 vs 示例值。
+   两种状态**必须可区分**——"示例值"三个字是降级不冒充实时的全部意义，
+   所以 stale 态用虚线框 + 稍暗的字色把它做得比实时态更"轻"，而不是更醒目。 */
+.hb-src {
+  display: inline-block; margin-left: 8px; padding: 1px 7px;
+  font-size: 10px; border-radius: 9px;
+  border: 1px solid var(--border); color: var(--muted);
+}
+.hb-src.hb-stale {
+  border-style: dashed; border-color: var(--gold); color: var(--gold);
+  font-weight: 600;
+}

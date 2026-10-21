@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>双色球智能预测分析系统</title>
+<title>双色球号码组合分析系统</title>
 <link rel="stylesheet" href="/static/style.css?v=20261020.2">
 <!-- ECharts CDN + 本地 fallback -->
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"
@@ -68,10 +68,70 @@
             <div class="hero-countdown" id="predCountdown"></div>
           </div>
           <div class="hero-actions">
-            <button class="primary" id="btnPredict" onclick="runPredict()">🎯 生成预测</button>
+            <button class="primary" id="btnPredict" onclick="runPredict()">🎯 生成候选注单</button>
             <button id="btnRegen" onclick="runPredict(true)">🔄 重新生成</button>
             <button class="btn-copyall" onclick="copyAllTickets()">📋 复制全部</button>
-            <button class="btn-follow" onclick="followMyPick()">🤝 跟我买</button>
+            <!-- 原「🤝 跟我买」：实际功能是"挑选一个蓝球覆盖较优的子集并复制到剪贴板"，
+                 与「复制全部」同类，但"跟我买"是首屏唯一可被读成投注建议的文案。
+                 功能保留，按钮改为描述动作本身。 -->
+            <button class="btn-follow" onclick="followMyPick()">📋 复制这组</button>
+          </div>
+        </div>
+        <!-- ===== 诚实收益边界（首屏常驻、不可折叠）=====
+             存在理由：本系统的每一个"看起来变好了"的功能（蓝球去重、结构门控、偏好度排序），
+             都在改变**中奖分布**，而**不改变期望收益**。用户最容易在首屏产生
+             "这系统能帮我赚"的错觉，所以这四项必须在首屏、常驻、不可折叠地摆着。
+
+             四个数字取 n=10 的实测值（/api/portfolio/blue-coverage）：
+               47.55%（随机重复）→ 62.50%（去重覆盖）：概率确实提高了
+               20 元成本
+               3.125 元六等奖期望回收
+               15.625% 返奖比恒定 —— 这才是结论：提高的是频率，不是收益率
+             ⚠ 不得只显示前两项，那正是误解的来源。 -->
+        <div class="honest-bounds" id="honestBounds">
+          <div class="hb-head">
+            <b>诚实收益边界</b>
+            <span class="hb-sub">最容易被误解的地方，放在最显眼处</span>
+          </div>
+          <!-- 四组数字的取值口径（D3）：
+               默认是写死的 **n=10 示例快照**，页面加载后由 `fillHonestBounds()` 用
+               `/api/portfolio/blue-coverage?n_tickets=10` 的**同一个响应对象**覆盖，
+               与「蓝球覆盖卡」共用一次请求、一套口径（不许两处各算一遍）。
+               若端点不可用（401/503/超时），**保留静态值**但把卡角小字切成
+               「示例值（n=10）· 实时数据不可用」—— 静态数字绝不能冒充实时。
+               `data-hb` 属性是对外契约：探针按它逐个核对渲染值与端点返回值一致。 -->
+          <div class="hb-grid">
+            <div class="hb-item">
+              <div class="hb-k">「至少中一次蓝球」概率</div>
+              <div class="hb-v"><span data-hb="p_repeat">47.55%</span>
+                <span class="hb-arrow">→</span>
+                <span data-hb="p_cover">62.50%</span></div>
+              <div class="hb-sub2"><span data-hb="n_tickets">10</span> 注去重覆盖 vs 随机重复：<b>概率确实提高了</b></div>
+            </div>
+            <div class="hb-item">
+              <div class="hb-k">成本</div>
+              <div class="hb-v"><span data-hb="cost">20</span> 元</div>
+              <div class="hb-sub2"><span data-hb="n_tickets2">10</span> 注 × 2 元</div>
+            </div>
+            <div class="hb-item">
+              <div class="hb-k">六等奖期望回收</div>
+              <div class="hb-v"><span data-hb="ev_sixth">3.125</span> 元</div>
+              <div class="hb-sub2">净亏 <span data-hb="net_sixth">16.875</span> 元</div>
+            </div>
+            <div class="hb-item">
+              <div class="hb-k">返奖比</div>
+              <div class="hb-v"><span data-hb="ratio_sixth">15.625%</span></div>
+              <div class="hb-sub2"><b>恒定，与注数无关</b> —— 概率提高不等于收益率提高</div>
+            </div>
+          </div>
+          <div class="hb-foot">
+            提高的是<b>中奖频率</b>，不是<b>收益率</b>。选号与覆盖策略都不改变期望值；
+            中头奖概率恒为 1/17,721,088。
+            <span class="hb-src" id="hbSource">数值为 n=10 示例快照</span>
+            <span class="hb-links">
+              <a href="javascript:void(0)" onclick="jumpToCard('blueCoverageCard')">→ 蓝球去重覆盖（完整披露）</a>
+              <a href="javascript:void(0)" onclick="jumpToCard('popularityCard')">→ 大众偏好度（只给排序）</a>
+            </span>
           </div>
         </div>
         <div class="pred-meta" id="predMeta"></div>
@@ -319,10 +379,51 @@
               <div id="mlDiagBody"><div class="note">尚未诊断。真实彩票数据上 trusted=False 是预期结论。</div></div>
             </div>
 
+            <!-- ==================== V14-B2 / B3 两卡 ====================
+                 这两张卡回答的是「看懂自己的票」，不是「预测下一期」。
+                 硬约束（缺一即视为实现错误）：
+                   · 蓝球覆盖卡：概率 / 成本 / 净亏 / 返奖比恒定 **必须同屏**，
+                     disclosure_lines 全文必须完整显示。禁止只展示「47.55% → 62.50%」。
+                   · 大众偏好度卡：只给档位，**不得出现任何「预计 X 注中奖」类数字**。
+                   · 两卡都禁用词：提高中奖率 / 提高命中率 / 更划算 / 稳赚。
+                 降级：任一端点 401/503/超时，只把本卡标为不可用，其余内容照常。 -->
+
+            <!-- 卡 7：蓝球去重覆盖（GET /api/portfolio/blue-coverage → blue_coverage.optimize） -->
+            <div class="card" id="blueCoverageCard" style="margin-top:16px">
+              <h2>🔵 蓝球去重覆盖 <span class="tag" id="blueCovTag">加载中…</span></h2>
+              <div class="note" style="margin-bottom:8px">
+                蓝球不去重时，多注之间会重复选同一个蓝球；去重覆盖让「至少对一次蓝球」的机会变大。
+                但<b>它改变的是中奖分布，不是期望收益</b> —— 下面对比里的四个数字必须一起读。
+              </div>
+              <div class="eval-actions" style="margin-bottom:8px">
+                <label class="hint-inline" for="blueCovN">打算买几注</label>
+                <input id="blueCovN" type="number" min="1" max="100" value="10" style="width:72px"
+                       onchange="loadBlueCoverage()">
+                <button id="btnBlueCov" onclick="loadBlueCoverage()">重新计算</button>
+                <span class="hint-inline">1~100 注；成本按每注 2 元计</span>
+              </div>
+              <div id="blueCovBody"><div class="note">读取蓝球覆盖计划…</div></div>
+            </div>
+
+            <!-- 卡 8：大众偏好度（GET /api/portfolio/popularity → popularity.describe） -->
+            <div class="card" id="popularityCard" style="margin-top:16px">
+              <h2>👥 大众偏好度 <span class="tag" id="popTag">加载中…</span></h2>
+              <div class="note" style="margin-bottom:8px">
+                只回答一个问题：<b>这种号码形态，历史上大概有多少人会选</b>。
+                它<b>不</b>说明下期会开什么，也<b>不</b>给出任何注数预估
+                —— 效应量 R² 只有千分之几，只能排序，不能定值。
+              </div>
+              <div class="eval-actions" style="margin-bottom:8px">
+                <button id="btnPopularity" onclick="loadPopularity()">查询当前推荐首注</button>
+                <span class="hint-inline" id="popSubject">取当前推荐的第一个注单形态</span>
+              </div>
+              <div id="popBody"><div class="note">读取大众偏好度…</div></div>
+            </div>
+
             <!-- 卡 6：形态规律（组合恒等约束，V12）——
                  这些不是"预测下一期"的规律，而是组合数学恒等约束：
                  和值/跨度/三区/奇偶/连号几乎必然落在这些区间内。
-                 作为严格模式的"可用规律"，LLM 在此约束下生成注单，形态必然合理。 -->
+                 作为严格模式的「结构门控条件」，LLM 在此约束下生成注单，形态必然合理。 -->
             <div class="card" id="shapeRuleCard" style="margin-top:16px">
               <h2>🧬 形态规律（组合恒等约束） <span class="tag" id="shapeRuleTag">加载中…</span></h2>
               <div class="note" style="margin-bottom:8px">
@@ -330,7 +431,9 @@
                 任何一期开奖的形态（和值/跨度/三区/奇偶/连号）都几乎必然落在这些区间内
                 （实测 3515 期与 C(33,6) 全空间理论枚举一致）。
                 作为严格模式的<b>结构门控条件</b>，LLM 在此约束下生成的注单，形态必然合理。
-                <br><span style="color:#c00">（注意：这只是「号码外形合理」，<b>不是</b>「预测到了什么规律」——后端纪律明令禁止把它叫「可用规律」。）</span>
+                <!-- 原红字行（"后端纪律明令禁止把它叫「可用规律」"）已删除：
+                     用户不需要知道我们内部有一条纪律，他只需要读到"这不是预测规律" ——
+                     上一句已经是「不是『预测下一期』的规律」，信息不损失。 -->
               </div>
               <div id="shapeRuleBody"><div class="note">加载形态规律…</div></div>
             </div>
@@ -668,7 +771,11 @@
   </aside>
 
   
-      <footer>双色球智能预测分析系统 <span class="badge badge-ver" id="verText">v4.1.0</span>（M1-M5 + U1-U9 + V4~V12 已上线 · L2 结构层/L3 决策层）· 仅供研究参考 · 随机性诚实声明 · 数据源 e.17500.cn</footer>
+      <!-- footer：站名与 `<title>`、后端四处（__init__.py / api_app.py / cli.py /
+           routes_data.py）保持同一口径 ——「号码组合分析系统」，不是「智能预测」。
+           「随机性诚实声明」保留为可点链接指向 #rigorCard（随机性检验卡）。
+           这句话是 footer 里唯一一句真话，压成四个字等于没说。 -->
+      <footer>双色球号码组合分析系统 <span class="badge badge-ver" id="verText">v4.1.0</span>（M1-M5 + U1-U9 + V4~V12 已上线 · L2 结构层/L3 决策层）· 仅供研究参考 · <a href="javascript:void(0)" class="footer-link" onclick="jumpToCard('rigorCard','predict')" title="双色球为独立随机事件：本系统不承诺中奖率，只做组合结构与概率口径的分析">随机性诚实声明</a> · 数据源 e.17500.cn</footer>
 </div>
 
 <!-- 号码详情弹窗（全局：任意 Tab 均可触发） -->

@@ -194,7 +194,12 @@ def portfolio_distribution(issues: int = Query(1, ge=1, le=20),
 @router.get("/api/portfolio/popularity")
 def portfolio_popularity(
     reds: str = Query(..., description="逗号分隔的 6 个红球，如 1,2,3,4,5,6"),
-    sales: float = Query(0.0, description="预计本期销量（元），可选；不影响档位"),
+    sales: float = Query(
+        0.0,
+        description=("预计本期销量（元）。⚠️ 当前**不参与档位判定**：档位按「每亿元"
+                     "销量注数」的标准化分位标定，与本期销量无关。该参数仅为未来"
+                     "扩展保留，传任意值（含负数/极大值/inf/nan）都不改变返回结果。"),
+    ),
 ) -> Dict:
     """查询该号码形态的「大众程度」档位。
 
@@ -205,6 +210,23 @@ def portfolio_popularity(
 
     实测效应量：形态对头奖注数（`p1`）的增量 R² ≈ 0.008（0.8%），
     置换 p ≈ 0.005 —— 真实但极小，**只能排序，不能定值**。
+
+    ## 参数边界（非法输入一律 400，不落到 500）
+
+    `reds` 必须是 6 个 1~33 内互不相同的整数；非整数、个数不符、重复、越界 → 400。
+    中文逗号与前后空格会被宽容规范化。
+
+    ## `sales` 是空转参数（重要，别被签名骗了）
+
+    `PopularityModel.describe()` **不使用 `sales` 的值**：档位在标准化空间上按分位
+    标定，与本期销量无关。所以 `sales` 传 -5、1e308、inf、nan 都不会报错、也都不会
+    改变结果 —— 这既是"不会 500"的原因，也是一个**陷阱**：调用方不要以为传了销量
+    档位会更准。详见 `popularity.PopularityModel.describe` 内的注释。
+
+    ## 模型未就绪 → 503
+
+    `popularity.get_model()` 内部吞掉拟合异常并返回未拟合对象（不会抛），
+    因此这里靠 `describe()` 的 `ok=False` 判定，返回 **503** 而非 500。
     """
     try:
         parts = [int(x) for x in str(reds).replace("，", ",").split(",") if x.strip()]
@@ -241,6 +263,25 @@ def portfolio_blue_coverage(
 
     所以本端点**永远**同时返回概率、成本、期望回收与 `disclosure` 文本，
     不存在只取概率的路径。
+
+    ## n > 16 时返奖比**不再恒定**（端点必须自己说清楚）
+
+    恒等式「返奖比 = 5/32 = 15.625%，与注数无关」的前提是 `p = n/16`，
+    **只在 n ≤ 16 成立**。蓝球池只有 16 个，n > 16 时 `p` 被封顶 1.0，
+    而成本仍线性增长 ⇒ 返奖比被稀释：
+
+        n=16 → 15.625%    n=17 → 14.71%    n=50 → 5.00%    n=100 → 2.50%
+
+    因此返回体带 `coverage_saturated`（n > 16 时为 true），披露文本也随之
+    改口为"覆盖已饱和"。**这一条是防"数字与文案自相矛盾"的守卫** ——
+    若哪天有人把披露改回无条件的"恒为…与注数无关"，`tests/test_v14_portfolio_api.py`
+    与 `tests/test_v14_blue_coverage.py` 都会失败。
+
+    ## 参数边界
+
+    `n_tickets` 经 `Query(ge=1, le=100)` 校验，HTTP 层越界返回 **422**
+    （FastAPI 契约层拦截，不经函数体）。直接调用函数时 `n_tickets ≤ 0`
+    会按 0 注处理（`optimize` 内 `max(0, n)`），返回完整的"0 注"披露而非崩溃。
     """
     from . import blue_coverage as BC
     full_ratio = None
@@ -256,7 +297,26 @@ def portfolio_blue_coverage(
             # 项目规则要求「一/二等奖为浮动奖，必须连假设表一起展示」。
             assumption = {"first": 6_840_000, "second": 205_000,
                           "label": "实测中位（3266 期 p1_amt/p2_amt）"}
-            ev = engine._single_ticket_ev(assumption, sixth="published")
+            # ===== V14 起改用 `strict`（2026-10-21 裁决，别改回去）=====
+            #
+            # `_single_ticket_ev` 刻意提供两个六等奖口径（`engine.py:1770` 原话：
+            # 「两者都给出，让口径可核对而不是二选一」）：
+            #   · `published` —— V4 起对外发表值，六等奖取蓝球**边际**概率 pb=0.0625，
+            #     与高奖级**重复计数**，系统性偏高约 0.9pp；
+            #   · `strict`    —— 按 `evaluate.prize_level` 的**互斥**奖级计算，
+            #     六等奖用 (p_r(0)+p_r(1)+p_r(2))·pb，语义正确。
+            #
+            # 为什么消费方必须选 strict（四条同时成立才定的）：
+            #   ① 语义正确：一注只能归入**一个**奖级，published 的重复计数不成立；
+            #   ② 与 Lead 红线表一致：52.29%（= 1.0458133/2，`popularity.py:42` 的出处）；
+            #   ③ 与同页 popularity 卡的可见文案一致（「约 52.3% 回收」）——
+            #      否则同一页面两张卡对同一个量给出 52.3% vs 53.2%，用户一除就发现；
+            #   ④ 数值更低，符合本项目"宁可少说"的披露原则。
+            #
+            # ⚠️ **不要删 engine 里的 published 分支**：它承担"可复现 V4 历史发表值"
+            # （docs/V10 §3.4.5 冻结的 ev_ratio_full≈0.45673）的能力，是刻意保留的
+            # 可核对设计。错的是消费者各挑一个且无一致性检查，不是口径本身。
+            ev = engine._single_ticket_ev(assumption, sixth="strict")
             full_ratio = float(ev["ev_ratio"])
             # `_single_ticket_ev` 返回的 `prize_assumption` 是**人读字符串**，
             # 不是 dict；这里两者都保留：dict 供结构化渲染，text 供披露文本。
@@ -266,5 +326,237 @@ def portfolio_blue_coverage(
             assumption = None
     out = BC.optimize(n_tickets, full_ev_ratio=full_ratio,
                       prize_assumption=assumption)
+    # 显式标注六等奖口径 —— 今天为这一个数倒了三个人核算，
+    # 加一个字段，后面任何人看一眼响应就知道它用的是哪个口径，不必读代码。
+    # 取值只有 "strict"（本端点）与 "published"（引擎默认/历史发表值）。
+    # full_ev=False（未请求整注口径）时没有 ev_ratio_full，此字段为 None ——
+    # 不能填 "published"，那会让调用方以为拿到了一个实际的整注口径值。
+    out["sixth_mode"] = "strict" if full_ratio is not None else None
     out["ok"] = True
     return _jsonable(out)
+
+
+# ==========================================================================
+# V14 能力清单端点：把"系统做不到什么"变成可核对的 API
+#
+# 【为什么需要这个端点】
+# 用户曾因"同一系统两个 usable"怀疑系统造假 —— `idle_mining.usable`（证据项）与
+# `patterns_runtime.usable_replayable`（可回放出号规律）是两个不同口径，数字不同
+# 是**正确**的，但没有一处统一说明，用户只能看到两个互相矛盾的数字。
+#
+# 本端点的价值不是展示能力，而是**让用户自己看到系统不吹牛**：
+#   · 每条结论必须带 `evidence`（实测数字 + 出处）与 `honest_note`；
+#   · 明确区分 `value` 是「文档记录值」还是「本次实测值」，不许混用；
+#   · 四条结论里有三条是"做不到/极弱"，只有一条是真实收益且立刻附成本与返奖比。
+#
+# 【绝对禁止】
+# 不许出现营销措辞，不许把"能排序"说成"能预测"，不许省略负面证据。
+# ==========================================================================
+
+def _capability_items() -> List[Dict]:
+    """能力清单的四条结论（纯数据，便于单测直接比对）。
+
+    `evidence` 里的每个数字都必须能在代码或 `docs/reviews/` 找到出处，
+    `source` 字段写明出处；`measured_now=True` 表示该值是**本次进程实测**，
+    否则是**文档记录值**（可能随数据更新而漂移，故标注口径）。
+    """
+    # 当前实测（本次进程）：popularity 模型的增量 R² / 置换 p。
+    # 注意这与文档写的 +0.0077 / p=0.005 **不一致** —— 口径相同（扩展窗口时序
+    # + 置换 200 次），但数据期数不同（文档基于 3266 期，当前库 3517 期）。
+    # 如实并列，不挑一个好看的说。
+    try:
+        from . import popularity as POP
+        _m = POP.get_model()
+        _r2_now = (round(float(_m.r2_increment), 5) if _m.fitted else None)
+        _p_now = (round(float(_m.p_value), 4) if _m.fitted else None)
+    except Exception:            # noqa: BLE001 —— 取不到就不给"实测"字段
+        _r2_now, _p_now = None, None
+
+    return [
+        {
+            "id": "predict_numbers",
+            "name_zh": "预测下一期号码",
+            "verdict": "cannot",
+            "verdict_zh": "做不到",
+            "summary_zh": ("号码本身不可预测。系统全部分析的正确结论是"
+                           "「本期开奖与历史无关」，不是「下一期会开什么」。"),
+            "evidence": [
+                {"claim_zh": "红球频次卡方检验",
+                 "value": "χ²=44.84, df=32, p=0.0654",
+                 "reading_zh": "不能在 α=0.05 下拒绝「均匀」。注意 p=0.065 仍 > 0.05，"
+                               "**没有**达到显著；即使显著也只说明历史频次有起伏，"
+                               "不构成下期预测力。",
+                 "source": "docs/reviews/V14_STAT_REVIEW.md（q2d_chisq.py，全史实测）"},
+                {"claim_zh": "条件熵：知道上期是否出现，能降多少不确定性",
+                 "value": "H=5.0355 vs 5.0431，仅降 0.0076 bit",
+                 "reading_zh": "降幅 0.15%，在噪声内 —— 上期开奖对下期几乎零信息。",
+                 "source": "docs/reviews/V14_TEAM_VERDICT.md:19"},
+                {"claim_zh": "最强候选在最大统计量零分布下的 p 值",
+                 "value": "max e=28.34 → p=0.2995（4000 次零分布）",
+                 "reading_zh": "纯随机数据中出现「至少一条这么强」的概率约 30%。"
+                               "**候选看起来的强度是多重比较造成的假象**。",
+                 "source": "docs/reviews/V14_TEAM_VERDICT.md:23"},
+            ],
+            "honest_note": (
+                "本系统不会、也不能提高任何一注的中奖概率。单注头奖概率恒为 "
+                "1/17,721,088。所有「按规律出号」的模块都受结构门控约束，"
+                "它筛选的是**形态**，不是提高命中。"
+            ),
+        },
+        {
+            "id": "detect_bias",
+            "name_zh": "检出现实中是否存在号码偏置",
+            "verdict": "partially",
+            "verdict_zh": "能检出 ≥+8%/号，检不出 +5%~+6%/号",
+            "summary_zh": ("这是统计检验的灵敏度问题，不是算法缺陷。以现有 3516 期的"
+                           "信息量，偏置约 +6% 以下注定检不出，会如实报 0 条证据项 —— "
+                           "**那不是「系统证明没有偏置」，而是「系统分辨不了」。**"),
+            "evidence": [
+                {"claim_zh": "注入实验：人为注入偏置后能否检出",
+                 "value": "+5% → e=13.44 漏报；+6% → e=53.94 漏报；"
+                          "+8% → e=1.23×10⁴ 检出",
+                 "reading_zh": "检出边界在 +6%~+8% 之间；把门槛从 2700 降到 960 "
+                               "（降 2.8 倍）后边界**完全没有移动**。",
+                 "source": "docs/reviews/V14_STAT_REVIEW.md:240（q4f_value_of_fix.py）"},
+                {"claim_zh": "通过门槛所需的相对效应量",
+                 "value": "V0 门槛 2700 需 delta=0.0683（+6.3%）；"
+                          "V2 门槛 960 需 delta=0.0645（+5.9%）",
+                 "reading_zh": "门槛降 2.8 倍，所需效应量只降 0.4 个百分点 —— "
+                               "e 值对效应量是四次方级敏感。",
+                 "source": "docs/reviews/V14_STAT_REVIEW.md:175"},
+                {"claim_zh": "最强真实候选的实测效应",
+                 "value": "delta=0.0496（相对 +4.5%），低于检出门槛 +5.9%",
+                 "reading_zh": "所以生产环境报 0 条是**如实**结果，不是漏算。",
+                 "source": "docs/reviews/V14_STAT_REVIEW.md:177"},
+            ],
+            "honest_note": (
+                "「证据项 0 条」\u2260「数据无偏置」。当系统报 0 时，正确读法是"
+                "「在现有样本量与 α=0.05 下无证据」，而不是「已证明随机」。"
+                "若未来真有 +5% 级偏置，系统会继续报 0。"
+            ),
+        },
+        {
+            "id": "popularity_rank",
+            "name_zh": "预判「这种号有多少人买」（大众偏好排序）",
+            "verdict": "weak",
+            "verdict_zh": "能做，但极弱（只能排序，不能定值）",
+            "summary_zh": ("号码是随机的，但**选号的人不是**。形态对头奖注数 `p1` "
+                           "的解释力真实存在，但只有约 1%，因此系统只输出"
+                           "低/中/高**档位**，从不输出预测注数。"),
+            "evidence": [
+                {"claim_zh": "形态对 p1 的增量 R²（文档记录值，3266 期）",
+                 "value": "+0.0077（0.77%）；3/5/8/10 折恒为 0.0077；"
+                          "剔除上 1% 异常值后 +0.0186",
+                 "reading_zh": "效应真实但极小。销量本身的 R²=+0.0205，"
+                               "即 p1 主要由销量驱动而非形态。",
+                 "measured_now": False,
+                 "source": "lottery/popularity.py 模块 docstring（实测留档）"},
+                {"claim_zh": "同一指标的**当前库实测值**（3517 期，本次进程）",
+                 "value": (f"R²={_r2_now}，置换 p={_p_now}" if _r2_now is not None
+                           else "模型未拟合，暂无实测"),
+                 "reading_zh": ("与文档记录值不同属于**正常**：两者口径相同"
+                                "（扩展窗口时序 + 置换），但数据期数不同。"
+                                "这里如实并列，不挑一个更好看的。"),
+                 "measured_now": True,
+                 "source": "popularity.get_model() 运行时实测"},
+                {"claim_zh": "置换检验",
+                 "value": "p ≈ 0.005（文档）/" + (f"{_p_now}（当前实测）"
+                                                if _p_now is not None else "—"),
+                 "reading_zh": "显著 \u2260 有用：显著只说明「不是零」，"
+                               "R²≈1% 说明「几乎预测不了」。",
+                 "source": "同上"},
+            ],
+            "honest_note": (
+                "0.77%~1.1% 的解释力只能给出粗略排序，**不能给出可用数值**。"
+                "所以本系统只输出档位。即便用它避开热门号，"
+                "实测期望增益仅 0.005~0.18 元/注（占 2 元成本的 0.3%~9%），"
+                "且**中奖概率完全不变**，长期期望仍为负。"
+            ),
+        },
+        {
+            "id": "blue_coverage",
+            "name_zh": "蓝球去重覆盖",
+            "verdict": "real_but_no_ev_gain",
+            "verdict_zh": "真实提高中奖**频率**，不提高期望收益",
+            "summary_zh": ("这是系统里**唯一**数学上确凿可兑现的改进：把 n 注的蓝球取"
+                           "互不相同，P(≥1 注中蓝) 从 1-(15/16)^n 变成 min(n,16)/16。"
+                           "但它改变的是**中奖分布**，不是期望值。"),
+            "evidence": [
+                {"claim_zh": "10 注：至少中一次蓝球的概率",
+                 "value": "随机重复 47.55% → 去重覆盖 62.50%（成本 20 元）",
+                 "reading_zh": "提升是组合恒等式，全枚举可证，零造假风险。",
+                 "source": "lottery/blue_coverage.py 模块 docstring 对照表"},
+                {"claim_zh": "六等奖返奖比（n ≤ 16）",
+                 "value": "恒为 15.625%，与注数无关",
+                 "reading_zh": "这是「覆盖优化不改变期望」的直接证据："
+                               "(5×n/16)/(2n) = 5/32，n 被完全约掉。",
+                 "source": "blue_coverage.optimize 实测 n=1..16"},
+                {"claim_zh": "n > 16 时返奖比会**下降**（覆盖饱和）",
+                 "value": "n=17 → 14.71%；n=50 → 5.00%；n=100 → 2.50%",
+                 "reading_zh": "蓝球池只有 16 个，超出部分必然重复："
+                               "概率封顶 1.0 而成本继续线性涨。",
+                 "source": "blue_coverage.optimize 实测；见 coverage_saturated 字段"},
+                {"claim_zh": "整注（一~六等全计）返奖比",
+                 "value": "约 53.2%（依赖奖金假设：一等 684 万 / 二等 20.5 万）",
+                 "reading_zh": "一/二等奖是浮动奖，必须连假设一起看；"
+                               "长期仍为负期望。",
+                 "source": "/api/portfolio/blue-coverage 的 prize_assumption 字段"},
+            ],
+            "honest_note": (
+                "覆盖优化提高的是**中奖频率（体感）**，不是期望收益。"
+                f"同样 10 注，成本 20 元，六等奖期望回收仅 3.13 元。"
+                "中头奖概率恒为 1/17,721,088，**不受选号或覆盖策略影响**。"
+            ),
+        },
+    ]
+
+
+@router.get("/api/portfolio/capabilities")
+def portfolio_capabilities() -> Dict:
+    """能力清单：系统「做不到什么」的逐条自证，带实测数字与出处。
+
+    ## 这个端点为什么存在
+
+    用户曾因**「同一系统两个 usable」**怀疑造假：
+
+    * `idle_mining` 的 `rule_evidence`（也叫过 `usable`）= 统计上过阈的证据项条数；
+    * `patterns_runtime` 的 `usable_replayable` = 能**可复现回放出号**的规律条数。
+
+    两者数字不同是**正确**的（一个是"有证据"，一个是"能出号"），但如果没一处
+    统一说明，用户只会看到两个打架的数字。本端点把口径摊开，并把
+    "预测号码：做不到"这类结论明确写出来。
+
+    ## 返回结构契约
+
+    * `capabilities[*].verdict` ∈ `cannot` / `partially` / `weak` /
+      `real_but_no_ev_gain` —— **只有最后一类是真收益，且必附"不提高期望"**；
+    * `capabilities[*].evidence[*]` 每条都带 `source`（出处），
+      带 `measured_now=True` 的是本次进程实测，否则是文档记录值；
+    * 顶层 `disclaimer` 固定陈述「本系统不改变中奖概率与期望值」。
+
+    ## 不做什么
+
+    不做营销文案，不把"能排序"说成"能预测"，不省略任何负面证据，
+    不使用「提高中奖率/提高命中率/更划算/稳赚」这类词。
+    """
+    items = _capability_items()
+    return _jsonable({
+        "ok": True,
+        "n_capabilities": len(items),
+        "capabilities": items,
+        "verdict_summary": {
+            "cannot": 1,          # 预测号码
+            "partially": 1,       # 检出偏置（有灵敏度下限）
+            "weak": 1,            # 大众偏好排序（只能排序）
+            "real_but_no_ev_gain": 1,   # 蓝球覆盖（提高频率不提高期望）
+        },
+        "disclaimer": (
+            "本系统不改变任何一注的中奖概率，也不改变期望值。"
+            "双色球为独立随机事件，长期期望为负（整注返奖比约 53.2%）。"
+        ),
+        "usage_note_zh": (
+            "读这个端点的正确方式：先看「做不到」和「极弱」的四条，"
+            "再看唯一一条真实收益（蓝球覆盖）后面跟着的成本与返奖比。"
+            "凡是本端点没写进 evidence 的数字，都不要当成结论。"
+        ),
+    })

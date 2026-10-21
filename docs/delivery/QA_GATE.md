@@ -1,0 +1,821 @@
+# 独立验收闸门（QA Gate）
+
+> 维护：严QA（独立验收） · 建档：2026-10-21
+> 定位：本文件是「**这算不算完成**」的唯一判据。任何人声称完成，都要过这里。
+> 原则：**不看截图、不看文字汇报，自己跑、自己数、自己复算。**
+
+---
+
+## §0 三条红线
+
+红线不是"注意事项"，是**一票否决**。触线即打回，不接受解释。
+
+### 红线 1 —— 测试只增不减
+
+```
+1358 passed, 24 skipped, 1 xfailed
+```
+
+- `passed` **少于 1358** → 打回。
+- `skipped` **多于 24** 且无书面理由 → **隐性减测试**，等同删测试，打回。
+- `xfailed` **多于 1** 且无书面理由 → 同上，打回。
+- 新增测试允许增加上述数字，但**必须说明增量对应哪个行为**。
+
+> 只盯 `passed` 是不够的。把一条测试改成 `skip` 或 `xfail`，`passed` 会掉，
+> 但把三条测试合并成一条 skip 的测试，`passed` 可能看不出来。**三个数一起看。**
+
+### 红线 2 —— 口径常量不得写死
+
+`306 / 72350 / 0.05 / 52.3% / 15.625%` 这类数字，**必须由计算得出**，
+不得以字面量出现在生产代码路径里。写死 = 无法随数据更新而更新 = 假完成。
+
+（例外：`docs/` 下的说明文档、测试里作为**期望值**的断言常量。）
+
+### 红线 3 —— 声称"已实现"必须被实际调用过一次
+
+只给代码 = 未完成。必须附**实际调用证据**：端点 `curl` 响应、函数 REPL 输出、
+页面实际渲染结果。**没有输出 = 没有实现。**
+
+---
+
+## §4 基线（硬地板）
+
+### 4.1 基线有两个口径 —— 必须标明是哪一个
+
+| 口径 | 是什么 | 用途 |
+|---|---|---|
+| **HEAD 口径** | 在独立 worktree 里跑 `HEAD`，不含任何未提交工作 | 证明**已提交部分**干净 |
+| **工作区口径** | 在项目目录跑当前工作区 | 证明**当前集成状态** |
+
+两者数字不同是**正常的**，但报告里**必须写明哪个是哪个** —— 否则数字之间无法比对。
+
+### 4.2 HEAD 口径
+
+```bash
+cd /root/DSH/应用/ssqyuce
+git worktree add /tmp/qa-baseline HEAD
+cd /tmp/qa-baseline
+ln -s /root/DSH/应用/ssqyuce/.venv .venv   # ⚠️ 见 §4.4
+mkdir -p data
+set -o pipefail
+.venv/bin/python -m pytest tests/ -q --ignore=tests/frontend
+```
+
+| 项目 | 值 |
+|---|---|
+| 基准 commit | `0f5656d`（`db634e3` 复核一致） |
+| passed | **1358** |
+| skipped | **24** |
+| xfailed | **1** |
+| 耗时 | ≈ 480s |
+
+### 4.3 工作区口径
+
+```bash
+cd /root/DSH/应用/ssqyuce
+set -o pipefail
+.venv/bin/python -m pytest tests/ -q --ignore=tests/frontend
+```
+
+工作区数字随成员提交变化。**判定下限仍是 `passed ≥ 1358` 且 `failed == 0`。**
+高于 1358 是正常的（新增测试），但**必须能说明增量对应哪些行为**。
+
+### 4.4 ⚠️ worktree 里跑测试的三个环境陷阱（实测踩到）
+
+1. **`.venv` 不跟随 worktree** —— 它被 `.gitignore` 忽略，worktree 里没有。
+   `tests/test_db_guard.py:19` 硬编码 `ROOT / ".venv/bin/python"` 起子进程，
+   于是 3 条测试报 `FileNotFoundError`，**看起来像 HEAD 有缺陷，其实是环境缺失**。
+   → 解法：`ln -s <main>/.venv .venv`。
+2. **`data/` 目录不存在** —— 同上，未跟踪。
+3. **判定前必须先排除"环境型失败"** —— 凡 `FileNotFoundError` / `No module named`
+   一律先查环境，不要直接判 HEAD 有缺陷。
+
+> **教训**：worktree 是"干净 checkout"，不是"可运行 checkout"。
+> 看到 worktree 里的失败，**先问是不是环境**，再问是不是代码。
+
+---
+
+## §5 全跑纪律（本项目的血泪条款）
+
+### 5.1 一律全跑，不许单跑交差
+
+本项目有**镜像双源前科**：`monkeypatch` 只打桩薄壳、真源未变，
+单跑该文件通过、全量跑才失败，且**依赖测试顺序**。
+
+因此：**单跑通过不构成完成证据**。任何"改完我跑过了"必须附**全跑**输出。
+
+### 5.2 ⚠️ 不许只看 exit code
+
+**这是本闸门最容易被绕过的一条。**
+
+实测（见案例 #1）：pytest 收集阶段崩溃时，原始退出码是 `2`，
+但命令写成 `pytest ... 2>&1 | tail -20` 后，管道取的是 `tail` 的退出码 **0** ——
+**一场灾难被当成通过**。
+
+规则：
+
+1. **必须解析 stdout 里的 `passed` 计数**，不许用 exit code 当唯一判据；
+2. `passed` 字样**缺失** → 判 **failed**（说明收集阶段就崩了）；
+3. 解析出的 `passed < 1358` → 判 **failed**；
+4. 若用管道，shell 必须 `set -o pipefail`，或改用 `PIPESTATUS[0]`。
+
+```bash
+# 正确写法
+set -o pipefail
+OUT=$(.venv/bin/python -m pytest tests/ -q --ignore=tests/frontend 2>&1)
+echo "$OUT" | tail -20
+echo "$OUT" | grep -qE '^[0-9]+ passed' || { echo "GATE FAIL: 无 passed 计数（收集崩溃）"; exit 1; }
+```
+
+### 5.3 冒烟前置检查（秒级，先于全跑）
+
+```bash
+.venv/bin/python -c "import lottery.engine, lottery.api_app, lottery.routes_predict; print('imports ok')"
+```
+
+**必须输出 `imports ok`。** 放在全跑之前，秒级捕获循环导入 / 模块缺失，
+不用等 8 分钟才发现。
+
+### 5.4 结构性变更的"收集阶段"必须单独校验
+
+拆包、改目录、改导入结构这类变更，**`pytest --collect-only` 必须单独跑一次**：
+
+```bash
+.venv/bin/python -m pytest tests/ -q --ignore=tests/frontend --collect-only
+```
+
+期望：`1445 tests collected` 且 **0 error**。
+
+理由：收集阶段崩溃时**一条都跑不了**，而它和"跑了几条但失败"在输出上完全不同。
+拆分类变更必须**改一步、验一次收集、再全跑**，不得批量改完再测。
+
+---
+
+## §6 变异测试清单（我的主要武器）
+
+### 为什么必须做
+
+"新增了守卫测试"和"守卫真的能抓住缺陷"是两件事。
+**注入缺陷后测试仍全绿 ⇒ 测试是假的。** 这是抓"假测试"最有效的手段。
+
+### 6.1 判定标准
+
+| 变异结果 | 判定 |
+|---|---|
+| 注入后 **failed** | ✅ 测试有牙 |
+| 注入后仍 **passed** | ❌ **假测试**，立即打回并指出缺哪个守卫 |
+| 注入后 **崩溃/挂起** | ⚠️ 需单独解释（可能暴露死循环等更严重问题） |
+
+### 6.2 必须复原
+
+每个变异做完**立即复原**，并以 `git diff` 为空作为复原证据：
+
+```bash
+git diff --stat        # 必须为空
+git status --short     # 不得残留
+```
+
+**未复原即离开工作区 = 污染他人验收 = P0 事故。**
+
+#### 6.2.1 ⚠️ 「复原」必须用输出证明，不能只看退出码（严QA 实测踩坑）
+
+`git diff --stat` 为空的**前提是那个仓库有对应基线提交**。
+若在 `git archive` 重建的隔离副本里作业，副本的 git 仓库是空历史，
+`git checkout -- .` **静默无效**、`git diff` **永远为空** ——
+两者都在撒谎，而退出码都是 `0`。
+
+**我的实际事故**：M1 跑完后执行 `mutate.py revert`，命令返回 0，`git diff` 为空，
+我以为复原了；实际 `grep` 发现 `k_star = rank + 1` **还留在文件里**。
+若不复核，M2 会叠加在 M1 的残留变异上，**结论全废**。
+
+**正确做法**（隔离副本专用）：
+
+```bash
+# 从 git archive 精确覆盖受测文件，再 grep 校验真值回位
+cd /root/DSH/应用/ssqyuce
+git archive 0f5656d lottery/stats/eprocess.py lottery/engine.py | tar -x -C /tmp/qa/base_0f5656d
+grep -n "k_star = rank$" /tmp/qa/base_0f5656d/lottery/stats/eprocess.py   # 必须命中
+```
+
+**规则**：
+1. 每次复原后必须**用 `grep` 命中真值**作为证据，不接受 "diff 为空"；
+2. 变异注入后同样必须**用 `grep` 命中变异**作为证据（证明真的写进去了）；
+3. 每个变异跑前跑后各校验一次，**共 2 次**。
+
+### 6.3 本轮已建立的标准变异锚点
+
+| # | 变异 | 位置 | 期望 | 实测 |
+|---|---|---|---|---|
+| M1 | `k_star` → `k_star+1` | `lottery/stats/eprocess.py:216` | 单跑 `test_p4_eprocess.py` **必红** | ✅ **4 failed, 20 passed** |
+| M2 | `m` 硬编码为 `1` | `lottery/stats/eprocess.py:206` | 同上 | ✅ **4 failed, 20 passed** |
+| M3 | `pass_constraints` 奇偶分支反转 | `lottery/engine.py:91` | 全跑必红 | ✅ **1 failed, 54 passed（22.6s）** |
+
+> **M1/M2 的历史意义**：这两个变异曾经**在 `test_p4_eprocess.py` 中存活**
+> （17 passed 全绿抓不住 e-BH 被改坏）。原因是 `ebh_selected` 的单元测试
+> 长在 `test_p4_candidate_space.py` 里。
+> **D-10 修复后（`ee7560b`）**：断言已搬回 `test_p4_eprocess.py`，
+> 现单跑即可捕获，**存活窗口已关闭**。
+>
+> ## ⚠️ M3 的自我更正（必读）
+>
+> **我最初把 M3 记为「挂起而非变红」，那是错的，现已撤回。**
+>
+> * 原记录：12:5x 在 worktree `/tmp/qa/wt-db634e3` 注入 M3，后台跑三文件，
+>   12 分钟无输出 → 判「挂起」，并给出「重试 60 次耗尽 ⇒ 死循环」的机理。
+> * **复现失败**：同一注入在主工作区跑 → `1 failed, 54 passed in 22.60s`，**正常变红**；
+>   在无 `data/` 的 worktree 重跑 → `1 failed, 54 passed in 25.28s`，同样变红。
+> * **机理是猜的，且与源码矛盾**：`sample_stat_ticket` 60 次重试后 **返回 `None`**，
+>   不是死循环；`battle.py:180` 的 `while` 有 `guard < max(60, 20*len(plan))` 上限。
+>   **代码里没有无界重试。**
+> * 最可能的真相：**后台 job 的输出缓冲**。pytest 重定向到文件，
+>   我读 `job_output` 拿不到未 flush 的内容，就把"没输出"当成"挂起"。
+>
+> **三条教训（比 M3 本身重要）**：
+> 1. **`job_output` 没输出 ≠ 进程挂起。** 判挂起必须看进程状态
+>    （`ps` / CPU / `faulthandler`），不能只看日志缓冲。
+> 2. **机理分析必须被代码证实。** 我没读上层调用方就断言死循环 —— 猜测冒充诊断。
+> 3. **变异的异常结论必须在工作区口径复现一次再入闸门**；
+>    worktree 的异常先按 §4.4 排查环境。
+
+### 6.3b 另一条独立复核记录（严QA，`0f5656d` 隔离副本，2026-10-21）
+
+我在 `/tmp/qa/base_0f5656d`（`git archive 0f5656d` 重建）上独立重做了 M1/M2，
+并补了两个变异。**§6.3 与本节是两次独立实验，数字不同，原因见下。**
+
+| # | 变异 | 位置 | 定点单跑 | 全套 | 判定 |
+|---|---|---|---|---|---|
+| M1 | `k_star = rank` → `k_star = rank + 1` | `lottery/stats/eprocess.py:215` | `test_p4_eprocess.py`：**1 failed, 23 passed** | **1 failed, 1357 passed, 24 skipped, 1 xfailed** | ✅ 捕获 |
+| M2 | `m = int(m_total) ...` → `m = 1` | 同文件 `:206` | — | **5 failed, 1353 passed, 24 skipped, 1 xfailed** | ✅ 捕获 |
+| M3 | `alpha = ...` → `alpha = 0.5`（**红线 2 变体：偷偷放宽门槛**） | 同文件 `:209` | — | **3 failed, 1355 passed, 24 skipped, 1 xfailed** | ✅ 捕获 |
+| M4 | `_renormalize` 的 `v / tot if v > 0` → `if v >= 0` | `lottery/engine.py:513` | — | **1358 passed（全绿）** | ❌ **存活** → 见下 |
+
+**⚠️ 与 §6.3 的数字差异必须解释清楚**（否则两处记录互斥）：
+
+- §6.3 的 M1/M2 记「4 failed, 20 passed」，我记「1 failed, 23 passed」/「5 failed」。
+- 差异原因有两个，都是**真实的**：
+  1. **定点跑的文件状态不同**（§6.3 那次可能叠加了他人工作区改动，我这次是纯 `0f5656d`）；
+  2. **失败条数取决于有多少条测试恰好踩在阈值边界上** —— `m→1` 会同时移动多个用例的判定结果，比 `k_star+1` 影响面大。
+- **不影响结论**：两个变异在两次独立实验中**都被捕获**。判定一致。
+
+#### M4 存活说明（严QA 分诊，不写「影响不大」）
+
+**根因 1：`_renormalize` 没有任何直接测试。**
+```
+grep -rn "_renormalize" tests/     → 0 处
+grep -rn "_renormalize" lottery/   → 2 处：定义 engine.py:508、调用 engine.py:466
+```
+`test_v4_evolution.py:120 test_apply_overrides_renormalizes_red_and_blue` 名字近似，
+但它测的是 **`lottery/evolution.py` 的 `apply_overrides_to_probs`** —— 不同模块。
+**「名字像」制造了覆盖率的假象**，是本项目「纯性测试盯错对象」坑的又一例。
+
+**根因 2：只在 `if adaptive:` 分支下才执行（`engine.py:465`）。**
+现有测试走 `predict_next` 时 `adaptive` 基本为空，466 行从未执行 —— 变异落在**未执行路径**。
+
+**根因 3（本质，决定这是「等价变异」还是「假测试」）：该差异在现有输入域内不可观测。**
+`adaptive` 是以 `adaptive.get(name, 1.0)` **乘性**施加的，取值恒为正；
+要触发 `v == 0` 走 `else 0.0`，必须存在一个 `v == 0` 的权重项且 `tot > 0`，
+而权重为 0 只在模型完全缺席时出现 —— 那时 `tot ≤ 0`，走的是上面的回退分支。
+**结论：M4 属于「等价变异」，测试没有义务捕获它，不算假测试。**
+
+**但它暴露了真实缺口**：`_renormalize` 的分母/回退语义**没有任何直测**，
+一旦有人真的改坏 `tot` 计算或引入负权重，**不会有任何测试响**。
+
+#### 由此量化出的 D-02 风险（**转入 D-02 验收条件**）
+
+对 `lottery/engine.py` 顶层私有函数机械盘点：**56 个中，测试从未引用 30 个（53.6%）**：
+
+```
+_last_sums, _weighted_sample, _with_meta, _model_builder_table, _renormalize,
+_apply_adaptive_red, _last_feedback, _norm_sorted_reds, _rule_matches_ticket,
+_rule_noise_explainer, _pick_verify_cfg, _latest_audit_digest, _ml_result_block,
+_popcount_lut, _popcount33, _red_mask, _all_red_masks, _validate_tickets,
+_pairwise_stats, _variance_from_abar, _var_ratio, _poisson_binomial_at_least_one,
+_iid_tail_probs, _balanced_min_sum_a, _balanced_counts, _balanced_portfolio,
+_portfolio_plan, _candidate_pool, _exact_p_at_least_r, _search_max_p_at_least_r
+```
+
+→ **D-02 拆分这 30 个函数时，现有测试一条都守不住。**
+D-02 的等价性验证脚本**必须覆盖到这些私有函数能影响的路径**，否则「拆分无行为变化」无从证明。
+
+---
+
+## §6.4 未跟踪的测试文件不会随 `git stash` 消失
+
+**这是本轮最昂贵的一条教训（案例 #2）。**
+
+未跟踪（`??`）的测试文件**不受 `git stash` 影响**，而它测的实现若已被改（或已提交），
+就会一起 `stash` 走 —— 结果是**功能消失、测试留下**。
+
+因此「测试红了」有**两种**可能，必须先分诊再定性：
+
+| 可能 | 判别 | 处置 |
+|---|---|---|
+| ① 代码真的坏了 | `grep 功能名 lottery/ routes_*.py` **有**命中 | 按缺陷处理，打回 |
+| ② 代码被 stash 走了、测试还在 | `grep` **零命中** + `git stash list` 非空 | **不是缺陷**，是工作区事故 |
+
+```bash
+# 分诊两连
+grep -rn "功能名" lottery/ routes_*.py   # 零命中？
+git stash list                            # 非空？
+```
+
+**任何时候 `git stash` 前，必须先看 `git stash show --stat` 列出的文件清单，
+确认没有夹带与当前事故无关的改动。**
+
+---
+
+## §6.5 并发改动期间的工作区状态，不得作为结论依据
+
+**触发事件**：2026-10-21 12:40 前后，`engine.py` 正被改名为包，我在该窗口内观察并转述
+「`engine.py` 已删除、`lottery/engine/` 已建」，随后被当作**持续事实**传播，
+衍生了「保 `engine.py:1180` 必须先拿映射」等错误推论。实际处置已完成回滚。
+
+**规则**：
+
+1. **工作区是流动的，不是事实源。** 并发改动期间观察到的一切状态，都只是**某一时刻的快照**。
+2. **引用任何状态，必须注明观察时刻**，例如「13:02 实测」。
+3. **不得由瞬时状态推导持续性结论。** 「此刻是 D」≠「已被删除」，也 ≠「拆分进行中」。
+4. **使用前重测。** 转述超过 5 分钟的状态必须重跑 `git status` / `ls` 再引用。
+5. **优先引用不变量**而非状态：
+   - ❌「engine.py 已删除」→ 会过期
+   - ✅「`import lottery.engine` 失败」→ 可随时重测
+   - ✅「`lottery/engine/` 目录存在」→ 可随时重测
+
+**反直觉之处**：这条纪律**不是防别人骗你**，是**防你信自己五分钟前的观察**。
+后者更难防，因为它不需要怀疑任何人，只需要怀疑自己。
+
+**推论（写入 §4.4 的一条强化）**：worktree 里的异常，先怀疑环境（缺 `.venv` / `data/`），
+再怀疑代码；工作区里的异常，先确认**观察时刻**，再确认**观察对象**。
+
+---
+
+## §6.6 `job_output` 无输出 ≠ 进程挂起
+
+**触发事件**：2026-10-21，注入 `pass_constraints` 奇偶分支反转后，后台跑测试 12 分钟无输出，
+我据此判定「挂起」，并给出「重试 60 次耗尽 ⇒ 死循环」的机理分析。**两者都是错的。**
+复现结果：同一注入正常变红（`1 failed, 54 passed in 22.6s`）；
+源码里 `sample_stat_ticket` 60 次后返回 `None`，`battle.py` 的 `while` 有 `guard` 上限 —— **无无界重试**。
+
+**规则**：
+
+1. **判定"挂起"必须看进程状态**，不能只看日志缓冲：
+   ```bash
+   ps -o pid,stat,%cpu,etime,cmd -p <pid>   # 有 CPU 占用 = 在跑，不是挂
+   ```
+2. **看堆栈用 `faulthandler` 或 `SIGABRT`**：
+   ```bash
+   timeout -s ABRT 60 .venv/bin/python -m pytest ...   # 崩时打印全部线程栈
+   ```
+3. **命令行直接跑**（前台、带 `timeout`），不要用后台 job 判断是否挂起 ——
+   后台 job 的输出是流式的，缓冲会导致"看起来没动静"。
+4. **机理结论必须能被代码证实。** 说出"死循环"之前，必须指出**具体哪一行是无界的**。
+   指不出来，就是猜测，不是诊断。
+
+> 这两条（§6.5 / §6.6）的共同点：**我都是在"信息不足以支撑结论"时下了结论。**
+> QA 的价值在于判得准，不在于判得多。**宁可写"未验证"，不可写"已确认"。**
+
+---
+
+## §7 案例库
+
+### 案例 #2：30 条测试红，成因不是代码坏了而是「实现睡在 stash 里」
+
+```
+红线：红线 1 未破（1390 passed > 1358），但**基线失效**
+等级：P0 —— 地板没了，所有人判断对错的参照物消失
+现象：30 failed, 1390 passed, 24 skipped, 1 xfailed
+      清一色 AttributeError: module 'lottery.routes_portfolio' has no attribute 'portfolio_capabilities'
+根因：为处置案例 #1 执行 git stash，带走了 7 个文件，其中 3 个与事故无关
+      （routes_portfolio.py 269 行、popularity.py、blue_coverage.py）
+      但 tests/test_v14_portfolio_api.py（未跟踪）留在工作区
+检出方式：先 grep 功能名 → 零命中；再 git stash list → 发现 stash@{0}
+教训：stash 是"原子提交的反面" —— 它不区分"这次事故的改动"与"别人的工作"
+```
+
+**我的实测证据**：
+
+```
+grep -rn "def portfolio_capabilities" lottery/   → 零命中
+git log --all -S "portfolio_capabilities"        → 零命中（从未提交）
+git stash show --stat stash@{0}                  → 7 文件，含 routes_portfolio.py | 269 行
+```
+
+**为什么这条比"破红线"更严重**：
+红线破了，你知道数字不对；
+**地板没了，你不知道任何数字对错。** 此刻所有成员的"我跑过了"都失去意义。
+
+**关键判断（区分 QA 与"跑测试的机器"）**：
+看到 30 failed，第一反应通常是"谁把代码改坏了"。
+但 `passed` 从 1358 涨到 1390 说明**测试变多了** —— 如果真是代码坏了，
+`passed` 不该增加。**这个反常才是线索。**
+
+**恢复纪律**：❌ 不要 `git stash pop`（会连同事故本体一起恢复，复发）；
+✅ 逐文件 `git show stash@{0}:<path> > <path>`，**先比对行数与内容**，
+只恢复确实需要的；恢复前把当前文件备份到 `/tmp`。
+
+---
+
+### 案例 #1：包转换致循环导入，全套测试崩
+
+```
+红线：红线 1（测试只增不减）
+等级：P0 —— 不是"少了几条"，是"一条都跑不了"
+根因：from . import X 的相对导入语义在包转换后改变
+检出方式：全跑（单跑任一文件都可能通过，证据：收集阶段才崩溃）
+教训：拆分类变更必须"改一步、全跑一次"，不得批量改完再测
+```
+
+**事故经过**：`lottery/engine.py` 被改名为 `lottery/engine/__init__.py`（包形式）。
+包内 `from . import backtest as BT` 的相对导入目标从 `lottery.backtest`
+变成 `lottery.engine.backtest` → 循环导入 → **10 个测试文件收集失败**。
+
+**我的独立核实**：
+
+| 核实项 | 转述值 | 我的实测 | 结论 |
+|---|---|---|---|
+| 崩溃现象 | `Interrupted: 10 errors during collection` | 已复原，当前无此现象 | — |
+| `engine.py` md5 | `d8a80a84dee2b586ec171981eef323e1` | `md5sum` 一致，且与 `git show db634e3:lottery/engine.py` 一致 | ✅ 复原成功 |
+| 收集崩溃时 exit code | **0** | pytest 原始退出码 **2**；`\| tail` 管道下才是 **0** | ⚠️ **转述不准确** |
+
+**⚠️ 对"exit code 是 0"的更正（重要）**：
+
+实测四种写法，pytest 自身**始终返回 2**：
+
+```
+mode='-q'                        -> exit=2
+mode='--collect-only -q'         -> exit=2
+mode='-q --ignore=tests/frontend'-> exit=2
+pytest ... | tail -2             -> PIPESTATUS[0]=0   ← 管道取的是 tail 的退出码
+pipefail + pytest ... | tail -2  -> 2
+```
+
+**所以不是 pytest 的缺陷，是管道吞掉了退出码。**
+这正是 §5.2 存在的理由：**任何脚本化检查若写成 `pytest | tail`，都会把灾难当通过。**
+根因认识错了，防护就会写错地方 —— 以为要绕开 pytest 的 exit code，
+实际要防的是自己的管道。
+
+**永久防护（建议守卫测试）**：
+
+```python
+def test_engine_has_no_subpackage_of_its_own_name():
+    """防止 `lottery/engine.py` 再被改成 `lottery/engine/` 包。
+
+    包转换会让 `from . import backtest` 从 `lottery.backtest` 变成
+    `lottery.engine.backtest`，产生循环导入，全套测试在收集阶段崩。
+    """
+    from pathlib import Path
+    repo = Path(__file__).resolve().parents[1]
+    assert not (repo / "lottery" / "engine").is_dir(), (
+        "lottery/engine/ 不应存在 —— engine.py 必须是单文件模块，"
+        "转包会改变 `from . import X` 的解析目标，引发循环导入")
+```
+
+> 状态：**待落库**（我提出，需写入 `tests/`，属李工写域，已申报 Lead）。
+
+---
+
+## §7.5 【严QA 增补】两条必须现在处理的事实问题
+
+> 以下两条不是方法论，是**实测发现的问题**。放在 §7 之后、§8 之前，
+> 因为它们直接影响别人正在做的工作（D-01 / D-09 / D-10）。
+
+### 7.5.1 看板 D-09 / D-10 状态过期：「未开始」实际是「已修完」
+
+看板 §4 写 D-09「未开始」、D-10「未开始」。**实际两件事都已在 `ee7560b` 完成**
+（`0f5656d` 的祖父提交，commit message 明写「V14-A1/A2/A3」）。
+
+我的逐条核实：
+
+| 看板声称的问题 | 实际（`0f5656d`） | 状态 |
+|---|---|---|
+| `test_p4_candidate_space.py:54` 恒真断言 `assert a is None or b is not None` | 已改为**两次独立调用** `a = CS.candidate_at(...)` / `b = CS.candidate_at(...)` 后比较 `(a is None) == (b is None)`，并附完整真值表说明 | ✅ 已修 |
+| 该文件 `:199` 的 `... or True` | 整个 e-BH 段已删，改为守卫 `test_ebh_math_tests_live_in_eprocess_file`（读源码文本，禁止测试搬回） | ✅ 已修 |
+| `test_p4_eprocess.py` **0 处** `ebh_selected` | **14 处**命中；该文件 24 条测试（非 17 条） | ✅ 已修 |
+| D-10 验收：「搬后单跑必须能捕获 `k_star+1`」 | 我在 `0f5656d` 注入 `k_star+1`，**单跑 `test_p4_eprocess.py` 即 1 failed** | ✅ **今天仍成立** |
+
+**→ 判定：D-09 / D-10 = 已完成。看板须改状态，不要派人重做。**
+
+**这一条最该警惕的地方**：如果我照着看板施工，就会**重写一遍已经正确的断言**，
+可能把真断言改坏、或在正确的测试上再叠一层，然后报「完成」。
+**看板过期本身不造成损失，照着过期看板施工才会。**
+
+→ 建议给看板加一条规则：**任何「未开始」都必须附「在我方基准 commit 上，这个东西真的还不存在」的核实证据。**
+
+### 7.5.2 🔴 看板 D-01 验收标准 2 的 `16.73 元` 是错的
+
+看板 §2.1 验收标准 2 原文：
+
+> 「16 注=32 元，期望回收 **16.73 元**，回报率恒为 15.625%/52.3%」
+
+**这句话内部自相矛盾，且 16.73 是错的。** 我的独立重算：
+
+```bash
+cd /tmp/qa/base_0f5656d && .venv/bin/python -c "
+import sys; sys.path.insert(0,'.')
+import lottery.blue_coverage as bc
+p = 1/16
+print('TICKET_PRICE =', bc.TICKET_PRICE, ' SIXTH_PRIZE =', bc.SIXTH_PRIZE)
+print('六等奖单注返奖比 = (1/16)*5/2 =', p*5/2)
+print('16注全覆盖：成本', 16*2, '元  期望回收', 16*p*5, '元  回报率', (16*p*5)/(16*2))
+"
+```
+```
+TICKET_PRICE = 2.0  SIXTH_PRIZE = 5.0
+六等奖单注返奖比 = (1/16)*5/2 = 0.15625 = 15.625 %
+16注全覆盖：成本 32 元  期望回收 5.0 元  回报率 0.15625
+```
+
+**矛盾在哪**：若期望回收真是 16.73 元，则 16 注全覆盖回报率 = 16.73/32 = **52.28%**（≈52.3%）
+—— 而看板同一句又要求回报率「恒为 **15.625%**」。**两个数不能同时成立。**
+
+**正确口径**（16 注覆盖全部蓝球，只算确定可得的六等奖，不含浮动奖）：
+- 成本 **32 元**，**确定只中 1 注六等奖（5 元）**，期望回收 **5.00 元**，回报率 **15.625%**；
+- 52.3% 是「整注含浮动奖假设」的口径，**与 16 注全覆盖不是同一件事，不得混用**。
+
+**→ 判定：这句话打回重写。** 若刘工按 `16.73 元` 写前端披露，
+页面会展示一个**比实际高 3.3 倍的期望回收** —— 正是红线 2「不得造假」要防的情形，
+而它出现在**验收标准自己身上**。
+
+**建议替换为**：
+> 「16 注=32 元，**确定只中 1 注六等奖，期望回收 5.00 元**，回报率恒为 **15.625%**（不含浮动奖）；
+> 整注含浮动奖假设时约 52.3%，两种口径必须分别标注，不得混用。」
+
+### 7.5.3 附带：`or True` 的范围远超看板记载
+
+看板写「2 处恒真断言」。我全量扫描 `tests/`，**`or True` 共 5 处**：
+
+| 文件:行 | 内容 | 定性 |
+|---|---|---|
+| `test_v12_shape_rules.py:150` | `assert SR.check_shape(...) or True  # noqa` | ❌ 自废断言（测试体只有这一行）|
+| `test_v10_registry.py:326` | `assert "R2" in (reg["errors"] or []) or True` | ❌ 自废 |
+| `test_v10_ticket_distribution.py:297` | `assert "ev_ratio" not in d or True` | ❌ 自废（注释说「见下一条静态断言」，但**下一条并不存在**）|
+| `test_v6_regime.py:226` | `assert a["omission"] != ... or True` | ❌ 自废（但前一行已在逐键比较，仍有牙）|
+| `test_v6_regime.py:278` | `assert a["obs"][-1] != b["obs"][-1] or True` | ❌ 自废（前一行已比较 `[:-1]`，仍有牙）|
+
+`test_p4_candidate_space.py:199` 那处**已被 `ee7560b` 删除**（看板已知的那 2 处里，只有 `:54` 曾是真问题，也已修）。
+
+**→ 这不是 2 处，是 5 处，且全部是「真·自废」**（`x or True` 恒真，断言内容从不生效）。
+其中 `test_v12_shape_rules.py:150` **测试体仅此一行**，等于该用例什么都没测。
+建议新增 D-14，统一清理。
+
+---
+
+## §8 三态验收表模板
+
+每份验收必须给出三态，**不许只有"通过/打回"两态**：
+
+| 项 | 状态 | 证据 |
+|---|---|---|
+| 声称的行为 | 已验证 / 未验证 / 有风险 | 命令 + 实际输出 |
+| 新增测试有效性 | 已验证 / 未验证 / 有风险 | 变异注入输出 |
+| 未声明改动 | 已验证 / 未验证 / 有风险 | `git show --stat` |
+| 数字复现 | 已验证 / 未验证 / 有风险 | 我的脚本输出 vs 对方值 |
+
+**「无法验证」（依赖缺失、环境限制）必须明确写「未验证」，不得写「通过」。**
+
+---
+
+## §9 已打回清单
+
+| # | 对象 | 事由 | 状态 |
+|---|---|---|---|
+| 1 | 看板 `BOARD.md §2.1` 验收标准 2 | 硬数字错误：`16 注期望回收 16.73 元` 应为 **5.00 元**；且与同句「回报率恒为 15.625%」自相矛盾（16.73/32=52.3%）。会让前端披露虚高 3.3 倍 | **待齐交付更正** |
+| 2 | 看板 `BOARD.md §4` D-09 / D-10 状态 | 标「未开始」，实际已在 `ee7560b` 修完且变异可验。照此施工会重写已正确的断言 | **待齐交付更正** |
+| 3 | 看板「2 处恒真断言」的记载 | 实际 `or True` 共 **5 处**（另 3 处未被列出），全部自废；`test_v12_shape_rules.py:150` 测试体仅一行 | **建议立 D-14** |
+
+> 打回不是攻击，是**防止"报告说完成了"冒充"真的完成了"**。
+> 我的价值只在于此。
+
+---
+
+## §10 变更记录
+
+| 时间 | 变更 | 人 |
+|---|---|---|
+| 2026-10-21 | 建档：红线、两口径基线、全跑纪律、变异清单 M1-M3、案例库 2 则 | 建档人 |
+| 2026-10-21 | **严QA 增补**：§6.2.1 复原必须用输出证明（含我的实测事故）；§6.3b 独立复核 M1-M4（3 捕获 1 存活，M4 分诊为等价变异 + 暴露 30 个未覆盖私有函数）；§7.5 三条实测问题（D-09/D-10 状态过期、D-01 `16.73` 数字错误、`or True` 实为 5 处）；§9 打回清单 3 条 | 严QA |
+
+---
+
+## §11 【严QA 追加】D-12 验收登记（2026-10-21 晚）
+
+> 本节追加于 §10 之后，不覆盖他人已写内容。完整报告见 `docs/reviews/QA_D12_NAMING_GUARD.md`。
+
+### 11.1 D-12 结论：⚠️ 有条件通过
+
+工作区全量：**1488 passed, 24 skipped, 1 xfailed**（较基线 +130，skip/xfail 未增）。
+
+变异测试 4 条：
+
+| # | 变异 | 结果 | 判定 |
+|---|---|---|---|
+| N1 | `app.js` 渲染面注入 `"可用规律 12 条"` | **2 failed** | ✅ 捕获（两套守卫都响） |
+| N2 | `index.html` 正文注入 `<h3>可用规律 · 12 条</h3>` | **3 failed** | ✅ 捕获 |
+| N3 | 让 `_is_discipline_mention` 恒 `return True`（**守卫空转**） | `test_discipline_mention_is_exempt_but_plain_use_is_not` **1 failed** | ✅ 捕获（反空转设计有效） |
+| N4 | 把 `index.html` 改名（文件缺失） | **2 failed, 1 skipped** | ⚠️ skip 会破红线 1 |
+
+### 11.2 打回理由（登记入 §9 清单，编号 4、5）
+
+**4. 引号豁免过宽 —— 正是 D-12 要修的形态**
+
+`_is_discipline_mention` 把「禁用词被引号包裹」当豁免。但 **JS 每个字符串字面量本就带引号**，
+产品文案给术语加引号又是最常见的强调写法。实测判定对照（全部为用户可见）：
+
+| 样本 | 第二套守卫 | 第一套守卫 |
+|---|---|---|
+| `metricItem("可用规律", 0);` | ❌ **放过** | ✅ 违规 |
+| `metricItem('可用规律', 0);` | ❌ **放过** | ✅ 违规 |
+| `<span>「可用规律」0 条</span>` | ❌ **放过** | ✅ 违规 |
+| `<p>『可用规律』0 条</p>` | ❌ **放过** | ✅ 违规 |
+| `<td>【可用规律】</td>` | ❌ **放过** | ✅ 违规 |
+| `h += '<b>「可用规律」</b>';` | ❌ **放过** | ✅ 违规 |
+| `<th>可用规律</th>` | ✅ 违规 | ✅ 违规 |
+
+端到端已在副本验证：注入 `metricItem("可用规律", 0)` 后，
+`test_usable_law_guard_covers_app_js` **failed**，而 `test_no_rendered_banned_phrase[static/app.js]` **静默放过**。
+
+**根子：收窄维度选错。** D-12 的诉求是「按**是否渲染**收窄」（`index.html:333` 是渲染可见的转述句）；
+实现成了「按**有无引号**收窄」。结果漏洞从「含『不得/不是/禁止』就放过」**迁移**到「加引号就放过」，
+**形态换了，没关闭**。第一套守卫（剥注释后含词即违规）才是正确判据。
+
+**放行条件**（任一）：
+- **（推荐）** 删掉第二套的引号豁免，并入第一套，只保留 `_normalize_concat`（这是第一套没有的真实增强）；
+- 或两套取并集：任何一套判违规即算违规。
+
+**5. `pytest.skip` 会破红线 1**
+
+```python
+if not path.exists():
+    pytest.skip(f"{rel} 不存在")
+```
+N4 实测：`index.html` 缺失 → `skipped` 从 24 变 25，**直接触发红线 1「skipped 增加」**。
+且语义错：前端文件丢了，守卫应当**失败**（页面没了），不该跳过。
+→ 改 `assert path.exists(), "前端文件丢失，守卫无从谈起"`。
+
+### 11.3 顺带确认（不是问题，是值得肯定的）
+
+- **N3 能捕获「守卫空转」** —— 同类守卫测试里并不常见，这是真设计。
+- `test_known_limit_runtime_construction_not_covered` 把「charCode / 变量拼接穿透」
+  **写成可执行用例**，防止后人误以为「过了守卫等于没禁用词」。**建议推广到其他守卫。**
+- 前端 F4/F5/F7 **是真改文案**（`app.js:911/927/1038`），不是靠删注释蒙混过关。
+
+### 11.4 变更记录追加
+
+| 时间 | 变更 | 人 |
+|---|---|---|
+| 2026-10-21 | §11 追加：D-12 验收登记（4 变异、引号豁免漏洞、skip 破红线）+ §9 清单增补至 5 条 | 严QA |
+
+---
+
+## §12 【严QA 追加】D-03 / D-07 验收登记（2026-10-21）
+
+### 12.1 D-07 `usable` 语义拆分：✅ **通过**
+
+守卫用 **AST 而非正则**（`test_no_route_returns_both_usable_fields`），避开注释误报 —— 做法正确。
+
+| # | 变异 | 结果 | 判定 |
+|---|---|---|---|
+| Q1 | 路由响应 dict 同时塞 `usable: 20` + `usable_replayable: 0` | **1 failed** | ✅ 捕获 |
+| Q2 | 前端同一行同时读 `by_decision.usable` 与 `usable_replayable` | **1 failed** | ✅ 捕获 |
+| Q3 | **跨行**并列展示（同一屏、不同行） | **8 passed 全绿** | ⚠️ 存活，**但边界已自我声明** |
+| Q4 | `app.js` 缺失 | **1 skipped** | ⚠️ 与 D-12 同病：skip 会破红线 1 |
+
+**Q3 判定为「诚实标注，不判缺陷」**：`test_no_frontend_reads_both_usable_fields` 的 docstring 明写
+「这里用文本扫描（前端是 JS，无 AST 可依），只查**同一行**同时出现两侧字段」。
+**边界写进了代码**，不属隐瞒。但需登记为已知残余风险：跨行并列展示仍可能存在。
+
+**Q4 需修**：`if not app_js.exists(): pytest.skip(...)` → 改 `assert`（同 D-12 缺陷 2）。
+
+### 12.2 D-03 边界加固：⚠️ **有条件通过**
+
+**好消息：真实 HTTP 层我全验了，而且比交付方自己测得更强。** D-03 文件头声称
+「容器内没有 `httpx` TestClient」因此只做函数级测试 —— **这个前提是错的**：
+
+```
+httpx 0.28.1        ← 已安装
+fastapi.testclient.TestClient → 可用
+```
+
+我用真实 `TestClient` 打 HTTP，结果：
+
+```
+/api/portfolio/popularity 非法 reds（8 种）→ 全部 HTTP 400   ✅
+/api/portfolio/blue-coverage n_tickets:
+  'abc' → 422   '' → 422   '0' → 422   '-1' → 422   '101' → 422
+  '１０'（全角）→ 422                                        ✅
+  '1' → 200   '100' → 200                                    ✅
+```
+
+**参数校验这一条真的成立**，不是函数级假象。**但交付方错过了能证明它的最强手段**，
+且据此写了「只能做 signature 元数据断言」的妥协方案 —— 这属于**自我设限**，不是缺陷，但降低了守卫强度。
+
+#### 缺陷（P1）：`degraded` 与 `degraded_items` **同名不同义**
+
+真实调用 `/api/capabilities`：
+```
+degraded        = False
+degraded_items  = ["idle_mining", "usable_replayable"]    ← 2 项实际处于降级
+```
+
+源码（`routes_capabilities.py:345`）：
+```python
+"degraded": bool(missing),        # 只反映"5 个常量是否取全"
+"degraded_items": degraded,       # 反映"哪些能力项不可用"
+```
+
+**这正是本项目记录过的坑**（`idle_mining.usable` 与 `patterns_runtime.usable` 同名不同义，
+曾导致「20 条可用」与「0 条可用」并存）。这里换了个字段名重演：
+- `degraded=False` 却有两项降级；
+- 而看板 D-03 验收标准 3 明确要求「前端拿到 `degraded=true` 时必须显示『不可用』」——
+  **前端照这个字段判断，会把 2 项降级显示成正常。**
+
+**修复建议**：
+```python
+"degraded": bool(missing) or bool(degraded),      # 或改名为 constants_degraded
+"degraded_items": degraded,
+"degraded_counts": {"constants": len(missing), "items": len(degraded)},
+```
+并补一条关系守卫：
+```python
+def test_degraded_flag_agrees_with_items():
+    b = C.capabilities()
+    assert b["degraded"] == (bool(b["degraded_constants"]) or bool(b["degraded_items"]))
+```
+
+### 12.3 变更记录追加
+
+| 时间 | 变更 | 人 |
+|---|---|---|
+| 2026-10-21 | §12 追加：D-07 通过（4 变异 3 捕获，Q3 边界已声明、Q4 需修）；D-03 有条件通过（HTTP 层实测全绿，但 `degraded` 字段同名不同义 + 自我设限未用 TestClient） | 严QA |
+
+---
+
+## §13 【严QA 追加】复验：D-03 / D-04 修复已生效（2026-10-21 晚）
+
+**我打回的三条，交付方已修。我在干净副本（`/tmp/qa/ws_final`，从工作区 tar 重建）上逐条复验。**
+
+### 13.1 D-04 `ev_single`：❌ 打回 → ✅ **复验通过**
+
+修复内容（工作区 `routes_capabilities.py:114` 现为）：
+```python
+ev = engine._single_ticket_ev(_PRIZE_ASSUMPTION, sixth="strict")   # 口径切到 strict
+out["ev_single"] = round(float(ev["ev_ratio"]), 6)                 # 实时计算
+out["sixth_mode"] = "strict"                                        # 口径显式标注
+```
+断言从区间 `0.40 <= x <= 0.65` 改为**精确断言** `approx(0.522907, abs=1e-6)`。
+
+**三个变异全部被捕获**（这是我打回时的原样变异）：
+
+| 变异 | 打回时 | 复验时 |
+|---|---|---|
+| `ev_single` → `0.60` | 21 passed（全绿） | **2 failed** ✅ |
+| `ev_single` → `0.6499`（贴区间上界） | 21 passed（全绿） | **2 failed** ✅ |
+| `ev_single` 写死为 `0.522907`（**= 当前真值**） | 21 passed（全绿） | **1 failed**（`test_ev_single_tracks_prize_assumption`）✅ |
+
+**第三条最有价值**：写死成"完全正确的值"也能被抓到 —— 因为追踪守卫**改变依赖再断言输出变化**，
+不依赖"值对不对"。**这是本轮最值得推广的守卫范式。**
+
+端点现在返回 `ev_single = 0.522907`（52.29%），**与红线表 52.3% 对齐**，口径矛盾已消除。
+
+### 13.2 D-03 `degraded` 同名不同义：⚠️ 打回 → ✅ **复验通过**
+
+```
+degraded        = True                                  ← 修复前是 False
+degraded_items  = ['idle_mining', 'usable_replayable']
+degraded_constants = []
+```
+`degraded` 与 `degraded_items` 现在**语义一致**（有 2 项降级 ⇒ flag 为 True）。
+前端照 `degraded` 判断不会再误显示"正常"。
+
+### 13.3 D-12 引号豁免：⚠️ 有条件通过 → **待复验**
+
+唯一**尚未复验**的一条。我的条件是：
+1. 删掉第二套守卫的引号豁免，或两套取并集；
+2. `pytest.skip` 改 `assert`。
+
+复验判据（我会原样重放）：
+```
+metricItem("可用规律", 0);        → 必须被捕获（修复前第二套放过）
+<span>「可用规律」0 条</span>      → 必须被捕获
+index.html 缺失                  → 必须 failed，不得 skipped
+```
+
+### 13.4 一个必须记录的协作教训
+
+我打回 D-04 时给的期望值 `0.762159` 是**按 `published` 口径**算的；
+而交付方同时采纳了我的**另一条建议**（端点切 `strict`），于是真值变成 `0.753141`。
+中间出现过一次测试红（`assert 0.762159` vs 实际 `0.753141`），**不是缺陷，是两条建议交错**。
+
+**教训**：给修复建议时，**期望值必须由被测代码自己算出，不能由我手写一个数字**。
+正确写法：
+```python
+expect = engine._single_ticket_ev(RC._PRIZE_ASSUMPTION, sixth=RC._SIXTH_MODE)["ev_ratio"]
+assert consts["ev_single"] == pytest.approx(round(expect, 6), abs=1e-9)
+```
+否则口径一变，守卫就从"抓缺陷"退化成"抓文档"。
+
+### 13.5 变更记录追加
+
+| 时间 | 变更 | 人 |
+|---|---|---|
+| 2026-10-21 | §13 追加：D-04 `ev_single` 复验通过（3 变异全捕获，含"写死为真值"）、D-03 `degraded` 语义复验通过、D-12 待复验；记录"期望值不得手写"教训 | 严QA |

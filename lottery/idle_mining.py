@@ -670,6 +670,38 @@ def status() -> Dict[str, Any]:
         "rule_evidence_count": len(state.get("rule_evidence")
                                   or state.get("usable") or {}),
         "usable_count_deprecated": len(state.get("usable") or {}),
+        # ===== D-07：`usable` 一词两义的**机器可读标注** =====
+        #
+        # 背景：本模块曾输出 `by_decision.usable`（单候选过阈、未做族级校正），
+        # 而 `patterns_runtime` 的生产快照有 `counts.usable`（可回放且可用于出号）。
+        # 同一系统两个 "usable" 不同值，用户看到即认定造假 —— 哪怕每个数字单独看都对。
+        #
+        # 本轮**只加标注、先不删**旧字段（删除留到下一版本，届时改名 e_reject_candidates）。
+        # 标注的作用：任何消费方只要能读到本段，就必须知道这两个词不是一回事，
+        # 且**禁止并列展示**。前端与报表用它做断言，而不是靠文档约定。
+        "usable_semantics": {
+            "this_module_authoritative_field": "rule_evidence_count",
+            "deprecated_aliases": ["usable_count_deprecated", "by_decision.usable"],
+            "meaning_zh": (
+                "本模块的「证据项」= 单候选过 α 阈后再经 e-BH 族级校正的统计结论；"
+                "它**不进生产快照、不影响出号**。"
+            ),
+            "collides_with": {
+                "field": "patterns_runtime.counts.usable",
+                "meaning_zh": (
+                    "生产快照里的「可用规律」= 可回放且被认定可用于出号的规律，"
+                    "是出号门控依据。与本节字段**同名不同义**。"
+                ),
+            },
+            "never_show_together": True,
+            "reason_zh": (
+                "两者数值不同是**正确**的（一个是「有证据」，一个是「能出号」）。"
+                "但并列展示会让用户以为是两个互相矛盾的数字，"
+                "从而怀疑整个系统的诚实性。若要同时说明，必须明确区分口径，"
+                "不得只说「可用 20 条 / 可用 0 条」。"
+            ),
+            "rename_plan": "下一版本将 `usable` 弃用别名改名为 `e_reject_candidates`。",
+        },
         "progress": {
             "single_done": single_done,
             "single_total": space["single_total"],

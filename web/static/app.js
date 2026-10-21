@@ -527,6 +527,34 @@ function toggleTheme() {
 
 // ==================== 导航 ====================
 
+/** 从首屏「诚实收益边界」卡跳到达标卡片（蓝球覆盖 / 大众偏好度）。
+ *
+ * 两张卡都在「评估报告 → 综合概览」子页里，所以要先切主标签、再切子标签、
+ * 最后滚动并高亮。三步都做了失败兜底：任意一步找不到容器就静默跳过，
+ * 只保证「不会点一下什么也没发生还报错」。
+ */
+function jumpToCard(cardId, tabName) {
+  const finish = () => {
+    const el = document.getElementById(cardId);
+    if (!el) { toast("该卡片暂不可用（接口未返回）"); return; }
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    el.classList.add("hb-flash");
+    setTimeout(() => el.classList.remove("hb-flash"), 1600);
+  };
+  // `tabName` 缺省为 "eval"：首屏「诚实收益边界」卡的两个入口（蓝球覆盖 / 大众偏好度）
+  // 都在「评估报告 → 综合概览」里。footer 的「随机性诚实声明」在首屏（predict），
+  // 显式传 "predict" 即可复用同一个函数，避免再写一个只差两行的孪生函数。
+  const tab = tabName || "eval";
+  try {
+    switchTab(tab);
+    if (tab === "eval" && typeof setEvalSub === "function") setEvalSub("overview");
+    // 面板刚切换，可能还在 display 变换中：等一帧再滚，否则 scrollIntoView 目标高度为 0
+    requestAnimationFrame(() => setTimeout(finish, 60));
+  } catch (e) {
+    finish();
+  }
+}
+
 function switchTab(name) {
   history.replaceState(null, "", "#" + name);
   $$(".nav-btn").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
@@ -736,7 +764,7 @@ async function runPredict(regenerate, btnId) {
       }
     }
   }
-  setFree(btnId, regenerate ? "🔄 强制重新生成" : "🎯 生成预测");
+  setFree(btnId, regenerate ? "🔄 强制重新生成" : "🎯 生成候选注单");
 }
 
 function renderPredictions(res) {
@@ -751,7 +779,7 @@ function renderPredictions(res) {
   const list = $("#predList");
   const items = res.tickets || [];
   if (!items.length) {
-    list.innerHTML = '<div class="note">暂无预测，点击「生成预测」。</div>';
+    list.innerHTML = '<div class="note">暂无候选注单，点击「生成候选注单」。</div>';
     return;
   }
   window._predTickets = items;
@@ -763,9 +791,13 @@ function renderPredictions(res) {
     const badge = t.method.startsWith("llm:")
       ? "<span class='t-badge llm'>LLM推理</span>"
       : "<span class='t-badge'>" + escHtml(t.method) + "</span>";
-    // 结构小结：一句话（和值 · 三区 · 奇偶），去掉统计噪音
+    // 结构小结：一句话（和值 · 三区 · 奇偶），描述性、不含评价
+    // —— 这里**故意不再放任何分级图形**（★☆ / ●●○ / 进度条 / 颜色深浅）。
+    //    2026-10-21 产品审计否决了"改成『形态合理度 ★★☆』+ 标签注明非中奖概率"的方案：
+    //    用户先看到星、未必读到标签；任何带级图形都会被读成"星多 = 更易中"。
+    //    而 confidence 的真实语义是「混合分布上的概率质量」，即**内部排序权重**，
+    //    给它做五级分级等于凭空制造信息。故原位只留下这三项恒等约束的实际取值。
     const sum = ticketSummary(t);
-    const stars = starsFor(t.confidence);
     // 详情（点击展开后才显示）——保留全部证据/规律/反证/结构分，但默认折叠
     const rt = t.reasoning ? '<div class="reasoning">💬 ' + escHtml(t.reasoning) + '</div>' : '';
     const used = (t.patterns_used || []).length ? '<div class="reasoning">规律引用：' + escHtml(t.patterns_used.join("、")) + '</div>' : '';
@@ -779,7 +811,11 @@ function renderPredictions(res) {
     }
     if (t.structure_scores && typeof t.structure_scores === "object" && Object.keys(t.structure_scores).length) {
       const sc = Object.entries(t.structure_scores).map(([k,v]) => escHtml(k) + "=" + v).join(" · ");
-      evd += '<div class="reasoning">📐 结构分：' + sc + '</div>';
+      // 原标签「📐 结构分」会被读成"分数越高越该买"。它的真实语义是
+      // ensemble_mass ——「混合分布上的概率质量」，即**系统内部排序权重**，
+      // 既不是中奖概率，也不能跨期比较（分母随当期混合分布变化）。
+      evd += '<div class="reasoning">系统内部排序权重（非中奖概率，不可跨期比较）：' +
+        sc + '</div>';
     }
     const body = (rt || used || evd)
       ? '<div class="t-body">' + rt + used + evd + '</div>'
@@ -790,7 +826,6 @@ function renderPredictions(res) {
         '<div class="balls">' + balls + " " + blue + "</div>" +
         badge +
         '<span class="t-sum">' + sum + '</span>' +
-        '<span class="stars" title="匹配度（基于结构均衡度，非中奖保证）">' + stars + '</span>' +
         "<button class='t-copy' onclick='event.stopPropagation();copyTicket(" + i + ")'>📋</button>" +
         '<span class="chev">▾</span>' +
       '</div>' + body + '</div>';
@@ -867,8 +902,15 @@ function renderRuleUsage(res) {
     // V14-A4：口径改名。这里统计的是「生产快照里可回放且可用的规律」，
     // 与「闲时挖掘的证据项(rule_evidence)」是两件不同的事，不能都叫"可用规律"。
     // 后端 routes_predict.py 明令：不得把 L2 结构约束叫成「可用规律」。
-    metricItem("可用规律（可回放）", Number(r.usable_replayable || r.usable || 0),
-               "阶段持续有效 + A/B 通过 + 可回放") +
+    // 口径（V14-A4 + 2026-10-21 文案审计）：这个名字必须自己说清"是什么门槛筛出来的"，
+    // 而不是让用户自己去猜"可用"和"可用规律"的区别。
+    // 副标题**固定写死**「0 条 = 统计否定结论，不是功能故障」——因为 0 条是本项目的
+    // **预期结果**，但用户看到 0 的第一反应是"坏了"。
+    // 兜底顺序：优先 usable_replayable（权威）；usable 是已弃用别名，仅兼容旧快照；
+    // 两者都缺才回落 0 —— 回落 0 时不假装有数据。
+    metricItem("可回放且通过前置注册的规律",
+               Number(r.usable_replayable || r.usable || 0),
+               "0 条 = 统计否定结论，不是功能故障") +
     metricItem("本轮受规律影响的候选", Number(r.n_resorted || 0), r.mode === "active" ? "已按规律重排" : "影子模式：仅记录") +
     // V12-04（裁决 R-2）：**禁止跨层相加**。usable 只显示长期可用，
     // 阶段可用单独列出并标注「未获支持」，避免出现「N 条可用其中大部分没预测力」。
@@ -882,7 +924,8 @@ function renderRuleUsage(res) {
   const rules = r.usable_rules || [];
   if (rules.length) {
     h += '<div class="scroll" style="margin-top:8px"><table class="battle-table"><thead><tr>' +
-      '<th>可用规律</th><th>维度</th><th>阶段状态</th><th>效应</th><th>校正p</th></tr></thead><tbody>';
+      '<th>通过前置注册的规律</th><th>维度</th><th>阶段状态</th><th>效应</th>' +
+      '<th>校正p</th></tr></thead><tbody>';
     for (const x of rules) {
       const rg = x.regime || {};
       h += '<tr><td style="text-align:left">' + escHtml((x.statement || "").slice(0, 46)) + '</td>' +
@@ -894,8 +937,9 @@ function renderRuleUsage(res) {
     }
     h += '</tbody></table></div>';
   } else {
-    h += '<div class="track-note">当前 0 条规律满足「阶段持续有效 + A/B 验证」。"无可用规律"是诚实的结论，' +
-      '不是系统没找——可到「评估报告 → ⏳ 规律时效」看全部规律的阶段画像，或点「⟳ 规律闭环」让 AI 重新挖掘验证。</div>';
+    h += '<div class="track-note">当前 0 条规律满足「阶段持续有效 + A/B 验证 + 通过前置注册」。' +
+      '这是<b>统计否定结论</b>，不是功能故障——真实彩票数据上本就该是 0 条。' +
+      '可到「评估报告 → ⏳ 规律时效」看全部规律的阶段画像，或点「⟳ 规律闭环」重新挖掘验证。</div>';
   }
   h += '<div class="eval-actions" style="margin-top:8px">' +
     '<button onclick="refreshRuleSnapshot()">⟳ 刷新规律快照</button>' +
@@ -984,11 +1028,16 @@ async function runClosedLoop() {
     onDone: async (r) => {
       const rt = r.runtime || {};
       {
-        // V12-04：只用长期可用数，不把阶段可用混进来
+        // V12-04：只用长期可用数，不把阶段可用混进来。
+        // V14 文案：把"完成了一个闭环"改成"这次检验通过了多少条" —— 前者听起来像
+        // "系统又变强了"，后者才是真实信息。0 条必须明说"为预期结果"，
+        // 否则用户会以为闭环跑失败了。
         const _c = rt.counts || {};
         const _ph = Number(_c.usable_phase || 0);
-        toast("闭环完成：长期可用规律 " + (Number(_c.usable_long_term || 0)) + " 条" +
-              (_ph ? "（另阶段可用 " + _ph + " 条，仅观察）" : ""));
+        const _n = Number(_c.usable_long_term || 0);
+        toast("检验完成：" + _n + " 条通过前置注册" +
+              (_n === 0 ? "（0 条为预期结果）" : "") +
+              (_ph ? "；另阶段可用 " + _ph + " 条，仅观察" : ""));
       }
       if (typeof renderLab === "function" && r.claims) renderLab(r);
       await loadLastPrediction();
@@ -1048,16 +1097,9 @@ function ticketSummary(t) {
   return "和值" + sum + " · 三区" + z1 + "-" + z2 + "-" + z3 + " · 奇偶" + odd + ":" + (reds.length - odd);
 }
 
-// 匹配度星级（0~5）：基于置信度 + 结构均衡度，标注为「匹配度」而非中奖保证
-function starsFor(confidence) {
-  const c = Number(confidence) || 0;
-  let score = c / 20; // 0~5
-  if (!isFinite(score)) score = 0;
-  const full = Math.max(0, Math.min(5, Math.round(score)));
-  let s = "";
-  for (let k = 1; k <= 5; k++) s += k <= full ? "★" : "<span class='off'>★</span>";
-  return s;
-}
+// 星级渲染已于 2026-10-21 产品审计后**移除**（`starsFor()` 整体删除）。
+// 原因见上面对 `ticketSummary()` 调用点的注释：任何带级图形都会被读成"更易中"。
+// 若将来要恢复，必须先解决"如何让用户不把分级读成中奖概率"——目前无解，故不加。
 
 // 折叠/展开单注
 function toggleTicket(i) {
@@ -2454,6 +2496,300 @@ async function loadDistribution() {
   }
 }
 
+// ============ V14-B2/B3：蓝球去重覆盖 + 大众偏好度 ============
+//
+// 数据来源（每个数字只有一个出口，前后端不各写一份口径）：
+//   🔵 蓝球覆盖  → GET /api/portfolio/blue-coverage → blue_coverage.optimize()
+//   👥 大众偏好  → GET /api/portfolio/popularity    → popularity.describe()
+//
+// 两个端点的纪律都在后端强制、前端只负责**完整呈现**：
+//
+//   1) 披露不可拆。`disclosure_lines` 是后端一次性给出的真相全集，前端**逐行全渲染**，
+//      不做截断、不做"精简版"。尤其禁止只展示「随机重复 47.55% → 覆盖 62.50%」——
+//      少了「成本 / 净亏 / 返奖比恒定」这三句，读者会把它理解成"收益率变高了"，
+//      而那正是这套模型最容易被误读的地方。
+//
+//   2) 偏好度只给档位。`tier` 是三档标称（TIER_LABELS），**不返回也不显示任何注数**。
+//      实测效应量 R² ≈ 0.008，只能排序不能定值；渲染层不得自行做注数换算——
+//      哪怕只是"顺手算一下"也不许，那会把一个只够排序的信号包装成可执行数字。
+//
+//   3) 降级容错。两卡各自独立 try/catch，任一端点 401/503/超时只让**本卡**显示
+//      "不可用"，绝不往外抛——`loadV10Cards()` 是 `Promise.all` 并发入口，
+//      一次未捕获的 reject 会连累整页首屏。
+
+/** 每注价格（与后端 blue_coverage.TICKET_PRICE 同值，仅用于文案，不参与计算）。 */
+const TICKET_PRICE_YUAN = 2;
+
+/** 百分数：保留 d 位。0 必须显示成 0.00%，不能被当假值吞掉。 */
+function _pct(v, d) {
+  if (v === null || v === undefined || isNaN(Number(v))) return "-";
+  return (Number(v) * 100).toFixed(d === undefined ? 2 : d) + "%";
+}
+
+/** 元：保留 d 位，带千分位-free 的固定写法（金额不大，避免本地化差异）。 */
+function _yuan(v, d) {
+  if (v === null || v === undefined || isNaN(Number(v))) return "-";
+  return Number(v).toFixed(d === undefined ? 2 : d);
+}
+
+/** 从当前推荐里取「第一个注单」的红球，作为偏好度查询对象。
+ *  取不到时返回 null，由调用方走默认形态——**不猜、不编**。 */
+function _firstTicketReds() {
+  const src = (typeof STATE !== "undefined" && STATE && STATE.lastPrediction) || null;
+  const tickets = (src && (src.tickets || src.bets)) || null;
+  if (!Array.isArray(tickets) || !tickets.length) return null;
+  const t = tickets[0] || {};
+  const reds = t.reds || t.red || t.front || null;
+  if (!Array.isArray(reds)) return null;
+  const nums = reds.map(Number).filter(x => Number.isInteger(x) && x >= 1 && x <= 33);
+  return nums.length === 6 && new Set(nums).size === 6 ? nums.slice().sort((a, b) => a - b) : null;
+}
+
+/** 降级文案：把状态码翻译成用户能懂的一句话，同时保留原始 message 供排查。 */
+function _degradeNote(what, e) {
+  const st = e && e.status;
+  let hint = "接口未返回";
+  if (st === 401) hint = "需要登录后查看（本卡不阻塞其余内容）";
+  else if (st === 403) hint = "无权访问本卡";
+  else if (st === 503) hint = "服务暂不可用（模型未就绪或数据不足）";
+  else if (st === 400) hint = "参数不合法";
+  else if (st === 404) hint = "接口不存在（后端版本可能较旧）";
+  else if (!st) hint = "网络超时或连接失败";
+  return "【" + what + "不可用】" + hint + "：" + String((e && e.message) || e);
+}
+
+/** 披露行的最小富文本渲染：后端的 disclosure 文本用 `**...**` 标出必须被看见的限定
+ *  （如「与注数无关」「长期仍为负期望」）。先整体转义再只把 `**x**` 转成 <strong>，
+ *  这样既保住了 XSS 防线，又不会在页面上漏出裸星号。
+ *  **不**实现完整 Markdown —— 只认这一种标记，多一种就多一条被滥用的路径。 */
+function _renderDisclosureLine(text) {
+  const safe = escHtml(String(text === null || text === undefined ? "" : text));
+  return safe.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+}
+
+// ----- 卡 7：蓝球去重覆盖 -----
+function renderBlueCoverage(d) {
+  const body = $("#blueCovBody"), tag = $("#blueCovTag");
+  if (!body) return;
+  if (!d || d.ok === false) {
+    if (tag) tag.textContent = "不可用";
+    body.innerHTML = '<div class="note">蓝球覆盖计划不可用：' +
+      escHtml((d && d.error) || "接口未返回") + "</div>";
+    return;
+  }
+  const n = d.n_tickets ?? 0;
+  const plan = Array.isArray(d.plan) ? d.plan : [];
+  const covered = d.blue_coverage_count ?? 0;
+  if (tag) tag.textContent = n + " 注 · 覆盖 " + covered + "/16 个蓝球";
+
+  const metric = (k, v, sub) =>
+    '<div class="v10-metric"><div class="k">' + k + '</div><div class="v">' + v +
+    "</div>" + (sub ? '<div class="sub">' + sub + "</div>" : "") + "</div>";
+
+  // ⚠ 下面四项**必须同屏**出现在同一个 .v10-metrics 容器里。
+  // 只看前两项（概率对比）是本卡最容易造成的误读，所以概率、成本、净亏、返奖比
+  // 放在同一行，物理上不给出「只截一半」的结构。
+  const cost = d.cost_yuan ?? (n * TICKET_PRICE_YUAN);
+  const evSixth = d.ev_sixth_yuan;
+  const netSixth = (d.net_sixth_yuan !== undefined && d.net_sixth_yuan !== null)
+    ? d.net_sixth_yuan
+    : (Number(evSixth) - Number(cost));
+
+  const lines = Array.isArray(d.disclosure_lines) ? d.disclosure_lines : [];
+  const disclosureHtml = lines.length
+    ? lines.map((ln, i) =>
+        '<div class="v14-line" data-line="' + (i + 1) + '">' +
+          _renderDisclosureLine(ln) + "</div>").join("")
+    // 后端契约保证 disclosure_lines 非空；万一缺失，宁可显示占位也不能静默省略
+    : '<div class="note">披露文本缺失（后端未返回 disclosure_lines），本卡结论不可单独使用。</div>';
+
+  const flags = d.honesty_flags || {};
+  const flagRow = (key, label, val) => {
+    if (val === undefined) return "";
+    const yes = val === true;
+    return '<span class="v14-flag ' + (yes ? "yes" : "no") + '" data-flag="' + key + '">' +
+      escHtml(label) + "：" + (yes ? "是" : "否") + "</span>";
+  };
+
+  body.innerHTML =
+    '<div class="v10-metrics">' +
+      metric("P(≥1 次中蓝) · 去重覆盖", _pct(d.p_any_blue_covered),
+        "计划：" + escHtml(plan.join(" ")) ) +
+      metric("P(≥1 次中蓝) · 随机重复", _pct(d.p_any_blue_random_repeat),
+        "同注数、不去重的对照值") +
+      metric("成本", "¥" + _yuan(cost, 0), n + " 注 × ¥" + TICKET_PRICE_YUAN) +
+      metric("六等奖期望回收", "¥" + _yuan(evSixth, 2),
+        "净亏 ¥" + _yuan(netSixth, 3)) +
+      // 六等奖返奖比恒为 15.625%（= (n/16 × ¥5) / (2n) = 5/32），**与注数无关**。
+      // 2026-10-21 Lead 复现裁定：恒等式在所有 n 都成立；n > 16 时变的是
+      // 「至少中一次」的概率（封顶 100%），不是返奖比。故此处注解**固定写恒定**，
+      // 饱和信息由下面独立的饱和提示块承载，两者不混在一行里。
+      metric("六等奖返奖比", _pct(d.ev_ratio_sixth, 3),
+        "恒定 = 0.15625，与注数无关") +
+    "</div>" +
+    (d.ev_ratio_full !== undefined
+      ? '<div class="v10-metrics">' +
+          metric("整注返奖比（一~六等全计）", _pct(d.ev_ratio_full, 2),
+            "含浮动奖估算 · 长期仍为负期望") +
+          metric("整注期望回收", "¥" + _yuan(d.ev_full_yuan, 2), "按上项返奖比 × 成本") +
+        "</div>"
+      : "") +
+    // n > 16：蓝球池（16 个）被占满。**概率**已封顶，「至少中一次」不会再提高；
+    // 再加注只增加"重复中奖"的次数，成本继续线性增加。
+    // 注意别把这条写成"返奖比被稀释"—— 返奖比恒为 15.625%，恒等式不随 n 变。
+    (d.coverage_saturated
+      ? '<div class="v10-honesty" id="blueCovSaturated"><b>概率已饱和：</b>' +
+        "蓝球只有 16 个，买超过 16 注时，「至少中一次蓝球」的概率已达 100%，" +
+        "再加注不会提高它，只会增加「重复中奖」的次数，而成本继续线性增加。" +
+        "返奖比仍恒为 15.625%（六等奖口径）。" +
+        "</div>"
+      : "") +
+    '<div class="v10-honesty" id="blueCovDisclosure">' +
+      "<b>披露（全文，不可拆开读）：</b>" +
+      '<div class="v14-disclosure-lines">' + disclosureHtml + "</div>" +
+      '<div class="v14-flags">' +
+        flagRow("increases_hit_probability", "提高中奖概率", flags.increases_hit_probability) +
+        flagRow("increases_expected_return", "提高期望收益", flags.increases_expected_return) +
+        flagRow("increases_prize_frequency", "提高中奖频率", flags.increases_prize_frequency) +
+      "</div>" +
+    "</div>";
+}
+
+// 首屏「诚实收益边界」卡的实时填充（D3）。
+//
+// 只做一件事：把**同一个响应对象**里的 6 个数字写进带 `data-hb` 的 span。
+// 不自己算、不自己四舍五入第二遍 —— 格式必须与蓝球覆盖卡完全一致，
+// 否则同页两处会出现「3.12 vs 3.125」这种自打脸。
+function fillHonestBounds(d) {
+  const card = $("#honestBounds");
+  if (!card || !d || d.ok === false) return false;
+  const set = (key, text) => {
+    const el = card.querySelector('[data-hb="' + key + '"]');
+    if (el) el.textContent = text;
+  };
+  const n = d.n_tickets ?? 10;
+  // 概率：与 renderBlueCoverage 同用 `_pct(v, 2)`，保证两卡逐字一致
+  set("p_repeat", _pct(d.p_any_blue_random_repeat, 2));
+  set("p_cover", _pct(d.p_any_blue_covered, 2));
+  set("n_tickets", String(n));
+  set("n_tickets2", String(n));
+  // 金额：成本取整（"20 元"），期望回收与净亏保留 3 位
+  // —— 3 位是六等奖 EV 的精度需求：n 不是 16 的倍数时 (n/16)×5 会是 1.25/3.125 这类值，
+  //    用 2 位会把 3.125 砍成 3.13，与后端 disclosure 的「3.125 元」对不上。
+  set("cost", _yuan(d.cost_yuan, 0));
+  set("ev_sixth", _yuan(d.ev_sixth_yuan, 3));
+  set("net_sixth", _yuan(Math.abs(Number(d.net_sixth_yuan)), 3));
+  set("ratio_sixth", _pct(d.ev_ratio_sixth, 3));
+  const src = $("#hbSource");
+  if (src) {
+    src.textContent = "实时值 · n=" + n + " 注 · 与下方「蓝球去重覆盖」卡同源";
+    src.classList.remove("hb-stale");
+  }
+  return true;
+}
+
+/** 实时值取不到时的降级：**保留静态数字**，但必须把来源标注切成「示例值」。
+ *
+ * 为什么不像其他卡那样显示"加载失败"：这是首屏最显眼的位置，空白比静态值更糟；
+ * 但留着静态值又不说来源，就是在**冒充实时**。所以唯一正确的做法是
+ * 值保留、标注改口 ——「示例值」三个字是这条降级的全部意义。 */
+function markHonestBoundsStale(why) {
+  const src = $("#hbSource");
+  if (!src) return;
+  src.textContent = "示例值 · 实时数据不可用" + (why ? "（" + why + "）" : "");
+  src.classList.add("hb-stale");
+}
+
+async function loadBlueCoverage() {
+  const body = $("#blueCovBody"), tag = $("#blueCovTag");
+  const raw = $("#blueCovN")?.value;
+  let n = parseInt(raw, 10);
+  if (!Number.isInteger(n)) n = 10;
+  n = Math.min(100, Math.max(1, n));
+  const inp = $("#blueCovN");
+  if (inp && String(inp.value) !== String(n)) inp.value = String(n);
+  if (tag) tag.textContent = "计算中…";
+  try {
+    // 一次请求，两个消费者：蓝球覆盖卡 + 首屏诚实边界卡。
+    // 分开各请求一次会出现"两卡数字对不上"的窗口（一次 200、一次 503）。
+    const d = await api("/api/portfolio/blue-coverage?n_tickets=" + n);
+    renderBlueCoverage(d);
+    fillHonestBounds(d);
+  } catch (e) {
+    // 降级：只让本卡失效，不往外抛（见本段开头第 3 条）
+    if (tag) tag.textContent = "不可用";
+    if (body) {
+      body.innerHTML = '<div class="note">' + escHtml(_degradeNote("蓝球覆盖计划", e)) + "</div>";
+    }
+    // 首屏卡：值保留，标注改口为「示例值」—— 绝不静默假装实时
+    markHonestBoundsStale(e && e.status ? "HTTP " + e.status : "网络异常");
+  }
+}
+
+// ----- 卡 8：大众偏好度（只给档位，不给注数） -----
+// 档位 → 样式。取值必须与后端 `popularity.tier_of()` 严格对齐：low / mid / high。
+// 早期误把 mid 写成 medium，会静默落到默认样式 —— 档位看着"显示出来了"，语义却丢了。
+const POP_TIER_CLASS = { low: "cool", mid: "common", high: "hot" };
+
+function renderPopularity(d) {
+  const body = $("#popBody"), tag = $("#popTag");
+  if (!body) return;
+  if (!d || d.ok === false) {
+    if (tag) tag.textContent = "不可用";
+    body.innerHTML = '<div class="note">大众偏好度不可用：' +
+      escHtml((d && d.error) || "接口未返回（模型可能尚未拟合）") + "</div>";
+    return;
+  }
+  const tier = String(d.tier || "");
+  const label = d.tier_label || "未标注";
+  if (tag) tag.textContent = label;
+  body.innerHTML =
+    '<div class="v14-tier-row">' +
+      '<span class="v14-tier ' + escHtml(POP_TIER_CLASS[tier] || "common") +
+        '" data-tier="' + escHtml(tier) + '">' + escHtml(label) + "</span>" +
+      (Array.isArray(d.reds) && d.reds.length
+        ? '<span class="v14-reds mono">形态：' + escHtml(d.reds.join(" ")) + "</span>"
+        : "") +
+    "</div>" +
+    (Array.isArray(d.reasons) && d.reasons.length
+      ? '<ul class="v14-reasons">' +
+          d.reasons.map(r => "<li>" + escHtml(String(r)) + "</li>").join("") +
+        "</ul>"
+      : "") +
+    (d.caveat
+      ? '<div class="v10-honesty"><b>档位含义：</b>' + escHtml(String(d.caveat)) + "</div>"
+      : "") +
+    '<div class="v10-honesty"><b>纪律说明：</b>' + escHtml(String(d.honesty || "未提供")) +
+      (d.r2_increment !== undefined
+        ? "<div class='sub v14-r2'>形态对头奖注数的增量解释力 R² ≈ " +
+          escHtml(String(d.r2_increment)) + "（只够排序，不足以定值）</div>"
+        : "") +
+    "</div>";
+}
+
+async function loadPopularity() {
+  const body = $("#popBody"), tag = $("#popTag");
+  const subj = $("#popSubject");
+  const reds = _firstTicketReds();
+  const query = reds || [1, 2, 3, 4, 5, 6];   // 无推荐时用默认形态，仅作演示，不冒充当前推荐
+  if (subj) {
+    subj.textContent = reds
+      ? "取当前推荐首注：" + reds.join(" ")
+      : "暂无当前推荐，使用示例形态 1 2 3 4 5 6";
+  }
+  if (tag) tag.textContent = "查询中…";
+  try {
+    renderPopularity(await api(
+      "/api/portfolio/popularity?reds=" + encodeURIComponent(query.join(","))));
+  } catch (e) {
+    // 降级：只让本卡失效，不往外抛
+    if (tag) tag.textContent = "不可用";
+    if (body) {
+      body.innerHTML = '<div class="note">' + escHtml(_degradeNote("大众偏好度", e)) + "</div>";
+    }
+  }
+}
+
 // ----- 卡 2：前置注册 -----
 function renderRegistry(rep) {
   const body = $("#preregBody"), tag = $("#preregTag");
@@ -2615,7 +2951,8 @@ async function runMlDiagnosis(force) {
 // ----- 卡 6：形态规律（组合恒等约束，V12）-----
 // 这些不是"预测下一期"的规律，而是组合数学恒等约束：
 // 和值/跨度/三区/奇偶/连号几乎必然落在这些区间内（实测 vs C(33,6) 理论一致）。
-// 作为严格模式的"可用规律"，LLM 在此约束下生成注单，形态必然合理。
+// 作为严格模式的「结构门控条件」，LLM 在此约束下生成注单，形态必然合理。
+// （旧注释把这里写成"可用规律"，是 V12 之前的说法；后端 routes_predict.py 已明令禁用该叫法。）
 async function loadShapeRules(force) {
   const body = document.querySelector("#shapeRuleBody");
   const tag = document.querySelector("#shapeRuleTag");
@@ -2794,7 +3131,12 @@ async function loadSamplesSideBySide() {
   }
 }
 
-/** V10-10：三卡 + 样本并排的统一加载入口（页面初始化 / 切到评估页时调用）。 */
+/** V10-10：三卡 + 样本并排的统一加载入口（页面初始化 / 切到评估页时调用）。
+ *
+ * V14-B2/B3 起并入蓝球覆盖 + 大众偏好度两卡。它们各自内部已经 try/catch，
+ * 这里再加 `.catch` 是第二道保险：`Promise.all` 里任何一个未捕获的 reject
+ * 都会让整个首屏渲染挂掉，而这两张卡是**附加信息**，不该有这种权力。
+ */
 async function loadV10Cards() {
   await Promise.all([
     loadDistribution(),
@@ -2802,7 +3144,9 @@ async function loadV10Cards() {
     loadSamplesSideBySide(),
     loadShapeRules(false),      // V12 形态规律卡
     loadMultiScaleMde(),        // V11 多尺度 MDE（供卡 5 表头）
-  ]);
+    loadBlueCoverage(),         // V14-B3 蓝球去重覆盖（披露不可拆）
+    loadPopularity(),           // V14-B2 大众偏好度（只给档位）
+  ].map(p => Promise.resolve(p).catch(() => null)));
   // V11 多尺度扫描卡：首次进 overview 时自动渲染（force=true 拉全部维度）
   const msBody = document.querySelector("#multiScaleBody");
   if (msBody && !msBody.getAttribute("data-loaded")) runMultiScale(true);
@@ -2876,10 +3220,23 @@ function renderLlmEval(rep) {
     "<div class='note' style='margin-bottom:6px'>🧠 LLM 离线评估（M3.1）：run " + r.run_id +
     " · " + r.window_issues + " 期 × " + r.tickets + " 注/期 · seed=" + r.seed +
     " · " + (r.created_at||"") + "</div>" +
-    "<div class='scroll'><table><thead><tr><th>通道</th><th>红球平均命中</th><th>蓝球命中率</th><th>≥五等率</th><th>ROI</th><th>LLM调用</th><th>估算成本$</th><th>LLM耗时</th></tr></thead><tbody>" + rows + "</tbody></table></div>" +
+    // P2#8：`≥五等率` / `ROI` 是比率，必须与样本量绑在一起读 —— 3 期里中 1 次是 33%，
+    // 与 100 期里 33 次完全不是一回事。表头写死样本框（期数 × 注数），表脚再复述一次，
+    // 与本项目 `runCounterfactual` 里已有的写法保持同一口径。
+    "<div class='scroll'><table><thead><tr><th>通道</th><th>红球平均命中</th>" +
+      "<th>蓝球命中率</th>" +
+      "<th>≥五等率<br><span class='th-sub'>（样本 " + (r.window_issues || 0) + " 期 × " +
+        (r.tickets || 0) + " 注）</span></th>" +
+      "<th>ROI<br><span class='th-sub'>（同上样本框）</span></th>" +
+      "<th>LLM调用</th><th>估算成本$</th><th>LLM耗时</th></tr></thead><tbody>" + rows +
+      "</tbody></table></div>" +
     "<div class='chart' id='chLlmCmp' style='height:220px;margin-top:8px'></div>" +
     "<div class='scroll' style='margin-top:8px'><table><thead><tr><th>对比</th><th>指标</th><th>Δ均值</th><th>p 值</th><th>结论</th></tr></thead><tbody>" + cmp + "</tbody></table></div>" +
-    "<div class='note'>结论：paired 检验（BH 校正后 p<0.05 才视为显著）；cost 为按 token 估算，仅作展示。LLM 通道存在模型噪声，stat/random 通道固定种子可复现。</div>";
+    "<div class='note'>结论：paired 检验（BH 校正后 p<0.05 才视为显著）；cost 为按 token 估算，仅作展示。" +
+      "LLM 通道存在模型噪声，stat/random 通道固定种子可复现。" +
+      "样本 " + (r.window_issues || 0) + " 期 × " + (r.tickets || 0) +
+      " 注 —— ≥五等率与 ROI 的抽样误差随样本量平方根缩小，样本不足 " + METHOD_MIN_ISSUES +
+      " 期时，与随机基线之差属随机波动，不构成能力结论。</div>";
   const ch = echartsInit("chLlmCmp");
   if (ch) {
     const cats = ["红球平均命中", "蓝球命中率", "≥五等率", "ROI"];
@@ -4266,10 +4623,15 @@ async function loadAll() {
       renderPredictions({issue: preds.issue, tickets: [], note: "", data_basis: preds.data_basis,
                          generated_at: null, rules: null});
       $("#predList").innerHTML = '<div class="note">本期（' + escHtml(preds.issue || "") +
-        '）还没有生成预测，点右上角「🎯 生成预测」。</div>';
+        '）还没有生成候选注单，点右上角「🎯 生成候选注单」。</div>';
       renderCountdown();
     }
     await renderHistory();
+    // D3：首屏「诚实收益边界」卡在页面加载时就用实时值填充。
+    // 不挂在 `loadV10Cards()` 上 —— 那个入口只在用户切到「评估报告 → 综合概览」时才触发，
+    // 而首屏卡是**首屏**的内容，不能等用户点进去才有真值。
+    // `loadBlueCoverage()` 内部已吞掉一切异常并切「示例值」标注，这里不必再包 try。
+    loadBlueCoverage();
     if (health) {
       $("#dataStatus").textContent = health.issues + " 期 | " + (health.max_issue || "");
       if (health.version) {

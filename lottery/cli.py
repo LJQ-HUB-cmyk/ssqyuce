@@ -152,7 +152,7 @@ def cmd_doctor(args):
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(prog="lottery", description="双色球智能预测分析系统")
+    p = argparse.ArgumentParser(prog="lottery", description="双色球号码组合分析系统")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("fetch", help="抓取最新开奖数据并增量入库")
     sub.add_parser("stats", help="输出最新多尺度统计")

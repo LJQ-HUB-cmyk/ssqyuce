@@ -1,0 +1,865 @@
+"""V14 端点边界加固 + 能力清单端点（`routes_portfolio`）。
+
+## 这个文件守的是什么
+
+不是"端点能返回 200"，而是**边界上的每个非法输入都不许变成 500**，
+以及**端点自己说的话不能和它自己返回的数字打架**。
+
+## 两种测法都用（2026-10-21 更正）
+
+**原先这里写着"容器内没有 `httpx` 的 TestClient 可用"—— 那是错的。**
+实测 `httpx 0.28.1`，`from fastapi.testclient import TestClient` 正常，HTTP 层完全可测。
+这个错误前提让我放弃了最能自证的手段（真 HTTP 请求），
+**比"没写测试"更难发现，因为文件头写着理由，看起来像深思熟虑的取舍。**
+
+现在两种都保留，各有不可替代之处：
+
+* **直接调用路由函数**（本文件主体）—— 能精确断言 `JSONResponse.status_code`
+  与 body，且能构造 `n_tickets=0/-1` 这类**HTTP 层会先拦成 422** 的输入
+  （`Query(ge=1)` 在函数体之前生效，所以要测函数自身的兜底，只能绕过 HTTP）。
+* **真 HTTP（`TestClient`，见文件末尾「十二」）** —— 证明参数校验在**真实请求
+  链路**上成立，而不是函数被直接调用时的巧合。
+
+    from lottery import routes_portfolio as R
+    resp = R.portfolio_popularity(reds="1,2,3,4")   # 直接调
+    assert resp.status_code == 400                   # 断言返回的 JSONResponse
+
+## 为什么必须区分「未拟合」与「已拟合」
+
+pytest 的 autouse 隔离（`tests/conftest.py::_auto_isolate_lottery_paths`）会把
+`config.DB_PATH` 指向**空的临时库**。而 `popularity.get_model()` 在数据不足时
+**吞掉异常并返回未拟合对象**（不抛）。后果：本文件里 `popularity` 端点默认走
+**503 分支**。这两条路径都要当正式用例测，不能假设有数据。
+
+## 断言原则（沿用 test_w08_frontend_auth.py:175 定下的原则）
+
+**断言行为，不断言实现字面量。**
+
+所以本文件里最重要的守卫不是"披露文本里必须有某个词"，而是
+`test_disclosure_never_contradicts_returned_ratio`：
+把披露文本里**声称的返奖比**解析出来，和**它返回的 `ev_ratio_sixth`** 比对。
+文案怎么改写都行，只要两者不矛盾 —— 这才是防"自相矛盾"的真正守卫。
+"""
+from __future__ import annotations
+
+import random
+import re
+
+import pytest
+from fastapi.responses import JSONResponse
+
+from lottery import routes_portfolio as R
+
+
+# ==========================================================================
+# 公共工具
+# ==========================================================================
+
+def _status(resp) -> int:
+    """路由函数返回 dict（成功）或 JSONResponse（失败）时的状态码。"""
+    if isinstance(resp, JSONResponse):
+        return resp.status_code
+    return 200
+
+
+def _json(resp) -> dict:
+    """把两种返回统一成 dict，便于断言 body。"""
+    if isinstance(resp, JSONResponse):
+        import json
+        return json.loads(resp.body)
+    return resp
+
+
+def _ensure_popularity_fitted(n: int = 400, seed: int = 7):
+    """在当前（临时）库里写入带 `p1`/`sales` 的合成期次，并让模型拟合。
+
+    `conftest.make_draws` 造的期次**不含 `p1`/`sales`**，而 popularity 只使用
+    这两列都存在的行（`fit()` 里 `rows = [... if d.get("p1") and d.get("sales")]`）。
+    故这里单独造数据：至少 300 期（`fit` 的下限），否则模型永远未拟合。
+    """
+    from lottery import db, popularity as POP
+
+    rng = random.Random(seed)
+    draws = []
+    for i in range(n):
+        reds = sorted(rng.sample(range(1, 34), 6))
+        draws.append({
+            "issue": f"20{i // 150 + 13}{i % 150 + 1:03d}",
+            "date": f"20{i // 150 + 13}-01-{(i % 28) + 1:02d}",
+            "reds": reds,
+            "order": list(reds),
+            "blue": rng.randint(1, 16),
+            # 让 p1 与形态弱相关（生日号越多，p1 略高）——模拟真实信号
+            "p1": float(3 + sum(1 for x in reds if x <= 31) + rng.random()),
+            "sales": 3.2e8 + rng.random() * 1e8,
+        })
+    db.upsert_draws(draws)
+    POP._CACHE = None            # 强制下一次 get_model() 重新拟合
+    model = POP.get_model()
+    return model
+
+
+@pytest.fixture
+def fitted_popularity():
+    """已拟合的 popularity 模型（用完还原缓存，避免污染其它用例）。"""
+    from lottery import popularity as POP
+    saved = POP._CACHE
+    model = _ensure_popularity_fitted()
+    assert model.fitted, "前置条件失败：合成数据未能让模型拟合"
+    yield model
+    POP._CACHE = saved
+
+
+@pytest.fixture
+def unfitted_popularity():
+    """显式未拟合的模型（`_CACHE` 被替换为空模型）。"""
+    from lottery import popularity as POP
+    saved = POP._CACHE
+    POP._CACHE = POP.PopularityModel()     # fitted=False
+    yield POP._CACHE
+    POP._CACHE = saved
+
+
+# ==========================================================================
+# 一、`/api/portfolio/popularity` 的 reds 参数边界（全部必须 400）
+# ==========================================================================
+
+@pytest.mark.parametrize("reds, why", [
+    ("1,2,3,4,5,x",      "含非整数"),
+    ("1,2,3,4,5",        "只有 5 个"),
+    ("1,2,3,4,5,6,7",    "有 7 个"),
+    ("",                 "空串（0 个）"),
+    ("1,1,2,3,4,5",      "有重复"),
+    ("0,2,3,4,5,6",      "含越界下界 0"),
+    ("28,29,30,31,32,34", "含越界上界 34"),
+    ("-1,2,3,4,5,6",     "含负数"),
+    ("1.5,2,3,4,5,6",    "含浮点数"),
+    (None,               "None"),
+    ("1,,2,3,4,5,6",     "含空段（仍解析出 6 个，见下一个用例说明）"),
+])
+def test_popularity_reds_invalid_returns_400(reds, why):
+    """reds 的非法形态一律 400 —— 绝不能落到 500（未捕获异常）。"""
+    resp = R.portfolio_popularity(reds=reds, sales=0.0)
+    code = _status(resp)
+
+    # "1,,2,3,4,5,6" 的空段被 `if x.strip()` 过滤后恰好是 6 个合法号，应进入
+    # **解析成功**分支。这里断言的是「不被判为参数非法」（code != 400），
+    # 而不是断言 200 —— 因为模型是否就绪与参数解析无关，未拟合时会是 503。
+    # 这正是本用例要守的行为：解析宽容 ≠ 校验放行。
+    if why.startswith("含空段"):
+        assert code != 400, f"空段应被过滤后正常解析，却被判为参数非法：{_json(resp)}"
+        return
+
+    assert code == 400, f"{why}（reds={reds!r}）应为 400，实际 {code}"
+    body = _json(resp)
+    assert body["ok"] is False
+    assert body.get("error"), "400 必须带人读错误信息"
+    assert "500" not in str(body.get("error"))
+
+
+def test_popularity_reds_not_string_number_is_400():
+    """传整数（而非字符串）时按 1 个号处理 → 400，不抛 TypeError。"""
+    resp = R.portfolio_popularity(reds=123456, sales=0.0)
+    assert _status(resp) == 400
+    assert "6" in _json(resp)["error"]
+
+
+def test_popularity_reds_tolerant_forms_return_200(fitted_popularity):
+    """宽容解析：中文逗号、前后空格、尾逗号都应被接受（不是缺陷）。"""
+    for reds in ("1，2，3，4，5，6", " 1, 2, 3, 4, 5, 6 ", "1,2,3,4,5,6,"):
+        resp = R.portfolio_popularity(reds=reds, sales=0.0)
+        assert _status(resp) == 200, f"{reds!r} 应被宽容接受，实际 {_status(resp)}"
+
+
+# ==========================================================================
+# 二、`sales` 参数：空转但绝不 500
+# ==========================================================================
+
+@pytest.mark.parametrize("sales", [
+    0.0, -5.0, 1e308, -1e308, float("inf"), float("-inf"), float("nan"), 1e8,
+])
+def test_popularity_sales_extremes_never_500(fitted_popularity, sales):
+    """`sales` 取任何值都不得 500。
+
+    **已知设计**：`PopularityModel.describe()` 根本不使用 `sales` 的值（档位在
+    标准化空间按分位标定），所以负数/极大/inf/nan 都不会出错。这不是"边界没测"，
+    而是参数本身空转 —— 见 `popularity.PopularityModel.describe` 内的注释。
+    """
+    resp = R.portfolio_popularity(reds="1,2,3,4,5,6", sales=sales)
+    assert _status(resp) == 200
+    assert _json(resp)["ok"] is True
+
+
+def test_popularity_sales_does_not_change_tier(fitted_popularity):
+    """`sales` 空转的**行为断言**：传不同销量，档位必须完全一致。
+
+    这条比"参数存在"更重要 —— 它把"空转"从注释变成了可执行契约。
+    若哪天有人让 `sales` 真的参与判定，本用例会失败并强制其更新文档与模型版本。
+    """
+    tiers = set()
+    for sales in (0.0, 1e6, 1e8, 1e12, -5.0):
+        resp = R.portfolio_popularity(reds="1,2,3,4,5,6", sales=sales)
+        tiers.add(_json(resp)["tier"])
+    assert len(tiers) == 1, f"sales 不应影响档位，但出现了多个档位：{tiers}"
+
+
+# ==========================================================================
+# 三、模型未就绪 → 503（不是 500，也不是 200）
+# ==========================================================================
+
+def test_popularity_unfitted_returns_503(unfitted_popularity):
+    """模型未拟合时必须是 503，且不能是 200（不能返回假档位）。"""
+    resp = R.portfolio_popularity(reds="1,2,3,4,5,6", sales=0.0)
+    assert _status(resp) == 503, f"未拟合应为 503，实际 {_status(resp)}"
+    body = _json(resp)
+    assert body["ok"] is False
+    assert "模型未就绪" in body["error"]
+
+
+def test_popularity_unfitted_still_validates_reds_first(unfitted_popularity):
+    """参数错误优先于模型状态：非法 reds + 未拟合 → 400 而非 503。
+
+    顺序很重要 —— 若先判模型状态，用户会以为"改对参数就能用"，
+    实际上参数本身也是错的。
+    """
+    resp = R.portfolio_popularity(reds="1,2,3", sales=0.0)
+    assert _status(resp) == 400
+
+
+def test_popularity_fitted_returns_tier_not_ticket_count(fitted_popularity):
+    """已拟合时返回档位，且**不得**包含任何"预测注数"字段。
+
+    这是诚实性守卫：`describe()` 只输出档位，绝不输出"预计 X 注中奖"。
+    """
+    resp = R.portfolio_popularity(reds="1,2,3,4,5,6", sales=0.0)
+    assert _status(resp) == 200
+    body = _json(resp)
+    assert body["tier"] in ("low", "mid", "high")
+    assert "tier_label" in body and "caveat" in body and "honesty" in body
+    # 不得出现精确注数字段（键名或数值形式都不许）
+    for forbidden in ("predicted_p1", "expected_tickets", "tickets"):
+        assert forbidden not in body, f"不得返回预测注数字段 {forbidden}"
+    assert body["reds"] == sorted([1, 2, 3, 4, 5, 6])
+
+
+# ==========================================================================
+# 四、`/api/portfolio/blue-coverage` 的 n_tickets 边界
+# ==========================================================================
+
+@pytest.mark.parametrize("n", [0, -1, -100])
+def test_blue_coverage_non_positive_tickets(n):
+    """`n_tickets ≤ 0`：直接调用不崩溃，返回完整的"0 注"披露。
+
+    HTTP 层由 `Query(ge=1)` 拦成 422，不进入函数体；但**直接调用**是本文件
+    采用的测试方式，此时函数必须自己兜住 —— `optimize()` 内 `max(0, n)`。
+    """
+    resp = R.portfolio_blue_coverage(n_tickets=n)
+    assert _status(resp) == 200
+    body = _json(resp)
+    assert body["n_tickets"] == 0, "负数应被夹到 0"
+    assert body["plan"] == []
+    assert body["cost_yuan"] == 0.0
+    assert body["ev_sixth_yuan"] == 0.0
+    # 0 注没有"频率收益"，flag 必须为 False
+    assert body["honesty_flags"]["increases_prize_frequency"] is False
+
+
+@pytest.mark.parametrize("n", [1, 10, 16, 100])
+def test_blue_coverage_legal_range_returns_plan(n):
+    """合法注数区间必须给出计划、成本、期望回收与披露（一个都不能少）。"""
+    body = _json(R.portfolio_blue_coverage(n_tickets=n))
+    assert body["ok"] is True
+    assert body["n_tickets"] == n
+    assert len(body["plan"]) == n
+    assert body["cost_yuan"] == pytest.approx(n * 2.0)
+    assert body["ev_sixth_yuan"] > 0
+    assert body["disclosure"] and body["disclosure_lines"]
+    # 三个必须同屏的数字
+    for key in ("p_any_blue_covered", "p_any_blue_random_repeat",
+                "cost_yuan", "ev_sixth_yuan"):
+        assert key in body
+    # 两条否定结论在任何合法注数下都不得翻转为 True
+    flags = body["honesty_flags"]
+    assert flags["increases_hit_probability"] is False
+    assert flags["increases_expected_return"] is False
+
+
+def test_blue_coverage_never_exceeds_blue_pool():
+    """蓝球池只有 16 个：覆盖数恒 ≤ 16，且 n > 16 时概率封顶 1.0。"""
+    for n in (16, 17, 50, 100):
+        body = _json(R.portfolio_blue_coverage(n_tickets=n))
+        assert body["blue_coverage_count"] <= 16
+    for n in (17, 50, 100):
+        body = _json(R.portfolio_blue_coverage(n_tickets=n))
+        assert body["p_any_blue_covered"] == pytest.approx(1.0)
+
+
+# ==========================================================================
+# 五、【核心守卫】披露不得与返回数字自相矛盾
+# ==========================================================================
+
+def test_disclosure_never_contradicts_returned_ratio():
+    """**本文件最重要的断言**：从披露文本里解析它声称的返奖比，
+    与它返回的 `ev_ratio_sixth` 比对 —— 两者必须一致。
+
+    缺陷背景（2026-10-21 实测）：旧版披露无条件写死
+    「六等奖返奖比**恒为** X%，与注数无关」，而 `ev_ratio_sixth` 在 n > 16 时
+    会掉到 2.5%。端点在说"恒为 15.625%"的同时自己返回 2.5% —— 用户一旦发现
+    这类矛盾，就再也不会相信任何数字。
+
+    本守卫**不断言文案措辞**（"恒为"改不改都行），只断言
+    "披露里声称的百分比 == 返回的 ev_ratio_sixth"。这样文案可以自由改写，
+    但永远不能与数字打架。
+    """
+    pattern = re.compile(r"六等奖返奖比[^0-9%]*?(\d+(?:\.\d+)?)\s*%")
+    for n in (1, 5, 10, 16, 17, 50, 100):
+        body = _json(R.portfolio_blue_coverage(n_tickets=n))
+        joined = "\n".join(body["disclosure_lines"])
+        m = pattern.search(joined)
+        if m is None:
+            # n=0 走"返奖比无从计算"分支，不声称任何百分比 —— 合法
+            assert n == 0 or "无从计算" in joined, (
+                f"n={n} 的披露没有声称返奖比，也未说明无从计算：{joined!r}")
+            continue
+        claimed = float(m.group(1)) / 100.0
+        assert claimed == pytest.approx(body["ev_ratio_sixth"], abs=5e-4), (
+            f"n={n}：披露声称返奖比 {claimed}，但返回 ev_ratio_sixth="
+            f"{body['ev_ratio_sixth']} —— 端点自相矛盾")
+
+
+def test_blue_coverage_ratio_is_constant_for_all_n():
+    """返奖比恒为 5/32 = 15.625%，**对任意 n（含 n > 16）**。
+
+    ## 这条测试曾经写反过（2026-10-21 教训，务必保留这段说明）
+
+    缺陷被发现时，第一反应是「n>16 时蓝球池占满、概率封顶而成本继续涨 ⇒
+    返奖比被稀释」，于是写了「n>16 返奖比必须下降」的断言。
+
+    **那个判断是错的。** 用 `evaluate.tickets_result()` 真实结算反证：
+    n=100 时每个开奖蓝球下命中注数为 6~7 注（均值 6.25），
+    六等奖按**注**兑付 ⇒ 真实回收 31.25 元，返奖比 15.625%。
+
+    真正的 bug 在 EV 公式：`p_cover = min(n,16)/16` 是「**至少中一次**的概率」，
+    却被乘了 ¥5；应该乘 ¥5 的是「**期望命中注数** = n/16」。
+    两者在 n ≤ 16 时同值（蓝球互不相同 ⇒ 至多中一次），所以旧测试抓不到。
+
+    **变异捕捉**：把 `ev_sixth` 改回 `p_cover * SIXTH_PRIZE`，
+    n=17/50/100 会立刻失败（0.147/0.05/0.025 ≠ 0.15625）。
+    """
+    for n in (1, 5, 10, 16, 17, 50, 100):
+        body = _json(R.portfolio_blue_coverage(n_tickets=n))
+        assert body["ev_ratio_sixth"] == pytest.approx(5 / 32, abs=1e-6), (
+            f"n={n} 返奖比 {body['ev_ratio_sixth']} 偏离 5/32 —— "
+            f"若在 n>16 处偏离，说明 EV 又用回了「至少中一次」口径")
+
+
+@pytest.mark.parametrize("n, expected_ev", [
+    (1, 0.3125), (10, 3.125), (16, 5.0),
+    (17, 5.3125), (50, 15.625), (100, 31.25),
+])
+def test_sixth_ev_uses_expected_hit_count(n, expected_ev):
+    """`ev_sixth_yuan == n/16 × 5`，对任意 n 成立。"""
+    body = _json(R.portfolio_blue_coverage(n_tickets=n))
+    assert body["ev_sixth_yuan"] == pytest.approx(expected_ev, abs=1e-6), (
+        f"n={n}：六等奖 EV 应为 {expected_ev}（= n/16×5），"
+        f"实际 {body['ev_sixth_yuan']}")
+
+
+def test_expected_hits_and_cover_probability_are_distinct():
+    """`expected_blue_hits = n/16`（不封顶）与 `p_any_blue_covered`（封顶 1.0）必须分开。
+
+    这两个量一旦混用就会重演本次缺陷。断言它们**不相等**（n>16 时）。
+    """
+    for n in (17, 50, 100):
+        body = _json(R.portfolio_blue_coverage(n_tickets=n))
+        assert body["p_any_blue_covered"] == pytest.approx(1.0)
+        assert body["expected_blue_hits"] == pytest.approx(n / 16, abs=1e-4)
+        assert body["expected_blue_hits"] > 1.0, "n>16 时期望命中注数应 > 1"
+
+
+def test_sixth_ev_matches_real_settlement_engine():
+    """用项目自己的结算函数交叉验证 EV —— 不靠公式自证。
+
+    `evaluate.tickets_result()` 逐注调 `prize_level` 再求和，是六等奖的权威口径。
+    这里让红球必然不中（与开奖红球交集为空），只让蓝球决定六等奖。
+
+    这是唯一不依赖 `optimize()` 内部公式的独立验证：任何"只改公式不改语义"
+    的改法都会在这里暴露。
+    """
+    from lottery import blue_coverage as BC
+    from lottery.evaluate import PRIZE_CASH, prize_level
+
+    n = 100
+    plan = BC.coverage_plan(n)
+    pred_reds, act_reds = [1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]
+
+    total = 0.0
+    for act_blue in range(1, 17):              # 16 个蓝球等概率
+        for b in plan:
+            if prize_level(pred_reds, b, act_reds, act_blue) == 6:
+                total += PRIZE_CASH[6]
+    real_ev = total / 16.0
+
+    body = _json(R.portfolio_blue_coverage(n_tickets=n))
+    assert body["ev_sixth_yuan"] == pytest.approx(real_ev, abs=1e-6), (
+        f"端点报六等奖 EV={body['ev_sixth_yuan']}，真实结算 {real_ev} —— 公式与结算不一致")
+
+
+def test_blue_coverage_saturation_flag_matches_definition():
+    """`coverage_saturated` 严格等价于 `n_tickets > 16`，且**只**表示概率封顶。
+
+    它不得暗示返奖比变化 —— 饱和区返奖比仍是 15.625%。
+    """
+    for n in (1, 15, 16, 17, 99, 100):
+        body = _json(R.portfolio_blue_coverage(n_tickets=n))
+        assert body["coverage_saturated"] is (n > 16), f"n={n} 饱和标志错误"
+    for n in (17, 100):
+        assert _json(R.portfolio_blue_coverage(n_tickets=n))["ev_ratio_sixth"] \
+            == pytest.approx(5 / 32, abs=1e-9)
+
+
+def test_saturation_note_is_about_probability_not_ratio():
+    """n > 16 的提示必须讲**概率**封顶，不得暗示返奖比下降。"""
+    joined = "\n".join(
+        _json(R.portfolio_blue_coverage(n_tickets=100))["disclosure_lines"])
+    assert "封顶" in joined, "n>16 必须提示概率封顶"
+    assert "至少中一次" in joined, "提示必须指向「至少中一次」这个量"
+    for bad in ("返奖比随之下降", "返奖比下降", "返奖比被稀释"):
+        assert bad not in joined, f"披露含错误陈述「{bad}」（返奖比实际恒定）"
+
+
+# ==========================================================================
+# 六、`/api/portfolio/capabilities` 能力清单
+# ==========================================================================
+
+def test_capabilities_returns_four_items():
+    body = _json(R.portfolio_capabilities())
+    assert body["ok"] is True
+    assert body["n_capabilities"] == 4
+    ids = [c["id"] for c in body["capabilities"]]
+    assert ids == ["predict_numbers", "detect_bias",
+                   "popularity_rank", "blue_coverage"]
+
+
+def test_capabilities_each_item_has_evidence_and_honest_note():
+    """每条能力都必须带 evidence（含出处）与 honest_note —— 缺一不可。"""
+    body = _json(R.portfolio_capabilities())
+    for cap in body["capabilities"]:
+        assert cap.get("honest_note"), f"{cap['id']} 缺 honest_note"
+        assert cap.get("summary_zh"), f"{cap['id']} 缺 summary_zh"
+        ev = cap.get("evidence")
+        assert ev, f"{cap['id']} 缺 evidence"
+        for e in ev:
+            assert e.get("claim_zh"), f"{cap['id']} 的 evidence 缺 claim_zh"
+            assert e.get("value"), f"{cap['id']} 的 evidence 缺 value"
+            assert e.get("source"), (
+                f"{cap['id']} 的 evidence「{e.get('claim_zh')}」缺 source —— "
+                f"没有出处的数字不许当结论")
+
+
+def test_capabilities_verdicts_are_honest():
+    """四条结论里三条必须是"做不到/有下限/极弱"，只有一条是真收益。"""
+    body = _json(R.portfolio_capabilities())
+    verdicts = {c["id"]: c["verdict"] for c in body["capabilities"]}
+    assert verdicts["predict_numbers"] == "cannot"
+    assert verdicts["detect_bias"] == "partially"
+    assert verdicts["popularity_rank"] == "weak"
+    assert verdicts["blue_coverage"] == "real_but_no_ev_gain"
+
+    summary = body["verdict_summary"]
+    assert summary["cannot"] == 1
+    assert summary["real_but_no_ev_gain"] == 1
+    # 真收益那一类必须同时否认"提高期望"
+    assert summary["cannot"] + summary["partially"] + summary["weak"] == 3
+
+
+def test_capabilities_predict_numbers_states_cannot():
+    """"预测号码"必须明确写"做不到"，且带三条独立证据（χ²/条件熵/max-stat）。"""
+    body = _json(R.portfolio_capabilities())
+    cap = next(c for c in body["capabilities"] if c["id"] == "predict_numbers")
+    assert cap["verdict"] == "cannot"
+    assert "做不到" in cap["verdict_zh"]
+    joined = "\n".join(e["value"] for e in cap["evidence"])
+    assert "p=0.0654" in joined, "必须给出红球 χ² p 值"
+    assert "0.0076" in joined, "必须给出条件熵降幅"
+    assert "0.2995" in joined, "必须给出 max-stat 校正后 p 值"
+
+
+def test_capabilities_blue_coverage_discloses_no_ev_gain():
+    """唯一真收益的那条，必须同屏给出"不提高期望"与成本。"""
+    body = _json(R.portfolio_capabilities())
+    cap = next(c for c in body["capabilities"] if c["id"] == "blue_coverage")
+    joined = "\n".join(e["value"] for e in cap["evidence"]) + cap["honest_note"]
+    assert "15.625" in joined or "15.62" in joined
+    assert "期望" in joined
+    assert "1/17,721,088" in joined
+
+
+def test_capabilities_avoids_banned_marketing_words():
+    """禁用词守卫：不得出现「提高中奖率/提高命中率/更划算/稳赚」。"""
+    import json
+    s = json.dumps(_json(R.portfolio_capabilities()), ensure_ascii=False)
+    for banned in ("提高中奖率", "提高命中率", "更划算", "稳赚"):
+        assert banned not in s, f"能力清单出现禁用词「{banned}」"
+
+
+def test_capabilities_disclaimer_denies_ev_change():
+    """顶层免责声明必须同时否认"改变概率"与"改变期望值"。"""
+    body = _json(R.portfolio_capabilities())
+    d = body["disclaimer"]
+    assert "不改变" in d
+    assert "概率" in d
+    assert "期望" in d
+
+
+def test_capabilities_marks_measured_vs_documented():
+    """`popularity_rank` 的 evidence 必须区分"文档记录值"与"当前实测值"。
+
+    背景：文档写 R²=+0.0077，当前库实测约 +0.0114 —— 口径相同、数据期数不同。
+    如实并列是本端点的立身之本；若哪天只剩一个数字，说明有人"挑了好看的"。
+    """
+    body = _json(R.portfolio_capabilities())
+    cap = next(c for c in body["capabilities"] if c["id"] == "popularity_rank")
+    flags = [bool(e.get("measured_now")) for e in cap["evidence"]]
+    assert any(flags), "必须至少有一条标注为当前实测"
+    assert any(not f for f in flags), "必须保留文档记录值作为对照"
+
+
+# ==========================================================================
+# 七、内容不得含 numpy 标量（序列化纪律）
+# ==========================================================================
+
+@pytest.mark.parametrize("call", [
+    lambda: R.portfolio_blue_coverage(n_tickets=10),
+    lambda: R.portfolio_capabilities(),
+])
+def test_no_numpy_scalars_in_payload(call):
+    """返回体不得含 numpy 标量/数组（FastAPI 编码器会抛 TypeError）。"""
+    import json
+    import numpy as np
+
+    body = _json(call())
+
+    def _walk(obj, path="$"):
+        assert not isinstance(obj, np.generic), f"{path} 是 numpy 标量 {type(obj)}"
+        assert not isinstance(obj, np.ndarray), f"{path} 是 numpy 数组"
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                _walk(v, f"{path}.{k}")
+        elif isinstance(obj, (list, tuple)):
+            for i, v in enumerate(obj):
+                _walk(v, f"{path}[{i}]")
+
+    _walk(body)
+    json.dumps(body)             # 必须可序列化
+
+
+# ==========================================================================
+# 七、口径地图：三个「整注返奖比」的关系（Lead 裁决 2）
+#
+# 系统里并存三个整注返奖比，来源不同、数值不同。用户曾因这类"同一系统两个数"
+# 怀疑造假，所以**不物理删除任何一个**（删掉就失去可核对性），而是：
+#   1. 每个都标明 assumption 与 method；
+#   2. 用测试断言三者的**关系**（严QA 指出：三口径并存却无任何断言 = 隐患）；
+#   3. 权威口径 = 可追溯到奖金假设的那个。
+# ==========================================================================
+
+def test_ev_ratio_map_relates_all_four_values():
+    """四个整注返奖比必须可核对，且大小关系可断言。
+
+    ## D1 落地后的口径地图（2026-10-21 终裁）
+
+    | 口径 | 值 | 来源 | 消费者 |
+    |---|---|---|---|
+    | 中位假设 + `published` | **0.531925** | 684万/20.5万 + 边际 pb | 引擎默认，**已不用于端点** |
+    | 中位假设 + `strict` | **0.522907** | 684万/20.5万 + 互斥奖级 | **端点权威值（D1）** |
+    | 旧文档简化值 | 0.523 | `popularity.py:42`「1.0458/2」 | 用户可见文案 |
+    | 固定奖金表 | ≈0.5028 | `PRIZE_CASH`（650万/18万）+ 互斥 | `/expected-value` |
+
+    关键关系：
+      * `strict` 必然**小于** `published`，差值约 0.9pp —— 因为 published 让六等奖
+        与高奖级**重复计数**，系统性偏高。这条断言是"两个口径没被混用"的直接证据。
+      * `strict`(0.522907) 与旧文档 0.523 在 1e-3 内吻合 —— 这正是 Lead 复现出
+        「52.3% = strict + 中位」的原因，也是红线表数值的合法出处。
+      * 固定表口径更低，因为其奖金假设（650万/18万）低于实测中位。
+
+    **不物理删除任何口径**：删掉就失去可核对性，且会丢掉"复现 V4 历史发表值"的能力。
+    """
+    strict_ratio = _json(R.portfolio_blue_coverage(n_tickets=10))["ev_ratio_full"]
+    fixed_ratio = _json(R.portfolio_expected_value(limit=1))["expected_return_per_ticket"] / 2.0
+
+    # 端点走 strict（D1）
+    assert strict_ratio == pytest.approx(0.522907, abs=1e-6), \
+        f"端点应为 strict 口径 0.522907，实际 {strict_ratio}"
+
+    # 引擎仍保留 published（刻意双口径，不得删除）
+    from lottery import engine
+    published = float(engine._single_ticket_ev(
+        {"first": 6_840_000, "second": 205_000}, sixth="published")["ev_ratio"])
+    assert published == pytest.approx(0.531925, abs=1e-6), \
+        "engine 的 published 分支必须保留（可复现 V4 历史发表值）"
+
+    # 核心关系 1：strict < published（published 重复计数，偏高 ~0.9pp）
+    assert strict_ratio < published, \
+        f"strict({strict_ratio}) 应小于 published({published})"
+    assert published - strict_ratio == pytest.approx(0.009, abs=2e-3), \
+        f"两口径差值应约 0.9pp，实际 {(published-strict_ratio)*100:.3f}pp"
+
+    # 核心关系 2：strict 与旧文档 52.3% 吻合（红线表的合法出处）
+    assert strict_ratio * 100 == pytest.approx(52.3, abs=0.1)
+
+    # 核心关系 3：固定表口径最低
+    assert fixed_ratio == pytest.approx(0.5028, abs=5e-3)
+    assert fixed_ratio < strict_ratio
+
+    # 全部 < 1：负期望是数学事实
+    for name, v in (("strict", strict_ratio), ("published", published), ("fixed", fixed_ratio)):
+        assert v < 1.0, f"{name} 返奖比 {v} >= 1"
+
+
+def test_ev_ratio_full_carries_prize_assumption():
+    """权威返奖比必须**带着**奖金假设一起返回（否则用户以为是确定值）。"""
+    body = _json(R.portfolio_blue_coverage(n_tickets=10))
+    pa = body.get("prize_assumption")
+    assert pa, "ev_ratio_full 必须配 prize_assumption 一起返回"
+    assert pa["first"] == 6_840_000
+    assert pa["second"] == 205_000
+    assert pa.get("label")
+
+
+def test_ev_ratio_full_never_exceeds_one():
+    """整注返奖比在任何注数下都必须 < 1 —— 负期望是双色球的数学事实。"""
+    for n in (1, 10, 16, 100):
+        body = _json(R.portfolio_blue_coverage(n_tickets=n))
+        assert body["ev_ratio_full"] < 1.0, f"n={n} 整注返奖比 {body['ev_ratio_full']} >= 1"
+        assert body["net_sixth_yuan"] < 0 or n == 0, f"n={n} 六等奖口径竟不亏"
+
+
+# ==========================================================================
+# 十、返奖比恒定性：跨 n=1..10000 全域（Lead 要求）
+#
+# 目的：防止将来有人把 `ev_sixth` 改回 `p_cover × 5`（即「至少中一次的概率」）
+# 或做任何"优化"。返奖比必须**处处**等于 5/32，而不只是在几个采样点上等于。
+# ==========================================================================
+
+#: 代表性取样点：覆盖 n≤16 段、临界点 16/17、以及多个量级以上
+_RATIO_SAMPLE_NS = (
+    1, 2, 3, 7, 8, 15, 16,        # 覆盖未饱和段与临界点
+    17, 18, 20, 31, 32,           # 刚越过蓝球池（旧 bug 从此处开始）
+    50, 64, 100,                  # 中等规模（API le=100 上限也在内）
+    128, 512, 1000, 4096, 10000,  # 大数量级
+)
+
+
+@pytest.mark.parametrize("n", _RATIO_SAMPLE_NS)
+def test_return_ratio_constant_across_all_magnitudes(n):
+    """`ev_ratio_sixth` 在 n=1..10000 的各个量级上都必须精确等于 5/32。
+
+    这是"覆盖优化不改变期望"的终极具守。任何把 EV 公式改错的改动都会
+    在 n>16 的点上立刻失败。
+    """
+    body = _json(R.portfolio_blue_coverage(n_tickets=n))
+    assert body["ev_ratio_sixth"] == pytest.approx(5 / 32, abs=1e-9), (
+        f"n={n} 返奖比 {body['ev_ratio_sixth']} != 5/32 —— "
+        f"期望命中注数口径可能又被换成了「至少中一次」")
+    # 同时校验 EV 精确等于 n/16 × 5（不是封顶值）
+    assert body["ev_sixth_yuan"] == pytest.approx(n / 16 * 5, abs=1e-6)
+
+
+def test_return_ratio_constant_over_full_range_1_to_1000():
+    """穷举 n=1..1000：返奖比必须处处恒定（采样点之外也要成立）。
+
+    为何到 1000 而不是 10000：`optimize()` 每次都要构造长度为 n 的 plan，
+    1..10000 穷举在本机上约 20s，对单测过重；量级验证交给上面的参数化用例
+    （已含 10000）。区间内穷举 + 量级采样，两层互补。
+    """
+    deviations = []
+    for n in range(1, 1001):
+        ratio = _json(R.portfolio_blue_coverage(n_tickets=n))["ev_ratio_sixth"]
+        if abs(ratio - 5 / 32) > 1e-9:
+            deviations.append((n, ratio))
+    assert not deviations, f"以下注数的返奖比偏离 5/32：{deviations[:10]}"
+
+
+# ==========================================================================
+# 十一、D1 + D2 落地守卫（2026-10-21 三人核算结论）
+#
+# 背景：同一页面两张卡对同一个量给出 52.3% vs 53.2%，用户一除就发现。
+# 根因是消费方选了 `published`（六等奖与高奖级重复计数，偏高 ~0.9pp）
+# 而非 `strict`（互斥奖级）。同时 disclosure 用 .2f 截断了精确恒等式 15.625%。
+# ==========================================================================
+
+def test_d1_full_ratio_uses_strict_mode():
+    """D1：整注返奖比必须走 `strict`，且响应显式标注 `sixth_mode`。
+
+    **变异捕捉**：把 `sixth="strict"` 改回 `"published"` ⇒
+    `ev_ratio_full` 变 0.531925，本用例立刻红。
+    """
+    body = _json(R.portfolio_blue_coverage(n_tickets=10))
+    assert body["sixth_mode"] == "strict"
+    assert body["ev_ratio_full"] == pytest.approx(0.522907, abs=1e-6), (
+        f"整注返奖比应走 strict（0.522907），实际 {body['ev_ratio_full']} —— "
+        f"若为 0.531925 说明又用回了 published（与 popularity 卡 52.3% 矛盾）")
+
+
+def test_d1_matches_lead_redline_and_popularity_copy():
+    """D1 的核心目的：端点值必须与红线表、同页 popularity 文案三方一致。
+
+    `popularity.py` 的用户可见文案写「约 52.3% 回收」；红线表也写 52.3%。
+    若端点给出 53.2%，同一页面就出现两个数 —— 这正是要消除的矛盾。
+    """
+    ratio = _json(R.portfolio_blue_coverage(n_tickets=10))["ev_ratio_full"]
+    assert ratio * 100 == pytest.approx(52.29, abs=0.01), \
+        f"渲染值 {ratio*100:.3f}% 与红线/文案的 52.3% 不一致"
+
+
+def test_d1_sixth_mode_is_none_without_full_ev():
+    """未请求整注口径时 `sixth_mode` 必须是 None，不能谎称 published。"""
+    body = _json(R.portfolio_blue_coverage(n_tickets=10, full_ev=False))
+    assert body["sixth_mode"] is None
+    assert "ev_ratio_full" not in body
+
+
+def test_d2_disclosure_uses_three_decimals():
+    """D2：披露必须渲染出 `3.125 / 16.875 / 15.625%`（精确恒等式不得被截断）。
+
+    **变异捕捉**：任一处改回 `.2f` ⇒ 本用例红。
+    """
+    lines = _json(R.portfolio_blue_coverage(n_tickets=10))["disclosure_lines"]
+    assert "3.125 元" in lines[1], f"期望回收应渲染 3.125 元，实际：{lines[1]}"
+    assert "16.875 元" in lines[1], f"净亏应渲染 16.875 元，实际：{lines[1]}"
+    assert "15.625%" in lines[2], f"返奖比应渲染 15.625%，实际：{lines[2]}"
+
+
+def test_d2_arithmetic_closes_in_disclosure():
+    """D2 的**真正目的**：披露里的三项必须算术闭合（净亏 = 成本 − 期望回收）。
+
+    这是齐交付驳回"混排"方案的理由：`3.125` 配 `16.88` 会让用户反算出
+    `20 − 3.125 = 16.875`，与页面写的 16.88 差 0.005。
+
+    本用例从**渲染文本里解析出三个数**再验恒等式 —— 不断言格式字符串，
+    只断言用户看到的数字之间自洽。
+    """
+    lines = _json(R.portfolio_blue_coverage(n_tickets=10))["disclosure_lines"]
+    m = re.search(r"成本是 (\d+(?:\.\d+)?) 元.*?期望回收 (\d+(?:\.\d+)?) 元，"
+                  r"净亏 (\d+(?:\.\d+)?) 元", lines[1], re.S)
+    assert m, f"披露格式无法解析：{lines[1]}"
+    cost, ev, net = (float(m.group(i)) for i in (1, 2, 3))
+    assert cost - ev == pytest.approx(net, abs=1e-9), (
+        f"披露数字不闭合：{cost} − {ev} = {cost - ev}，但页面写净亏 {net}")
+
+
+def test_d2_saturated_branch_also_three_decimals():
+    """D2 第 4 处：饱和分支的返奖比同样必须 `.3f`（口径一致）。"""
+    joined = "\n".join(_json(R.portfolio_blue_coverage(n_tickets=17))["disclosure_lines"])
+    assert "15.625%" in joined, f"饱和分支返奖比应渲染 15.625%，实际：{joined}"
+
+
+def test_d1_d2_end_to_end_consistency():
+    """端到端：四个量在响应体与披露文本里必须**唯一且一致**。
+
+    这是「同屏一致性」的机器化版本 —— 不靠人眼比对两张卡。
+    """
+    body = _json(R.portfolio_blue_coverage(n_tickets=10))
+    joined = "\n".join(body["disclosure_lines"])
+
+    assert f"{body['ev_ratio_sixth'] * 100:.3f}%" in joined
+    assert f"{body['ev_sixth_yuan']:.3f} 元" in joined
+    # 净亏：响应体为负，披露写「净亏 正数」
+    assert f"{abs(body['net_sixth_yuan']):.3f} 元" in joined
+    assert body["sixth_mode"] == "strict"
+    assert "52.3%" in joined
+
+
+# ==========================================================================
+# 十二、真 HTTP 层验证（`TestClient`）
+#
+# ## 为什么要有这一节（自我更正）
+#
+# 本文件原头部写着"容器内没有 httpx 的 TestClient 可用"，据此只用直接调用。
+# **那个前提是错的**（实测 httpx 0.28.1 + TestClient 可用，齐交付与严QA 均已证实）。
+#
+# 直接调用证明了"路由函数本身会返回 400/503"，但**没有证明参数校验在真实
+# HTTP 链路上生效**。两件事不是一回事：
+#   · 直接调用绕过 FastAPI 的参数解析，`Query(ge=1, le=100)` 完全不执行；
+#   · 真 HTTP 会先经过 pydantic 校验 → 越界变 422，不会进函数体。
+#
+# 严QA 已用真 TestClient 验过一遍（8 种非法 reds 全 400；n_tickets 越界全 422）。
+# 这里把它固化成测试，避免以后有人再把"函数级断言"当成"HTTP 契约成立"。
+# ==========================================================================
+
+@pytest.fixture(scope="module")
+def http_client():
+    """真实 TestClient（module 级，避免重复导入开销）。"""
+    from fastapi.testclient import TestClient
+    from lottery import api_app
+    return TestClient(api_app.app)
+
+
+_BAD_REDS_HTTP = [
+    "1,2,3,4,5",          # 少一个
+    "1,2,3,4,5,6,7",      # 多一个
+    "1,1,2,3,4,5",        # 重复
+    "0,2,3,4,5,6",        # 越界下界
+    "28,29,30,31,32,34",  # 越界上界
+    "1,2,3,4,5,x",        # 非整数
+    "",                   # 空
+    "1.5,2,3,4,5,6",      # 浮点
+]
+
+
+@pytest.mark.parametrize("reds", _BAD_REDS_HTTP)
+def test_http_popularity_bad_reds_is_400(http_client, reds):
+    """真 HTTP：非法 reds 必须 400（不是 422、不是 500）。
+
+    `reds` 是 `str` 类型，所以校验在**函数体内**做 → 400。
+    这与 `n_tickets`（`int` + `ge/le`，在 pydantic 层 → 422）不同，
+    两者状态码不同是**正确**的，不是不一致。
+    """
+    r = http_client.get("/api/portfolio/popularity", params={"reds": reds})
+    assert r.status_code == 400, f"reds={reds!r} 应 400，实际 {r.status_code}"
+    body = r.json()
+    assert body["ok"] is False and body.get("error")
+
+
+@pytest.mark.parametrize("n", ["abc", "", "0", "-1", "101", "１０"])
+def test_http_blue_coverage_bad_n_is_422(http_client, n):
+    """真 HTTP：`n_tickets` 非法/越界必须 422（pydantic 层拦截）。
+
+    注意 `"１０"` 是全角数字 —— pydantic 也不接受，同样 422。
+    """
+    r = http_client.get("/api/portfolio/blue-coverage", params={"n_tickets": n})
+    assert r.status_code == 422, f"n_tickets={n!r} 应 422，实际 {r.status_code}"
+
+
+@pytest.mark.parametrize("n", [1, 10, 16, 100])
+def test_http_blue_coverage_valid_n_is_200(http_client, n):
+    """真 HTTP：合法注数一律 200，且关键字段齐全。"""
+    r = http_client.get("/api/portfolio/blue-coverage", params={"n_tickets": n})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True and body["n_tickets"] == n
+    for key in ("ev_ratio_sixth", "ev_sixth_yuan", "coverage_saturated",
+                "disclosure_lines", "sixth_mode"):
+        assert key in body, f"缺字段 {key}"
+
+
+def test_http_capabilities_is_json_serializable(http_client):
+    """真 HTTP：能力清单端点必须能正常编码（含 numpy 标量就会 500）。"""
+    r = http_client.get("/api/portfolio/capabilities")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["n_capabilities"] == 4
+
+
+def test_http_numpy_scalars_would_be_caught_here(http_client):
+    """真 HTTP 走 FastAPI 默认编码器 —— 这是 numpy 标量缺陷的最后一道闸。
+
+    直接调用返回 dict 时不会触发编码，只有真 HTTP 才会。
+    本用例断言两个端点都能被默认编码器处理。
+    """
+    for path in ("/api/portfolio/blue-coverage?n_tickets=10",
+                 "/api/portfolio/capabilities"):
+        r = http_client.get(path)
+        assert r.status_code == 200, f"{path} 编码失败：{r.status_code}"
+        assert r.headers["content-type"].startswith("application/json")

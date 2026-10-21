@@ -75,7 +75,7 @@ def app_info():
     """系统版本与里程碑状态（主页页脚徽标与「关于」展示用）。"""
     from . import methods as METH
     return {
-        "name": "双色球智能预测分析系统",
+        "name": "双色球号码组合分析系统",
         "version": config.APP_VERSION,
         "build": config.APP_BUILD,
         "milestones": config.APP_MILESTONES,

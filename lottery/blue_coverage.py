@@ -1,6 +1,28 @@
 """蓝球覆盖优化（B-3）：把 `engine.blue_coverage_plan` 的闭式最优接出来，
 并**强制**携带诚实披露。
 
+## 整个功能的诚实边界（一句话，第一屏就该看到）
+
+> **任意蓝球分配方案下，`E[命中注数]` 恒等于 `n/16`，与是否去重无关。**
+
+去重覆盖**确实**把「至少中一次蓝球」的概率从 ``1-(15/16)^n`` 抬到 ``min(n,16)/16``
+（n=10 时 47.55% → 62.50%，真实的、组合恒等式可证的收益），
+但它**对期望收益一分钱都不改变**：期望命中注数从来不由"怎么分配"决定，
+而是由"每注各自 1/16"决定，线性可加。
+
+由此直接得到本模块最重要的数字：
+
+    ``返奖比 = (n/16 × 5) / (2n) = 5/32 = 15.625%``，**对任意 n 恒成立**
+    （实测 n=1 到 n=10000 全程 0.15625，见 test_v14_portfolio_api.py）
+
+所以正确表述只有一句：**覆盖优化改变的是中奖的「分布 / 频率 / 体感」，不是期望。**
+任何把这里说成「更划算」「提高回报」的说法都是假的。
+
+（2026-10-21 实测教训：曾误以为 n>16 时返奖比会被稀释到 2.5%，并据此写了
+"返奖比随注数下降"的错误文案。真实原因是 EV 公式错把「至少中一次的概率」
+当成了「期望命中注数」—— 两者在 n ≤ 16 时数值完全相同，只在 n > 16 分叉。
+`p_any_blue_covered` 与 `expected_blue_hits` 是**两个量**，永远不要混用。）
+
 ## 这个模块存在的唯一理由
 
 `engine.py` 里已经有一个数学上正确的 `blue_coverage_plan()`：
@@ -91,6 +113,20 @@ def optimize(n_tickets: int,
 
     `full_ev_ratio` 由调用方从 `engine.prize_expectation(...)["ev_ratio_full"]`
     传入（含浮动奖假设）；不传时只给六等奖口径，并在披露里说明"未含浮动奖"。
+
+    ## 六等奖返奖比：**对任意 n 恒为 5/32 = 15.625%**
+
+    `E[命中注数] = n/16`（每注蓝球命中概率 1/16，线性可加，与是否重复无关），
+    故 `返奖比 = (n/16 × 5) / (2n) = 5/32`，**与 n 无关**。
+
+    两个**必须区分**的量，历史上曾混用导致 n>16 的 EV 被低估 6.25 倍：
+
+    * `p_any_blue_covered = min(n,16)/16` —— 「**至少中一次**」的概率，n>16 封顶 1.0；
+    * `expected_blue_hits = n/16` —— 「**期望命中注数**」，永不封顶。
+
+    六等奖按**注**兑付（`evaluate.tickets_result()` 逐注 `prize_level` 后求和），
+    所以乘 ¥5 的必须是后者。n ≤ 16 时两值相同（蓝球互不相同 ⇒ 至多中一次），
+    缺陷只在 n>16 显形 —— 这就是旧测试 `range(1,17)` 抓不到它的原因。
     """
     n = max(0, int(n_tickets))
     plan = coverage_plan(n, blue_probs)
@@ -99,7 +135,29 @@ def optimize(n_tickets: int,
     p_cover = p_any_blue_covered(n)
     p_repeat = p_any_blue_random_repeat(n)
     cost = n * TICKET_PRICE
-    ev_sixth = p_cover * SIXTH_PRIZE
+
+    # ===== 六等奖期望回收：必须用「期望命中注数」，不是「至少中一次的概率」=====
+    #
+    # 缺陷背景（2026-10-21 实测，用 `evaluate.tickets_result()` 真实结算反证）：
+    # 旧代码写 `ev_sixth = p_cover * SIXTH_PRIZE`，而
+    # `p_cover = min(n,16)/16` 回答的是**「至少中一次蓝球」的概率**。
+    # 但六等奖是**按注兑付**的：`evaluate.tickets_result()` 对每一注独立调
+    # `prize_level()` 再把 rewards 求和 —— 6 注蓝球命中就是 6×¥5，不是 1×¥5。
+    #
+    #   n ≤ 16：蓝球互不相同 ⇒ 命中指示变量互斥 ⇒ E[命中注数] = n/16，
+    #           而 min(n,16)/16 也等于 n/16 ⇒ **两种口径数值完全相同**，缺陷隐形。
+    #           （这正是 test_v14_blue_coverage 只跑 range(1,17) 抓不到它的原因：
+    #            不是没覆盖，是两种口径在该区间同值。）
+    #   n > 16：命中注数的期望仍是 n/16（每注独立 1/16），但「至少中一次」封顶 1.0
+    #           ⇒ 旧口径把 6.25 注压成 1 注：n=100 时报 5.00 元，真实 31.25 元
+    #             （低估 6.25 倍）。
+    #
+    # 正确口径 `E[命中注数] = n / 16`，对任意 n 成立。由此
+    # `返奖比 = (n/16 × 5) / (2n) = 5/32 = 15.625%`，**恒与注数无关** ——
+    # 这才是"覆盖优化不改变期望"的真正证明。旧代码在 n>16 时算出的 2.50%
+    # 是**公式错误造成的假象**，不是覆盖优化稀释了返奖比。
+    expected_blue_hits = n / float(B_MAX)
+    ev_sixth = expected_blue_hits * SIXTH_PRIZE
     ev_ratio_sixth = (ev_sixth / cost) if cost > 0 else 0.0
 
     out: Dict[str, Any] = {
@@ -113,6 +171,17 @@ def optimize(n_tickets: int,
         "ev_sixth_yuan": round(ev_sixth, 4),
         "ev_ratio_sixth": round(ev_ratio_sixth, 6),
         "net_sixth_yuan": round(ev_sixth - cost, 4),
+        #: 概率是否已饱和 —— 仅指 **P(≥1 注中蓝) 已封顶 100%**，与返奖比无关。
+        #:
+        #: 语义边界（务必别混）：
+        #:   · n > 16：蓝球池 16 个已占满 ⇒ 再加注**不增加「至少中一次」的概率**
+        #:     （它恒为 1.0），只是把命中的注数从 n/16 摊得更散。
+        #:   · 返奖比**不变**，恒为 5/32 = 15.625%（`E[命中注数] = n/16` 与
+        #:     成本 `2n` 同步增长，n 被约掉）。
+        #: 前端用这个字段提示"再加注不会更可能中蓝球"，不得用它暗示收益变化。
+        "coverage_saturated": n > B_MAX,
+        #: 期望命中注数（= n/16），供前端解释"为什么 n>16 后概率封顶但 EV 仍线性增长"
+        "expected_blue_hits": round(expected_blue_hits, 4),
     }
     if full_ev_ratio is not None:
         out["ev_ratio_full"] = round(float(full_ev_ratio), 6)
@@ -126,11 +195,24 @@ def optimize(n_tickets: int,
     lines = [
         f"同样买 {n} 注：「至少中一次蓝球（¥5）」的概率从 "
         f"{p_repeat * 100:.2f}% 提升到 {p_cover * 100:.2f}%。",
-        f"但成本是 {cost:.0f} 元，六等奖期望回收 {ev_sixth:.2f} 元，"
-        f"净亏 {cost - ev_sixth:.2f} 元。",
-        f"六等奖返奖比恒为 {ev_ratio_sixth * 100:.2f}%，**与注数无关** —— "
+        # 精度统一 `.3f`，**不许混排**（2026-10-21 三人核算结论）：
+        #   `净亏 = cost − ev` 是恒等式，三项必须同精度，否则用户自己一减就对不上。
+        #   全 .2f：3.12 / 16.88  → 反算 20−3.12 = 16.88    ✅ 闭合
+        #   混排  ：3.125 / 16.88 → 反算 20−3.125 = 16.875  ❌ 差 0.005
+        #   全 .3f：3.125 / 16.875→ 反算 20−3.125 = 16.875  ✅ 闭合（本方案）
+        # 另外 `15.625% = 5/32` 是**精确恒等式**，截成 15.62% 会削弱
+        # 「返奖比恒定」这一全系统最不可伪造结论的说服力（Lead 判为证据强度问题）。
+        f"但成本是 {cost:.0f} 元，六等奖期望回收 {ev_sixth:.3f} 元，"
+        f"净亏 {cost - ev_sixth:.3f} 元。",
+        f"六等奖返奖比恒为 {ev_ratio_sixth * 100:.3f}%，**与注数无关** —— "
         f"覆盖优化改变的是中奖分布，不是期望收益。",
     ]
+    if n > B_MAX:
+        # 只讲**概率**封顶，绝不能说"返奖比下降"（那是旧 EV 公式错误造成的假象）。
+        lines.append(
+            f"注意：蓝球只有 {B_MAX} 个，买超过 {B_MAX} 注后「至少中一次蓝球」的概率已封顶 "
+            f"100%，再加注**不会提高这个概率**（只会让蓝球重复、命中注数按 {n}/{B_MAX} 摊开）。"
+            f"返奖比不受影响，仍恒为 {ev_ratio_sixth * 100:.3f}%。")
     if full_ev_ratio is None:
         lines.append("（未含一/二等奖浮动奖；整注口径需配合奖金假设表查看。）")
     else:
@@ -150,9 +232,15 @@ def optimize(n_tickets: int,
         "中头奖概率恒为 1/17,721,088，**不受选号或覆盖策略影响**。")
     out["disclosure"] = "\n".join(lines)
     out["disclosure_lines"] = lines
+    # `increases_prize_frequency` 语义：去重覆盖相对随机重复，是否提高了**中奖频率**。
+    #   · n = 0：没有票，无频率可言 → False（旧版恒为 True，语义无意义）
+    #   · 1 ≤ n：覆盖把 P(≥1 中蓝) 从 1-(15/16)^n 抬到 min(n,16)/16 → True
+    #     （n>16 时该概率恒为 1.0，是**封顶**而非继续提高；但"覆盖优于随机重复"
+    #      这一事实对任意 n≥1 都成立，故仍为 True。）
+    # 两条否定结论（不提高命中率、不提高期望收益）在所有 n 下恒为 False —— 这是铁律。
     out["honesty_flags"] = {
         "increases_hit_probability": False,
         "increases_expected_return": False,
-        "increases_prize_frequency": True,
+        "increases_prize_frequency": bool(n >= 1),
     }
     return out

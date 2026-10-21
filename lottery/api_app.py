@@ -33,6 +33,7 @@ from . import routes_methods
 from . import routes_ml
 from . import routes_rigor
 from . import routes_portfolio
+from . import routes_capabilities
 from . import routes_data
 from . import routes_patterns
 from . import routes_predict
@@ -99,7 +100,7 @@ from .request_context import (                    # noqa: E402
 )
 
 app = FastAPI(
-    title="双色球智能预测分析系统",
+    title="双色球号码组合分析系统",
     version=config.APP_VERSION,
     # W01：文档端点默认关闭。`/docs` `/redoc` `/openapi.json` **不在 `/api/` 前缀下**，
     # 天然绕过 `optional_api_auth`，是当前生产最容易被忽略的暴露面（实测公网 200）。
@@ -266,6 +267,8 @@ app.include_router(routes_methods.router)
 app.include_router(routes_ml.router)
 app.include_router(routes_rigor.router)
 app.include_router(routes_portfolio.router)
+# D-04：能力清单（can / cannot / degraded / constants 四段，constants 实时读取）
+app.include_router(routes_capabilities.router)
 app.include_router(routes_data.router)
 app.include_router(routes_patterns.router)
 app.include_router(routes_predict.router)
