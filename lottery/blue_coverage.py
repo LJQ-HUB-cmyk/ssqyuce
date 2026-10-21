@@ -85,7 +85,8 @@ def coverage_plan(n_tickets: int,
 
 def optimize(n_tickets: int,
              blue_probs: Optional[Sequence[float]] = None,
-             *, full_ev_ratio: Optional[float] = None) -> Dict[str, Any]:
+             *, full_ev_ratio: Optional[float] = None,
+             prize_assumption: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """返回「蓝球覆盖计划 + 三个必须同屏的数字 + 披露文本」。
 
     `full_ev_ratio` 由调用方从 `engine.prize_expectation(...)["ev_ratio_full"]`
@@ -116,6 +117,10 @@ def optimize(n_tickets: int,
     if full_ev_ratio is not None:
         out["ev_ratio_full"] = round(float(full_ev_ratio), 6)
         out["ev_full_yuan"] = round(float(full_ev_ratio) * cost, 4)
+    if prize_assumption:
+        # 「必须连 prize_assumption 一起展示」—— 把它作为数据字段返回，
+        # 而不仅写在披露文本里，便于前端独立渲染与审计。
+        out["prize_assumption"] = dict(prize_assumption)
 
     # ---- 强制披露（不可省略、不可拆开单独展示）----
     lines = [
@@ -129,9 +134,18 @@ def optimize(n_tickets: int,
     if full_ev_ratio is None:
         lines.append("（未含一/二等奖浮动奖；整注口径需配合奖金假设表查看。）")
     else:
+        # 项目自订规则（`engine._single_ticket_ev` docstring）：
+        # 「一/二等奖为浮动奖，必须连 prize_assumption 一起展示」。
+        # 只报一个 53.2% 而不说它假设了多少头奖，等于让用户以为那是确定值。
         lines.append(
             f"整注（一~六等全计）返奖比约 {float(full_ev_ratio) * 100:.1f}%，"
             f"**长期仍为负期望**。")
+        if prize_assumption:
+            lines.append(
+                f"（该返奖比依赖奖金假设：一等奖 {prize_assumption.get('first', 0):,.0f} 元、"
+                f"二等奖 {prize_assumption.get('second', 0):,.0f} 元 —— "
+                f"一/二等奖是浮动奖，实际金额随奖池变化，此处取"
+                f"{prize_assumption.get('label', '假设值')}。）")
     lines.append(
         "中头奖概率恒为 1/17,721,088，**不受选号或覆盖策略影响**。")
     out["disclosure"] = "\n".join(lines)

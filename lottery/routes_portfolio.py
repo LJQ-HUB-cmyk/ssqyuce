@@ -244,12 +244,27 @@ def portfolio_blue_coverage(
     """
     from . import blue_coverage as BC
     full_ratio = None
+    assumption = None
     if full_ev:
         try:
             from . import engine
-            full_ratio = float(engine._single_ticket_ev(5000000, sixth="published")["ev_ratio"])
+            # V14-A4 修正：`_single_ticket_ev` 的第一个参数必须是 **dict**。
+            # 传整数会被静默忽略并回落到 PRIZE_ASSUMPTION_TABLE_A
+            # （first=500万 / second=15万），这正是「同一返奖比两个值」的来源。
+            # 这里显式传入实测中位口径（一等 684 万 / 二等 20.5 万，来自 3266 期
+            # p1_amt / p2_amt），并把它作为 `prize_assumption` 一并返回 ——
+            # 项目规则要求「一/二等奖为浮动奖，必须连假设表一起展示」。
+            assumption = {"first": 6_840_000, "second": 205_000,
+                          "label": "实测中位（3266 期 p1_amt/p2_amt）"}
+            ev = engine._single_ticket_ev(assumption, sixth="published")
+            full_ratio = float(ev["ev_ratio"])
+            # `_single_ticket_ev` 返回的 `prize_assumption` 是**人读字符串**，
+            # 不是 dict；这里两者都保留：dict 供结构化渲染，text 供披露文本。
+            assumption = dict(assumption, text=str(ev.get("prize_assumption") or ""))
         except Exception:        # noqa: BLE001 —— 取不到就只给六等奖口径
             full_ratio = None
-    out = BC.optimize(n_tickets, full_ev_ratio=full_ratio)
+            assumption = None
+    out = BC.optimize(n_tickets, full_ev_ratio=full_ratio,
+                      prize_assumption=assumption)
     out["ok"] = True
     return _jsonable(out)
