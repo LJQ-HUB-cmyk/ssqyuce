@@ -160,6 +160,11 @@ SPACE_VERSION = 2
 #: 只保留 e_value 最高的若干个 monitor 候选（避免断点膨胀到几十 MB）
 MAX_MONITOR_TOP = 50
 
+#: 交叉层「族对 + 模式」真实档位数的缓存（V14-A1）。
+#: `candidate_space._cross_plan()` 自身已有缓存，这里只是把换算结果留住，
+#: 避免每轮每个候选都重建一次 dict。
+_FAMILY_PAIRS_CACHE: Optional[Dict[str, int]] = None
+
 
 def _fresh_state() -> Dict[str, Any]:
     """断点的初始结构（新空间语义）。"""
@@ -429,46 +434,56 @@ def _recompute_usable(candidates: Dict[str, Any],
                       n_checked: int) -> Dict[str, Any]:
     """用 **分层 e-BH** 对「单候选过阈」的候选做族级 FDR 校正。
 
-    ## 为什么必须分层（D2，四专家论证裁决）
+    ## 为什么要分层
 
-    交叉层有 72 350 个候选（536 个族对 × 2 种合并模式）。若整层共用一个大 m，
-    k=1 的阈值 = m/α = **1 447 000** —— 而真实数据上全史最大 e 只有约 109。
-    这等于**实际放弃了交叉层**：挖了 7 万个候选，一个都不可能通过。
+    交叉层有 72350 个候选。若整层共用一个 m，k=1 的阈值 = ``m/α`` 会大到
+    任何真实数据都够不到（``72656/0.05 = 145 万``）。分层把 m 降到「一个族对 ×
+    一种模式」的量级，才让 e-BH 在真实数据上有分辨力。
 
-    分层后，每个自然层（一个族对 × 一种模式）各自 m≈135，阈值降到 **2 700**。
-    SPACE 的实测：分层 vs 不分层的发现数 7228 vs 7258（差 0.42%），
-    FDP 0.0011 vs 0.0010 —— **FDR 几乎无损，但可用性从 0 变成有**。
+    ## V14-A1 修正（2026-10-21，团队四人共同指出的缺陷）
 
-    ## 层的划分
+    旧实现有两处让 m 失真，**方向都是把 m 算小**：
 
-    - 单因子层：m = 该层累计检验数（`single_checked`）
-    - 交叉层：按指纹里的「族对 + 模式」分组，每组各自 m = 该组检验数
+    1. **分组键塌陷**：``key = "cross|" + parts[1]`` 只取 mode，实测只产生 2 个组
+       （`cross|0` = 11079、`cross|1` = 26793），而设计意图是 268 族对 × 2 模式。
+       现在用 `_group_key_of()` 取「mode + 族A + 族B」四段。
+    2. **m 用代数常数**：交叉层硬编码 135（其实是该分布的**均值**），
+       单因子层硬编码 306。实测族对档位数中位只有 35，78% 的族对低于 135。
+       现在 `_group_checked()` 逐组查 `candidate_space` 真源。
 
-    m 的记账原则（SPACE §6.2，三条硬规则）：
+    修正后的量级变化（以 `cross|1` 为例）：m 从 135 → 26793，阈值从 2700 → 535860，
+    **低估 198 倍的部分被消除**。这不保证「能选出东西」（数据本身无信号），
+    但保证 m 不再是凭空捏造的数字。
+
+    ## m 的记账原则（SPACE §6.2，三条硬规则，未变）
+
       1. m **单调递增、永不复位**（复位 = 重置式作弊，α 会被放大）
       2. 指纹不含期号（否则同一假设会重复计入 m）
       3. `usable` 每轮**全量重算**而非并集（否则旧的假阳性永远洗不掉）
+
+    ## 输入口径（统计审查员更正的一条，必须写清）
+
+    `candidates` 按设计只包含**单候选过 α 阈**（e ≥ 1/α）的候选，不是全部检验。
+    这不违反 e-BH：`ebh_selected` 的判据是 ``e_(k) >= m/(k·α)``，而
+    ``e < 1`` 的候选永远不会被选中（阈值最小也有 ``1/α``），所以只传 e ≥ 1 的候选
+    与传全部候选**结果等价**，且省内存。真正决定成败的是 **m 是否取对**。
+
+    实测（`data/idle_mining_state.json`，20 条过阈）：`cross|1` 组内有 18 条候选，
+    `ebh_selected` 会逐个 rank 比较（rank 能走到 18），
+    但**每一档都没能越过门槛**，因此 ``k_star = 0``、返回空集 ——
+    这才是 `usable` 为 0 的真实机制，不是「rank 恒为 1」。
     """
     if not candidates:
         return {}
 
-    # 按层分组：single 一组；cross 按「族对+模式」各一组
     groups: Dict[str, List[str]] = {}
     for fp in candidates:
-        if fp.startswith("single|"):
-            key = "single"
-        else:
-            # 指纹形如 cross|<mode>|族A:{...}|族B:{...}
-            parts = fp.split("|")
-            key = "cross|" + (parts[1] if len(parts) > 1 else "?")
-        groups.setdefault(key, []).append(fp)
+        groups.setdefault(_group_key_of(fp), []).append(fp)
 
     selected: Dict[str, Any] = {}
     for gkey, fps in groups.items():
         e_vals = [float((candidates[fp] or {}).get("e_value") or 0.0) for fp in fps]
-        # 组内 m = 该组过阈候选数 与 该组检验数 的较大者。
-        # 用全局 n_checked 当分母会让交叉层退回「全局一个大 m」的老问题。
-        m_group = max(len(fps), _group_checked(gkey, n_checked, len(fps)))
+        m_group = _group_checked(gkey, n_checked, len(fps))
         sel = eprocess.ebh_selected(e_vals, m_total=m_group)
         for i in sel:
             v = dict(candidates[fps[i]])
@@ -479,20 +494,103 @@ def _recompute_usable(candidates: Dict[str, Any],
     return selected
 
 
-def _group_checked(gkey: str, n_checked: int, n_in_group: int) -> int:
-    """估算某一层的检验总数（分层的 m）。
+def _family_pairs() -> Dict[str, int]:
+    """交叉层每个「族对 + 模式」组的真实档位数（= 该组应记的 m）。
 
-    保守做法：单个族对组的检验数最多是「该组候选数」，
-    但由于我们只对**过阈**候选做 e-BH，组内 m 应反映「这一族对一共检验了多少档位」。
-    交叉层每个族对的档位数 = |A档| × |B档|，单因子层每族 = 该族档位数。
-    这里用 n_in_group 作下界（已过阈的），并用族网格规模作上界估计——
-    取二者较大值，避免用全局 72656 把阈值抬死。
+    ## 为什么必须问 `candidate_space` 而不是用常数（V14-A1，2026-10-21）
+
+    旧实现用两个字面量：单因子 `min(n_checked, 306)`、交叉 `max(n_in_group, 135)`。
+
+    * `306` 恰好等于单因子层真实规模（29 族档位总和实测 306），**它对**；
+    * `135` 是**该分布的均值，不是每个组的值**。实测族对档位数
+      min / 中位 / mean / max = **1 / 35 / 135 / 2304**，且 **78%（210/268）的族对低于 135**。
+
+    把均值当常数用，代价全落在低于均值的组上：`repeat×repeat2` 真实 m=1 被放大 **135 倍**。
+    该组的阈值于是从 `1/α = 20` 被抬到 `135/α = 2700`，任何真实效应都过不去。
+
+    ## 返回什么
+
+    ``{"cross|<mode_idx>|<族A>|<族B>": 档位数, ...}``，键与 `_group_key_of(fp)` 一致。
+    档位数取 ``len(A 的档位) × len(B 的档位)`` —— 与 `probe_cross`/`_cross_plan` 同源。
+    """
+    global _FAMILY_PAIRS_CACHE
+    if _FAMILY_PAIRS_CACHE is not None:
+        return _FAMILY_PAIRS_CACHE
+
+    out: Dict[str, int] = {}
+    try:
+        from . import candidate_space as CS
+        pairs, _order = CS._cross_plan()
+        singles = CS._single_index()
+        for ia, ib, cnt in pairs:
+            # 用两侧首档取族名：同族对内部族名唯一，取任一样本即可
+            ka = singles[ia[0]][0] if ia else "?"
+            kb = singles[ib[0]][0] if ib else "?"
+            for mi in range(len(CS.CROSS_MODES)):
+                out[f"cross|{mi}|{ka}|{kb}"] = int(cnt)
+    except Exception:            # noqa: BLE001 —— 结构探测失败不应拖垮判定
+        out = {}
+    _FAMILY_PAIRS_CACHE = out
+    return out
+
+
+def _group_key_of(fp: str) -> str:
+    """把候选指纹映射到「分层 e-BH 的组键」。
+
+    ## 旧实现的塌陷（V14-A1，团队四人共同指出）
+
+    旧代码：``key = "cross|" + parts[1]`` —— ``parts[1]`` 只是模式下标（0/1），
+    而 docstring 写的是「按族对+模式各一组」。实测结果：**整个交叉层只有 2 个组**
+    （`cross|0` 有 11079 个候选、`cross|1` 有 26793 个），
+    与「268 族对 × 2 模式 = 536 组」的意图相差 268 倍。
+
+    后果：26793 个候选被塞进 1 个组，m 只记 135 ⇒ 阈值低估 **198 倍**
+    （应为 ``26793/α = 535860``，实际只有 ``135/α = 2700``）。
+
+    ## 现在的规则
+
+    指纹形如 ``cross|<mode>|<族A>:<params>|<族B>:<params>``，
+    组键取前四段（mode + 两个族名，**不含具体参数**）——
+    这才对应「一个族对 × 一种模式」这一自然层。单因子层仍是单独一组。
+    """
+    if fp.startswith("single|"):
+        return "single"
+    parts = fp.split("|")
+    if len(parts) < 4:
+        return "cross|" + (parts[1] if len(parts) > 1 else "?")
+    fa = parts[2].split(":", 1)[0]
+    fb = parts[3].split(":", 1)[0]
+    return f"cross|{parts[1]}|{fa}|{fb}"
+
+
+def _group_checked(gkey: str, n_checked: int, n_in_group: int) -> int:
+    """某一组的检验总数（= 分层 e-BH 的 m）。
+
+    ## 原则：m 取「这一组一共检验了多少档位」，不取任何代数常数
+
+    * **单因子层**：真实规模 = ``candidate_space.layer_size("single")``
+      （实测 306 = 29 族档位之和）。这里直接用真源，不用字面量。
+    * **交叉层**：按「族对 + 模式」查 ``_family_pairs()`` 的真实档位数
+      （中位 35、均值 135、max 2304 —— **没有单一常数能代表它**）。
+
+    兜底：查不到组时退回 ``max(n_in_group, 1)``。**绝不退回 135 这类常数** ——
+    那正是本缺陷的成因。宁可 m 偏小被下游 FDR 检查发现，也不要偷偷放大 135 倍。
+
+    `n_checked` 参数保留只为兼容既有调用/测试签名，**不再参与计算**：
+    它曾是 `min(n_checked, 306)` 的输入，而那正是「用全局累计截断成常数」的老毛病。
     """
     if gkey == "single":
-        # 单因子层：29 族 × 平均 10.5 档 ≈ 306
-        return min(n_checked, 306) if n_checked else n_in_group
-    # 交叉层单组：一族对的档位乘积，实测平均约 135
-    return max(n_in_group, 135)
+        try:
+            from . import candidate_space as CS
+            return max(int(CS.layer_size(CS.LAYER_SINGLE)), n_in_group, 1)
+        except Exception:        # noqa: BLE001
+            return max(n_in_group, 1)
+
+    real = _family_pairs().get(gkey)
+    if real:
+        # 组内已过阈数不可能超过该组总档位；取 max 防御指纹口径漂移
+        return max(int(real), n_in_group, 1)
+    return max(n_in_group, 1)
 
 
 def _next_layer(cursors: Dict[str, int], CS) -> Optional[str]:

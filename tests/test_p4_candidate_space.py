@@ -42,7 +42,18 @@ def test_cross_layer_covers_families_not_seen_in_single_layer():
 # ---------- 2. 确定性 ----------
 
 def test_candidate_at_is_deterministic():
-    """同样的 (层, 索引) 必须给出同一个候选 —— 续跑/复算的前提。"""
+    """同样的 (层, 索引) 必须给出同一个候选 —— 续跑/复算的前提。
+
+    ## 断言修正（V14-A3）
+
+    原断言是 ``assert a is None or b is not None``，而下一行就写了
+    ``a = b = CS.candidate_at(layer, idx)`` —— **a 与 b 是同一个对象**。
+    真值表：a is None 时首项为真；a 非 None 时 b 必然非 None，末项也为真。
+    **这条断言恒真，等于没测**（commit 37d6fce 从 `a is not None` 改宽成了它）。
+
+    正确的不变式是「两次独立调用结果一致」，且不能依赖 a 和 b 是同一个变量：
+    这里重新调用一次拿**不同对象**，逐项比较。
+    """
     for layer in (CS.LAYER_SINGLE, CS.LAYER_CROSS):
         n = CS.layer_size(layer)
         # 交叉层有退化组合会被剔除（返回 None），因此只断言「两次结果一致」，
@@ -50,10 +61,17 @@ def test_candidate_at_is_deterministic():
         checked = 0
         for idx in range(0, min(400, n), 7):
             a = CS.candidate_at(layer, idx)
-            b = CS.candidate_at(layer, idx)
-            assert a is None or b is not None, f"{layer}#{idx} 首轮合法但复算返回 None"
+            b = CS.candidate_at(layer, idx)      # 独立调用，不是同一个变量
+            assert (a is None) == (b is None), (
+                f"{layer}#{idx} 两次调用合法性不一致：{a is None} vs {b is None}")
             if a is not None:
-                assert a[1] == b[1], f"{layer}#{idx} 两次算出不同候选"
+                assert a[1] == b[1], f"{layer}#{idx} 两次算出不同指纹"
+                # 只比较**可比较的结构**：selector 是每次新建的闭包，
+                # 用 == 比较函数对象必然不等（identity 不同），不是缺陷。
+                ka = {k: v for k, v in a[0].items() if k != "selector"}
+                kb = {k: v for k, v in b[0].items() if k != "selector"}
+                assert ka == kb, f"{layer}#{idx} 两次算出不同过滤器（selector 除外）"
+                assert callable(a[0].get("selector")), "过滤器必须带可调用 selector"
                 checked += 1
         assert checked > 0, f"{layer} 层没有任何合法候选"
 
@@ -170,55 +188,32 @@ def test_hot_window_never_below_ten():
 
 
 # ---------- e-BH 数学 ----------
+#
+# **V14-A3 搬家说明**：这组 `ebh_selected` 的单元测试原本长在这里（candidate_space
+# 是"候选空间"的测试文件），而 `ebh_selected` 住在 `eprocess.py`。
+# 后果是 `test_p4_eprocess.py` 的 17 条测试**全绿也抓不住 e-BH 被改坏** ——
+# 变异测试实测：把 `k_star` 改成 `k_star+1`，单跑 test_p4_eprocess 全部通过。
+# 现已搬到 `tests/test_p4_eprocess.py::test_ebh_*`，这里保留一条转发检查，
+# 确保搬家之后两处不会各说各话。
 
-def test_ebh_selects_nothing_when_all_evidence_is_weak():
-    """纯弱证据必须一条都不选（不报假规律的底线）。"""
-    assert eprocess.ebh_selected([0.5] * 1000, m_total=1000) == set()
-    assert eprocess.ebh_selected([2.0] * 500, m_total=500) == set()
+def test_ebh_math_tests_live_in_eprocess_file():
+    """守卫：e-BH 的单元测试必须住在 `test_p4_eprocess.py`（与实现同文件）。
 
-
-def test_ebh_selects_strong_signal_at_small_m():
-    """m 小的时候，真正的强信号必须能被选中 —— 否则闸门太严等于自废。"""
-    # m=2, α=0.05 → 阈值 2/0.05 = 40
-    ev = [1000.0, 1.0]
-    sel = eprocess.ebh_selected(ev, m_total=2)
-    assert 0 in sel, "m=2 时 e=1000 竟未被选中"
-
-
-def test_ebh_threshold_scales_with_m():
-    """**必须记录的代价**：m 越大，单个发现所需的 e-value 越高（m/α）。
-
-    这不是缺陷而是多重检验的固有代价。这里把它固化成测试，
-    防止将来有人「觉得太严」就偷偷去掉 m 而制造假发现。
+    这条测试读源码文本，防止将来有人把数学测试又搬回本文件 ——
+    那样 `test_p4_eprocess.py` 会再次失去对 `ebh_selected` 的覆盖，
+    而"文件名叫 eprocess 却没有测到 e-BH"正是本轮发现的缺陷。
     """
-    alpha = eprocess.DEFAULT_ALPHA
-    for m in (10, 100, 1000):
-        need = m / alpha
-        # 刚好差一点：不该被选中
-        assert m - 1 not in eprocess.ebh_selected([need * 0.99], m_total=m) \
-            or True   # 单元素情形下 k=1，阈值恰为 m/α
-        sel_below = eprocess.ebh_selected([need * 0.99], m_total=m)
-        sel_above = eprocess.ebh_selected([need * 1.01], m_total=m)
-        assert sel_below == set(), f"m={m} 时 e={need*0.99:.0f} 不该选中"
-        assert sel_above == {0}, f"m={m} 时 e={need*1.01:.0f} 应当选中"
+    from pathlib import Path
 
-
-def test_ebh_cannot_detect_realistic_effect_at_large_m():
-    """**诚实性测试**：把「多重检验的代价」写成可执行的断言。
-
-    `cold+50%/号` 是项目验收口径里的强注入偏置，600 期单候选
-    e-value 只有约 28。一旦 m 上了几十，阈值 m/α 就远超 28 ——
-    所以族级校正后 `usable` 长期为 0 是**数学必然**，不是 bug。
-    如果哪天这条测试失败（e 突然变大），要么是真发现了强效应，
-    要么是 eprocess 被改坏了，两者都必须人工复核。
-    """
-    import numpy as np
-    rng = np.random.default_rng(42)
-    z = rng.normal(0.1556, 1.0, 600)
-    e = float(eprocess.verdict(z, min_obs=30)["e_value"])
-    assert e > 1 / eprocess.DEFAULT_ALPHA, "强偏置竟连单候选阈值都没过"
-    # m=44（一个中等族的档位数）时已检不出
-    assert eprocess.ebh_selected([e], m_total=44) == set()
+    here = Path(__file__).parent
+    ep_test = (here / "test_p4_eprocess.py").read_text(encoding="utf-8")
+    assert "ebh_selected" in ep_test, (
+        "test_p4_eprocess.py 里没有任何 ebh_selected 断言 —— "
+        "e-BH 的单元测试又被搬到别处了（V14-A3 缺陷回归）"
+    )
+    assert "test_ebh_threshold_scales_with_m" in ep_test, (
+        "关键的「阈值随 m 放大」用例不在 test_p4_eprocess.py 里"
+    )
 
 
 # ---------- 断点迁移 ----------

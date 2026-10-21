@@ -270,49 +270,87 @@ def sigma_hypergeom(k: float, target: str = "red") -> float:
 
 
 def z_scores_from_scan(scan: Dict, target: str = "red") -> List[float]:
-    """把 ``discovery.asof_scan`` 的结果转成 z 序列，**逐候选按 k 定标**。
+    """把 ``discovery.asof_scan`` 的结果转成 z 序列，**逐期按当期的 k 定标**。
 
-    ## 两条必须守住的规则（都来自 2026-10-21 的两次生产事故）
+    ## 四条必须守住的规则（每条都对应一次生产事故）
 
     ### 1. 按 k 定标，不用固定 sigma
 
-    见 `sigma_hypergeom` 的说明：固定 0.8678 遇上并集的大筛选集会低估方差
+    见 `sigma_hypergeom`：固定 0.8678 遇上并集的大筛选集会低估方差
     1.23 倍，e 值高估 61 倍。
 
     ### 2. **空期（exp=0）绝不能跳过**
 
     这是本函数第一版犯的错，代价更大。当时想的是「筛选集为空 ⇒ 该期无证据」，
     于是 `continue` 掉。但空期恰恰是**最强的证据**：它说明筛选条件没触发、
-    命中数必然是 0。跳过它等于只统计「触发了的那些期」，
-    是典型的**选择偏差**。
+    命中数必然是 0。跳过它等于只统计「触发了的那些期」，是典型的选择偏差。
 
     实测 `hot{k=7,w=10} ∩ omission_high{k=10}`（k_mean=0.219）：
 
         跳过空期（n=641）  e = 11 351   ← 假阳性，过阈值 2700
         保留空期（n=3217） e =     1.75  ← 正确
 
-    **高估 6490 倍。** 空期必须作为 z=0 计入序列 —— 在 H0 下「没触发」
-    和「触发了但没中」合起来才构成完整的零假设样本。
+    **高估 6490 倍。** 空期必须作为 z=0 计入序列。
+
+    ### 3. 整段恒空时返回**空序列**，而不是全零序列
+
+    若某候选的回放期里筛选集**恒为空**，那么它不携带任何信息：
+    既不能说"有效"也不能说"无效"，应交给调用方判 `underpowered`。
+    若这里返回 100 个 z=0，`e_value` 会算出 ≈1（看着"无证据"），
+    但它同时让 `n_obs=100` 通过了 `min_obs` 检查 —— 语义上把
+    「从未触发」误当成「检验过、无效应」，正是 V12 裁决里点名的
+    「从未检验与检验了无效应不可区分」。因此必须返回空。
+
+    ### 4. 每期用**该期自己的 k** 定标，不用全段 k_mean（V14-A2，2026-10-21）
+
+    前三条修好之后仍然错：`sigma_hypergeom(scan["k_mean"])` 算的是**全段平均**
+    筛选集大小，而 `k_mean` 把 k=0 的空期也平均进去了。实测：
+
+        2576 空期 + 641 活跃期(k≈6) → k_mean = 1.1955
+        σ(k_mean=1.1955) = 0.4204   vs   σ(k=6) = 0.8678
+        ⇒ z 放大 2.1 倍；e 的虚高随信号强度急剧放大
+        （合成验证：delta=0.10 时 14.6 倍，delta=0.20 时 4.5 万倍）
+
+    commit `38d44ff` 的说明写"逐候选按 k 定标"，但当时 `asof_scan` 不返回逐期 k，
+    下游只能归一化到全段均值 —— 所以那次的修复**没有真正生效**。
+    现在 `asof_scan` 返回 `k_series`，这里逐期取 `sigma_hypergeom(k_i)`。
+
+    当 `k_series` 缺失（旧断点、外部构造的 scan dict）时，退回 `k_mean` 口径并
+    保持与历史一致的行为 —— 兼容性优先，但**新代码路径一律走逐期**。
 
     ## 关于 n 的含义
 
     返回序列的长度恒等于回放期数（除非整段 k_mean=0）。
-    调用方的 `min_obs` 因此比较的是「回放了多少期」而不是「触发了多少期」，
-    语义正确。
+    调用方的 `min_obs` 因此比较的是「回放了多少期」而不是「触发了多少期」，语义正确。
     """
     obs = scan.get("obs") or []
     exp = scan.get("exp") or []
+    ks = scan.get("k_series")
     k_mean = float(scan.get("k_mean") or 0.0)
-    sigma = sigma_hypergeom(k_mean, target)
-    if sigma <= 0:
-        return []               # 整段筛选集恒为空：该候选无意义，交给调用方判 underpowered
+
+    # 规则 3：整段恒空 ⇒ 无信息，返回空序列交由调用方判 underpowered
+    if ks and len(ks) == len(obs):
+        if not any(int(k) > 0 for k in ks):
+            return []
+        sigmas = [sigma_hypergeom(k, target) for k in ks]
+    else:
+        s = sigma_hypergeom(k_mean, target)
+        if s <= 0:
+            return []           # 整段筛选集恒为空：该候选无意义
+        sigmas = [s] * len(obs)
+
     out: List[float] = []
-    for o, e in zip(obs, exp):
+    for i, (o, e) in enumerate(zip(obs, exp)):
         e = float(e)
         o = float(o)
         if e <= 0.0:
-            # 空期：命中必然为 0，计入 z=0（**不是跳过**）。见上方事故说明。
+            # 空期：命中必然为 0，计入 z=0（**不是跳过**）。见规则 2。
             out.append(0.0)
-        else:
-            out.append((o - e) / sigma)
+            continue
+        sg = sigmas[i] if i < len(sigmas) else 0.0
+        if sg <= 0:
+            # 该期有期望却没有方差（理论上不该发生）：按无信息处理
+            out.append(0.0)
+            continue
+        out.append((o - e) / sg)
     return out

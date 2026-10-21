@@ -265,19 +265,83 @@ def test_throttle_never_sleeps_absurdly_long(idle_env, monkeypatch):
 # ---------- 分层 e-BH（D2） ----------
 
 def test_ebh_stays_local_to_its_layer(idle_env, monkeypatch):
-    """交叉层用**单组** m，不是全局 72 656 —— 否则阈值 1 447 000 等于放弃该层。"""
+    """交叉层用**单组** m，不是全局 72 656 —— 否则阈值 1 447 000 等于放弃该层。
+
+    ## V14-A1 起 m 取「该族对 × 该模式的真实档位数」，不再取常数 135
+
+    旧断言依赖 ``m≈135 ⇒ 阈值 2700``，那正是被团队判定为缺陷的行为：
+    135 是分布的**均值**，实测族对档位数中位只有 35、78% 的族对低于 135，
+    把均值当常数会让低于均值的组阈值被凭空抬 135 倍。
+
+    现在用 `hot×streak`（真实档位数 132 ⇒ 阈值 2640），让 e=5000 能在
+    真实 m 下通过，同时验证阈值仍远小于全局 72656/α。
+    """
     cands = {
-        'cross|0|hot:{"window":10,"k":5}|cold:{"window":10,"k":5}':
-            {"e_value": 5000.0},
-        'cross|0|hot:{"window":10,"k":6}|cold:{"window":10,"k":5}':
-            {"e_value": 3000.0},
+        'cross|0|hot:{"window":10,"k":5}|streak:{"n":3}': {"e_value": 5000.0},
+        'cross|0|hot:{"window":10,"k":6}|streak:{"n":3}': {"e_value": 3000.0},
         'single|hot|{"window":10,"k":5}': {"e_value": 800.0},
     }
     got = idle_mining._recompute_usable(cands, n_checked=72656)
-    # 交叉组 m≈135 ⇒ k=1 阈值 2700，e=5000 应通过；3000 也过
     assert any(k.startswith('cross|0|hot') for k in got), "交叉层在本层 m 下应当有候选通过"
     for k, v in got.items():
         assert v.get("ebh_threshold_k1", 1) < 20000, "阈值不应被全局 m 抬死"
+
+
+def test_group_m_equals_real_family_pair_size(idle_env):
+    """**V14-A1 核心**：m 必须等于该族对的真实档位数，不能是任何字面量常数。
+
+    实测基线（`candidate_space`）：族对档位数 min/中位/max = 1/35/2304，
+    最小与最大差 2304 倍，**不存在能代表所有组的单一常数**。
+    """
+    pairs = idle_mining._family_pairs()
+    assert len(pairs) == 268 * 2, (
+        f"族对+模式组数应为 268×2=536，实际 {len(pairs)} —— 分组键可能又塌陷了")
+
+    sizes = sorted(pairs.values())
+    assert sizes[0] == 1, "最小族对档位数应为 1（如 repeat×repeat2）"
+    assert max(sizes) > 1000, "最大族对档位数应 >1000（如 hot×sum_range 类）"
+    assert len(set(sizes)) > 10, "组规模必须有显著离散度，否则常数近似才有理"
+
+    for gkey, real in list(pairs.items())[:20]:
+        assert idle_mining._group_checked(gkey, 18200, 1) == real, (
+            f"{gkey}: _group_checked 返回 {idle_mining._group_checked(gkey, 18200, 1)}，"
+            f"真实档位数 {real}")
+
+
+def test_group_key_includes_both_families(idle_env):
+    """分组键必须含「两个族名 + 模式」，否则交叉层会塌陷成 2 组。
+
+    旧实现 `key = "cross|" + parts[1]` 只取 mode，实测整个交叉层只有
+    `cross|0` 与 `cross|1` 两组（11079 + 26793 个候选），
+    与设计意图「268 族对 × 2 模式」相差 268 倍。
+    """
+    a = 'cross|0|hot:{"window":10,"k":5}|cold:{"window":10,"k":5}'
+    b = 'cross|0|hot:{"window":10,"k":6}|cold:{"window":10,"k":5}'
+    c = 'cross|0|hot:{"window":10,"k":5}|sum_range:{"lo":45}'
+    d = 'cross|1|hot:{"window":10,"k":5}|cold:{"window":10,"k":5}'
+
+    ka, kb = idle_mining._group_key_of(a), idle_mining._group_key_of(b)
+    kc, kd = idle_mining._group_key_of(c), idle_mining._group_key_of(d)
+
+    assert ka == kb, "同族对的不同参数档位应落在同一组"
+    assert ka != kc, "不同族对必须分组"
+    assert ka != kd, "不同模式必须分组"
+    assert ka.count("|") >= 3, f"组键 {ka} 缺族对信息（可能又退化成 cross|<mode>）"
+
+
+def test_repeat_times_repeat2_gets_tiny_m(idle_env):
+    """`repeat×repeat2` 的真实档位数极小，旧实现把它放大 135 倍。
+
+    这是「把均值当常数」最典型的受害者：真实 m 只有 1，阈值应为 1/α = 20，
+    旧实现给出 135/α = 2700 —— 任何真实信号都过不去。
+    """
+    pairs = idle_mining._family_pairs()
+    key = 'cross|0|repeat|repeat2'
+    if key not in pairs:
+        pytest.skip("该族对不在当前候选空间中")
+    real = pairs[key]
+    assert real < 135, f"repeat×repeat2 真实档位数 {real}，应远小于常数 135"
+    assert idle_mining._group_checked(key, 18200, 1) == real
 
 
 def test_ebh_zero_when_nothing_exceeds_local_threshold(idle_env):

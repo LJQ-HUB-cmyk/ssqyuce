@@ -1274,9 +1274,26 @@ def asof_scan(draws: Sequence[Dict], flt: Dict, start: int = 200,
     对 red target：``obs[i] = |筛选出的红球 ∩ 第 i 期开奖|``，``exp[i] = 6*|k_i|/33``；
     对 blue target：``obs[i] = 1{筛选出的蓝球包含第 i 期蓝球}``，``exp[i] = |k_i|/16``。
 
-    返回 ``{target, n, obs, exp, hit_series, k_mean, elapsed_note}``；
-    ``obs``/``exp`` 长度与 ``draws[start:end]`` 对齐，可直接送 ``regime.regime_report``
-    （需先用 ``pad_series`` 补前 start 期占位以对齐 draws）。
+    返回 ``{target, n, obs, exp, k_series, k_mean, k_active_mean, hit_series,
+    start, end}``；``obs``/``exp`` 长度与 ``draws[start:end]`` 对齐，可直接送
+    ``regime.regime_report``（需先用 ``pad_series`` 补前 start 期占位以对齐 draws）。
+
+    ## `k_series` 为什么必须有（V14-A2，2026-10-21）
+
+    `k_mean` 是**全段平均**，包含筛选集为空（k=0）的期次。用它给整段 z 序列定标是错的：
+    空期的命中数必然是 0、方差也必然是 0，把它们算进"平均 k"会同时低估 σ 和
+    错配每期的期望。实测（`hot{k=7,w=10} ∩ omission_high{k=10}`）：
+
+        2576 期 k=0 + 641 期 k≈6  →  k_mean = 1.1955
+        真实 σ（按活跃期 k=6 计） = 0.8678，而按 k_mean 算 = 0.4204
+        ⇒ z 被放大 2.1 倍、e 被放大 4 倍（k_mean=0.219 时高达 23 倍）
+
+    commit `38d44ff` 声称"逐候选按 k 定标"，但当时 `asof_scan` **只返回 k_mean**，
+    下游拿不到逐期 k，只能退回归一化到全段均值 —— 这就是它没有真正生效的原因。
+    本次把 `ks` 原样返回成 `k_series`，下游 `eprocess.z_scores_from_scan` 改为逐期定标。
+
+    `k_mean` 保留不变（多个下游在用它做退化判断），另加 `k_active_mean`
+    （只统计 k>0 的期）供需要"活跃期平均筛选集"的地方使用。
     """
     draws = list(draws or [])
     end = len(draws) if end is None else min(int(end), len(draws))
@@ -1310,8 +1327,12 @@ def asof_scan(draws: Sequence[Dict], flt: Dict, start: int = 200,
         series.append({"issue": actual.get("issue"), "hits": hits, "expected": round(e, 4),
                        "k": k})
         ctx.advance(actual)
+    active = [k for k in ks if k > 0]
     return {"target": flt["target"], "n": len(obs), "obs": obs, "exp": exp,
+            "k_series": ks,
             "k_mean": float(np.mean(ks)) if ks else 0.0,
+            "k_active_mean": float(np.mean(active)) if active else 0.0,
+            "k_active_ratio": (len(active) / len(ks)) if ks else 0.0,
             "hit_series": series[-200:], "start": start, "end": end}
 
 

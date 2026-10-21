@@ -376,8 +376,35 @@ def load_last_draws(n: int) -> List[Dict]:
     return [_row_to_draw(r) for r in reversed(rows)]
 
 
+#: 奖级键（一~六等奖的中奖注数与单注金额）。列名在 `draws` 表中确实存在，
+#: 之前 `_row_to_draw` **从不读取**它们 —— 见 `_row_to_draw` 的说明。
+PRIZE_LEVELS = (1, 2, 3, 4, 5, 6)
+
+
 def _row_to_draw(r: sqlite3.Row) -> Dict:
-    return {
+    """把一行 `draws` 转成 dict。
+
+    ## 为什么要把 p1..p6 / *_amt 也带出来（V14-B，2026-10-21）
+
+    在此之前这个函数只返回 `issue/date/reds/blue/order/sales/pool/source`，
+    **`p1`、`p1_amt`、`p2..p6` 被直接丢弃** —— 而它们在库里有真实数据：
+
+        p1      （一等奖注数）  3266 期非零，1~153 注，中位 6，另有 251 期真零（无人中）
+        p1_amt  （单注金额）    3269 期，139 万~1500 万（封顶），中位 684 万
+        p2..p6                 约 3428 期
+
+    这些字段是**全项目唯一能反映"人群怎么选号"的观测量**。号码本身不可预测
+    （红球 χ² p=0.065、边际熵 5.0429/5.0444），但 `p1` 可预测 —— 因为它是人的行为。
+    实测（控制销量后）``p1`` 与号码形态的 Spearman 相关：生日号 +0.1389（p<0.001）、
+    同尾号 +0.0543（p=0.0015）。丢弃这些字段等于主动放弃唯一有信号的那条轴。
+
+    ## 兼容性
+
+    纯**增量**：原有键一个不变、顺序不变、语义不变，只是多出 `p1..p6` 与
+    `p1_amt..p6_amt`（键名与列名同构）。老调用方按 `draw["reds"]` 取值不受影响。
+    `source` 的 `in r.keys()` 判据保留 —— 少数历史建库路径没有该列。
+    """
+    out = {
         "issue": r["issue"], "date": r["date"],
         "reds": [r[f"r{i}"] for i in range(1, 7)],
         "blue": r["blue"],
@@ -385,6 +412,14 @@ def _row_to_draw(r: sqlite3.Row) -> Dict:
         "sales": r["sales"], "pool": r["pool"],
         "source": r["source"] if "source" in r.keys() else "17500",
     }
+    # 奖级字段：列可能缺失（早期 schema），逐个探测而不是假定存在。
+    keys = r.keys()
+    for lv in PRIZE_LEVELS:
+        for suffix in ("", "_amt"):
+            col = f"p{lv}{suffix}"
+            if col in keys:
+                out[col] = r[col]
+    return out
 
 
 # ---------- features ----------
