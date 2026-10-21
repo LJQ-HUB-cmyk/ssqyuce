@@ -323,7 +323,14 @@ def test_p3_undersized_batch_is_not_judged(reg_path):
     reg = hypothesis.register_prereg(hyps, registry_path=reg_path, issue="2003400",
                                      evaluate_after_issue=2003400)
     assert reg["judgeable"] is False
-    assert "R2" in (reg["errors"] or []) or True  # 记录在 prereg_reason
+    # D-15：原写法 `assert "R2" in (reg["errors"] or []) or True` 恒真，等于没测。
+    # 实测 `reg["errors"]` 是空列表（R2 不在里面），R2 真正记录在**每条假说**的
+    # `prereg_reason` 字段（落盘在 registry 文件里），所以必须去读文件而不是读返回值。
+    import json as _json
+    _saved = _json.loads(reg_path.read_text(encoding="utf-8"))
+    _reasons = [h.get("prereg_reason") or "" for h in _saved["hypotheses"]]
+    assert any("R2" in r for r in _reasons), (
+        f"R2（批不足）未记录进任何假说的 prereg_reason：{_reasons[:3]}")
 
     out = hypothesis.evaluate_prereg(registry_path=reg_path,
                                      issue=str(2003400 + hypothesis.FROZEN_ISSUES + 5),

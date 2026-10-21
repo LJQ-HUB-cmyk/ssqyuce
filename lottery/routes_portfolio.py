@@ -191,6 +191,18 @@ def portfolio_distribution(issues: int = Query(1, ge=1, le=20),
 # 不是"预测下一期"。
 # ---------------------------------------------------------------------------
 
+#: 请求路径等待模型的最长时间（秒）。
+#:
+#: 取值理由：预热通常 6~7s，2 秒足以覆盖"预热刚好在收尾"的常见情形，
+#: 省掉一次不必要的 503；而一旦超时就立刻放弃，**宁可显示"未就绪"
+#: 也不让用户为一个后台任务排队**。前端有对应降级文案，不会白屏。
+_POPULARITY_WAIT_SECONDS = 2.0
+
+#: 「预热中」时告诉客户端的重试间隔（秒），同时写进 `Retry-After` 头。
+#: 供前端显示「约 5 秒后就绪」，而不是让用户干等或以为功能坏了。
+_POPULARITY_RETRY_AFTER_SECONDS = 5
+
+
 @router.get("/api/portfolio/popularity")
 def portfolio_popularity(
     reds: str = Query(..., description="逗号分隔的 6 个红球，如 1,2,3,4,5,6"),
@@ -240,11 +252,61 @@ def portfolio_popularity(
                             status_code=400)
 
     from . import popularity as POP
-    model = POP.get_model()
+    # 请求路径用**带超时**的取法：预热线程正在拟合时，最多等 2 秒，
+    # 超时立刻返回未拟合对象走 503（前端有"模型未就绪"降级文案）。
+    # 绝不用 `get_model()` 无超时持锁 —— 那会让用户为后台任务排队，
+    # 是 Product 指出的「看起来加了预热、实际一点没省」的最坏形态。
+    model = POP.get_model_for_request(timeout=_POPULARITY_WAIT_SECONDS)
     out = model.describe(parts, sales if sales else None)
     if not out.get("ok"):
-        return JSONResponse({"ok": False, "error": "模型未就绪（数据不足或尚未拟合）"},
-                            status_code=503)
+        # ===== 区分「预热中」与「样本不足」=====
+        #
+        # 这两件事**用户该做的事完全不同**，合并成一句会误导：
+        #   · 预热中（约 5~20s）：刷新一下就有 —— 说成"数据不足"会让用户以为功能坏了；
+        #   · 样本不足（n_train < 300）：短期无解，只能等更多期开奖。
+        # 这与 D-07「一个 usable 两个意思」同类：不是数字错，是用户无法区分该做什么。
+        #
+        # 用 `is_warming()` 而不是 `_CACHE is None`：超时返回的未拟合对象**不写 _CACHE**，
+        # 所以 `_CACHE is None` 在两种情况下都成立，区分不出来。
+        # `describe()` 现在会回传 `unfitted_reason`（warming / insufficient_data /
+        # fit_failed），端点据此给对文案，而不是压成一句「数据不足或尚未拟合」。
+        # 优先级：**实时**的 is_warming() 高于 describe() 里存的原因。
+        # 理由：如果此刻正有拟合在跑，「预热中」就是当下最准确的原因；
+        # 而 `unfitted_reason` 可能是上一次失败留下的历史值（例如先失败过
+        # insufficient_data，之后预热重试又启动了）。
+        why = "warming" if POP.is_warming() else (out.get("unfitted_reason") or "unknown")
+
+        if why == "warming":
+            return JSONResponse(
+                {"ok": False,
+                 "reason": "model_warming",
+                 "unfitted_reason": "warming",
+                 "retry_after": _POPULARITY_RETRY_AFTER_SECONDS,
+                 "error": ("模型未就绪：正在拟合，约 %d 秒后自动可用（稍后刷新即可）"
+                           % _POPULARITY_RETRY_AFTER_SECONDS)},
+                status_code=503,
+                headers={"Retry-After": str(_POPULARITY_RETRY_AFTER_SECONDS)})
+
+        if why == "insufficient_data":
+            return JSONResponse(
+                {"ok": False,
+                 "reason": "insufficient_data",
+                 "unfitted_reason": "insufficient_data",
+                 "retry_after": None,
+                 "error": ("模型未就绪：历史样本不足（需 ≥300 期含销量与头奖注数的"
+                           "开奖），当前无法给出档位")},
+                status_code=503)
+
+        # fit_failed / unknown：模型未就绪但不是数据问题也不是预热 —— 需看日志。
+        # 文案保留「未就绪 / 未拟合」字样，便于通用降级提示匹配。
+        return JSONResponse(
+            {"ok": False,
+             "reason": "model_not_ready",
+             "unfitted_reason": why,
+             "retry_after": _POPULARITY_RETRY_AFTER_SECONDS,
+             "error": "模型未就绪（拟合未完成或失败），稍候会自动重试"},
+            status_code=503,
+            headers={"Retry-After": str(_POPULARITY_RETRY_AFTER_SECONDS)})
     out["reds"] = sorted(parts)
     return _jsonable(out)
 

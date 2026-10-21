@@ -378,6 +378,19 @@ def capabilities() -> Any:
         "degraded": bool(missing) or bool(degraded),
         "constants_degraded": bool(missing),
         "degraded_constants": missing,
+        # ===== 口径声明：放**顶层**，不塞进 constants（2026-10-21 修复）=====
+        #
+        # 缺陷背景（齐交付实测）：`_live_constants()` 里已写 `out["sixth_mode"]="strict"`，
+        # 但本函数的响应体是**白名单重新组装**的：
+        #     "constants": {k: consts.get(k) for k in ("alpha","single","cross",
+        #                                              "ev_single","ev_sixth")}
+        # `sixth_mode` 不在那五元组里 ⇒ **被静默丢弃**。字段写进了代码却不出现在响应，
+        # 比没写更糟：下一个人读 `_live_constants()` 会以为它在那儿。
+        #
+        # 为什么放顶层而不是塞进 constants：它不是"某个常量的值"，而是
+        # **整个 constants 段的口径声明**（`ev_single` 依赖它才有意义）。
+        # 塞进 constants 会让人误以为它只描述 `ev_single` 一个数。
+        "sixth_mode": consts.get("sixth_mode"),
         "can": can,
         "cannot": cannot,
         "degraded_items": degraded,

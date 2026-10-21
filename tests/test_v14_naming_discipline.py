@@ -460,36 +460,47 @@ def _render_surface_lines(path: Path) -> list:
     return list(enumerate(cleaned.splitlines(), 1))
 
 
-def _is_discipline_mention(line: str) -> bool:
-    """这一行是否在**明确引用/否定**该词（引号包裹），而非向用户陈述它。
-
-    与旧守卫的关键区别：不看"有没有'不得'"，而看**否定词是否与被禁词
-    在同一处的引用语境**。仅含"不得"的陈述句**不再**自动免疫 —— 那正是漏洞 B。
-    """
-    for marker in (f"『{_BANNED_PHRASE}』", f"「{_BANNED_PHRASE}」",
-                   f"【{_BANNED_PHRASE}】",
-                   f"\"{_BANNED_PHRASE}\"", f"“{_BANNED_PHRASE}”",
-                   f"'{_BANNED_PHRASE}'"):
-        if marker in line:
-            return True
-    return False
+# 【已删除】`_is_discipline_mention(line)` —— 2026-10-21（D-12）
+#
+# 它曾把「禁用词被引号包裹」判为"纪律引用"从而豁免。**那是个错误的判据**：
+# JS 里每个字符串字面量本来就带引号，于是 `toast("可用规律")` 会被放过，
+# 而用户恰恰会看到这句 toast。实测：注入后带引号豁免的守卫全绿。
+#
+# 没有"改进"它，而是**整个删掉** —— 引号在 JS 里无处不在，
+# 任何基于引号的启发式都注定误放行。
+# 现在的判据只有一条：**剥掉注释后仍含该词 → 违规**。
+# 防复发守卫见 `test_quoted_visible_mention_is_not_exempt`。
 
 
 @pytest.mark.parametrize("rel", ["index.html", "static/app.js"])
 def test_no_rendered_banned_phrase(rel):
     """**核心守卫**：两个前端文件都不得向用户渲染「可用规律」。
 
-    覆盖 mutation 的字面量级与相邻拼接级。
+    ## 为什么这里没有"引号豁免"（D-12，2026-10-21）
+
+    上一版用「禁用词被引号包裹 ⇒ 视为纪律引用 ⇒ 豁免」。**那是个洞**：
+    **JS 里每个字符串字面量本来就带引号**，于是
+
+        toast("可用规律")
+
+    会被当成"引用"而放行 —— 但用户恰恰会看到这句 toast。
+
+    实测确认：注入上述代码后，带引号豁免的守卫 **全绿通过**。
+
+    修法不是"改进引号启发式"，而是**整条删掉**：
+    引号在 JS 里无处不在，任何基于引号的启发式都注定误放行。
+    现在只做两件事：**剥注释**（用户看不到的放行）+ **`_normalize_concat`**（抓拆分字面量）。
+    判据回到最朴素的一条：**剥掉注释后还含这个词 → 违规**。
+
+    纪律声明写在注释里，注释已被剥掉 ⇒ 不会误杀。
     """
     path = _WEB / rel
-    if not path.exists():
-        pytest.skip(f"{rel} 不存在")
+    # D-12：skip 改 assert —— skipped 24→25 直接破红线 1，等于隐性减测试
+    assert path.exists(), f"{rel} 不存在 —— 扫描面被破坏，守卫无法生效"
 
     offenders = []
     for lineno, line in _render_surface_lines(path):
         if _BANNED_PHRASE not in line:
-            continue
-        if _is_discipline_mention(line):
             continue
         offenders.append((lineno, line.strip()[:120]))
 
@@ -510,12 +521,50 @@ def test_app_js_is_scanned_at_all():
     assert len(_render_surface_lines(app_js)) > 100, "app.js 应被完整解析"
 
 
-def test_discipline_mention_is_exempt_but_plain_use_is_not():
-    """豁免规则必须区分「纪律引用」与「普通陈述」—— 漏洞 B 的守卫。"""
-    assert _is_discipline_mention("后端纪律明令禁止把它叫『可用规律』") is True
-    # 同样的词但没有引用标记 → 不豁免（旧守卫会因为它含"禁止"而放过）
-    assert _is_discipline_mention("后端纪律明令禁止把它叫可用规律") is False
-    assert _is_discipline_mention("共检出 3 条可用规律") is False
+def test_quoted_visible_mention_is_not_exempt(tmp_path):
+    """**D-12：引号不再是豁免理由** —— 引号包裹的**可见**禁用词照样违规。
+
+    ## 这条守的是一个已经被证实的漏洞
+
+    上一版守卫：`if _is_discipline_mention(line): continue`，
+    而 `_is_discipline_mention` 的判据是「禁用词被引号包裹」。
+
+    但 **JS 的每个字符串字面量本身就带引号**：
+
+        toast("可用规律")            → 词组被 "…" 包裹 → 旧守卫判为"引用" → 放行
+        el.textContent = "可用规律"  → 同上
+
+    实测：注入 `toast("可用规律")` 后，带引号豁免的守卫 **全绿通过**。
+
+    ## 现在的判据
+
+    剥掉注释后仍含该词 → 违规，**不看有没有引号**。
+    本用例把样本写进临时 JS 文件，走**与生产完全相同的** `_render_surface_lines`，
+    断言禁用词在剥注释后**仍然存在**（即会被判为违规）。
+    """
+    samples = [
+        'function f(){ toast("可用规律"); }',
+        'el.textContent = "可用规律";',
+        "alert('可用规律');",
+        "x = `可用规律`;",
+        'backend 明令禁止把它叫「可用规律」',   # 可见正文里的"转述禁用词"
+    ]
+    for i, line in enumerate(samples):
+        p = tmp_path / f"sample{i}.js"
+        p.write_text(line + "\n", encoding="utf-8")
+        visible = [t for (_n, t) in _render_surface_lines(p)]
+        hit = [t for t in visible if _BANNED_PHRASE in t]
+        assert hit, (
+            f"样本被误判为'可豁免'：{line!r}\n"
+            f"剥注释后可见行：{visible}\n"
+            f"引号包裹**不得**作为豁免理由 —— JS 字符串字面量本身就带引号。")
+
+    # 反证：**注释里**的词必须被剥掉（否则守卫过度，会逼人改注释）
+    p = tmp_path / "commented.js"
+    p.write_text('// 不得把 L2 叫「可用规律」\nfunction f(){ return 1; }\n',
+                 encoding="utf-8")
+    assert not [t for (_n, t) in _render_surface_lines(p) if _BANNED_PHRASE in t], \
+        "注释中的纪律说明被误判为违规（守卫过度）"
 
 
 def test_strip_comments_preserves_line_numbers():

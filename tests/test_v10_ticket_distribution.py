@@ -294,7 +294,10 @@ def test_ev_ratio_full_is_not_the_sixth_prize_number_and_carries_assumption():
     assert isinstance(d["prize_assumption"], str) and "一等" in d["prize_assumption"]
     # 严格互斥奖级口径（与 evaluate.prize_level 一致）也要给出，供口径对照
     assert 0.40 < d["ev_ratio_full_strict"] < 0.46
-    assert "ev_ratio" not in d or True      # 裸 ev_ratio 不得作为字段（见下一条静态断言）
+    # D-15：原此处写 `assert "ev_ratio" not in d or True` —— 恒真，是废断言。
+    # 「裸 ev_ratio 不得作为字段」这条契约已由下一条
+    # `test_no_bare_ev_ratio_field_in_ticket_distribution` 真测，此处不重复，只留指针。
+    # （该测试名为"静态契约"但实际是运行时检查，命名不准，已在 D-15 记录。）
 
 
 def test_ev_ratio_full_changes_with_jackpot_assumption():

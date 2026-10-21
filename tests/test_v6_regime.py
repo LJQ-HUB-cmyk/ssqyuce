@@ -223,7 +223,11 @@ def test_stage_snapshot_is_as_of():
     assert a["n"] == 120 and b["n"] == 120
     for key in ("omission", "red_freq", "structure", "latest"):
         assert a[key] == b[key], f"{key} 受到了未来数据影响"
-    assert a["omission"] != regime.stage_snapshot(future)["omission"] or True
+    # D-15：原写法 `assert ... != ... or True` 恒真，等于没测。
+    # 本意是「换了更长历史后 omission 应当不同，证明上面的一致性断言不是空转」。
+    # 实测确实不同（120 期 vs 170 期，遗漏值变了），故写成真断言。
+    assert a["omission"] != regime.stage_snapshot(future)["omission"], \
+        "更长历史下 omission 竟然完全相同 —— 上面的一致性断言可能是空转"
 
 
 # ---------- discovery ----------
@@ -275,7 +279,10 @@ def test_asof_scan_is_strictly_walk_forward():
     mutated[199]["reds"] = [1, 2, 3, 4, 5, 6]
     b = discovery.asof_scan(mutated, f, start=150)
     assert a["obs"][:-1] == b["obs"][:-1]
-    assert a["obs"][-1] != b["obs"][-1] or True   # 最后一期允许变化
+    # D-15：原写法 `assert a["obs"][-1] != b["obs"][-1] or True` 恒真，是废断言。
+    # **这里不补 != 断言**，因为实测在测试数据下 `obs[-1]` 前后都是 1.0（不敏感），
+    # 改成 `!=` 会假红。原作者的注释「最后一期允许变化」是诚实的观察。
+    # 本用例的真正契约是上面那句「前缀逐项相同」，已由 `:-1` 断言覆盖。
 
     c = discovery.asof_scan(d, f, start=150, end=200)
     assert c["obs"][:-1] == a["obs"][:-1], "更长历史的前缀必须与短历史一致"

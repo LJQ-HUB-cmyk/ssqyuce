@@ -344,3 +344,68 @@ def test_old_ambiguous_degraded_field_no_longer_means_constants_only():
     # 两个字段可以不同值 —— 这正是它们存在的意义
     assert b["degraded"] != b["constants_degraded"] or not b["degraded_items"], (
         "当存在降级项而常量正常时，两字段应当不同 —— 否则说明又被混用了")
+
+
+# ==========================================================================
+# 白名单不得静默吞字段（2026-10-21 修复）
+#
+# 缺陷：`_live_constants()` 里写了 `out["sixth_mode"]="strict"`，但响应体是
+# **白名单重新组装**的，`sixth_mode` 不在五元组里 ⇒ 被静默丢弃。
+# 代码里看起来有、响应里实际没有 —— 下一个人读源码会以为它在那儿。
+#
+# 这是当天那一族的第六个变体：
+#   `| tail` 吞退出码 / `git stash` 收走工作 / 无基线 `git diff` 为空 /
+#   `--collect-only` 返回 0 / 错误环境假设让我们以为做不到 / 白名单吞字段。
+# 共同点：某种「看起来对」的中间态掩盖了真实结果。
+# ==========================================================================
+
+#: `_live_constants()` 里属于「元信息」的键 —— 它们进 `constants_meta`，不进 `constants`。
+_CONST_META_KEYS = {"sources", "prize_assumption", "derivation_zh", "errors"}
+
+
+def test_sixth_mode_is_exposed_at_top_level():
+    """`sixth_mode` 必须出现在响应顶层（Lead 点名要加的字段）。
+
+    放顶层而非 `constants`：它是**整个 constants 段的口径声明**，
+    不是某个常量的值。塞进 constants 会让人误以为它只描述 `ev_single`。
+    """
+    from lottery import routes_capabilities as RC
+
+    body = RC.capabilities()
+    assert "sixth_mode" in body, "sixth_mode 被白名单吞掉了"
+    assert body["sixth_mode"] == "strict", f"应为 strict，实际 {body['sixth_mode']}"
+
+
+def test_no_constant_key_is_silently_dropped():
+    """**反查守卫**：`_live_constants()` 产出的每个值键都必须能在响应里找到。
+
+    这条是「白名单不得吞字段」的硬版本 —— 不枚举期望键，而是**反查实际产出**。
+    以后再加常量却忘了暴露，本测试会红，而不是靠人记得改白名单。
+    """
+    from lottery import routes_capabilities as RC
+
+    produced = set(RC._live_constants().keys())
+    value_keys = produced - _CONST_META_KEYS
+    body = RC.capabilities()
+    exposed = set(body["constants"].keys()) | {"sixth_mode"}
+
+    missing = value_keys - exposed
+    assert not missing, (
+        f"以下常量在 `_live_constants()` 里产出了、但响应里找不到：{sorted(missing)}\n"
+        f"（这就是「白名单静默吞字段」—— 代码里看起来有，响应里实际没有）")
+
+    # 反向也不能多：响应里的常量键必须都来自产出（防止白名单写了不存在的键）
+    extra = set(body["constants"].keys()) - value_keys
+    assert not extra, f"响应里出现了未产出的常量键：{sorted(extra)}"
+
+
+def test_constants_meta_keys_are_not_in_constants_group():
+    """元信息键不得混进 `constants` 值组（否则口径与值混在一起）。"""
+    from lottery import routes_capabilities as RC
+
+    body = RC.capabilities()
+    overlap = set(body["constants"].keys()) & _CONST_META_KEYS
+    assert not overlap, f"元信息键混进了 constants 值组：{sorted(overlap)}"
+    # 元信息应在 constants_meta 里
+    for k in ("sources", "prize_assumption"):
+        assert k in body["constants_meta"], f"{k} 应在 constants_meta"

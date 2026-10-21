@@ -146,8 +146,10 @@ def test_check_shape_accepts_normal():            # noqa
     ctx = {"sum_min": 60, "sum_max": 140, "span_min": 10, "span_max": 30,
            "top_zones": [(1, 3, 2), (2, 2, 2), (2, 3, 1), (1, 2, 3)],
            "odd_range": [2, 3, 4], "max_consecutive": 2}
-    # 一组形态正常的注单
-    assert SR.check_shape([3, 8, 15, 18, 24, 28], ctx) or True
+    # 一组形态正常的注单 —— 必须**明确放行**
+    # D-15：原写法 `assert ... or True` 恒真，等于没测。实测该组合返回 True。
+    assert SR.check_shape([3, 8, 15, 18, 24, 28], ctx) is True, \
+        "形态正常的注单被 check_shape 拦截了"
 
 
 # ---------------------------------------------------------------------------

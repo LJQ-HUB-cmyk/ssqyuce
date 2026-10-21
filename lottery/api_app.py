@@ -459,6 +459,91 @@ def _idle_mining_loop():
         _time.sleep(IDLE_MINING_INTERVAL)
 
 
+def _popularity_warmup():
+    """启动后台预热「大众偏好度」模型。
+
+    ## 为什么需要这条线程（2026-10-21 实测）
+
+    `PopularityModel.fit()` 同步跑在请求路径上，冷启动首次要 **7.3 秒**
+    （进程外 HTTP 端到端 28.5s，含 numpy 惰性导入）。而
+    `loadV10Cards()` 是**用户进「评估报告」就自动触发**的 ——
+    等于每次服务重启后的第一个用户都要盯着两张卡转圈半分钟。
+
+    拆解（3517 期实测）：
+        load_draws()            0.06s
+        fit() 总计               7.99s
+          └─ _out_of_sample_check  ~7s   ← 200 次置换检验（纯 Python）
+          └─ _ols(全量)            0.01s
+
+    ## 为什么不改统计本身
+
+    `_out_of_sample_check` 产出的是 `r2_increment` 与置换 p 值 —— 它们是
+    **披露给用户的效应量**（"只够排序、不足以定值"的依据），删掉或减少 n_perm
+    会让结论变弱。所以这里**一个字都不改统计**，只把耗时挪到用户到来之前。
+
+    ## 为什么不是「懒加载 + 首请求等待」
+
+    那正是现状（`get_model()` 在没缓存时同步拟合）。预热的意义是把
+    「第一个用户承担 7 秒」改成「服务启动时承担 7 秒」。
+
+    ## 失败必须静默
+
+    模型拟合失败绝不能影响主链路（这是 `get_model()` 里既有的约定：
+    `except Exception: pass`）。预热线程同样 —— 失败就打一行日志，
+    端点侧仍会退回 503「模型未就绪」，前端已有对应降级。
+    """
+    import time as _time
+    t0 = _time.time()
+    try:
+        # ---- 显式 import numpy：把惰性导入的代价也挪到用户到来之前 ----
+        # 2026-10-21 实测：容器内端到端 28~29s，而纯 fit() 只有 6~7s，
+        # 差值主要在首次 numpy 导入（sklearn 也会连带拖进来）。
+        # 不预热掉它，第一个请求仍会付这笔钱。
+        try:
+            import numpy  # noqa: F401
+        except Exception:        # noqa: BLE001
+            pass
+
+        from . import popularity
+
+        # ---- 有缓存就直接加载，不必预热 ----
+        # 预热只在「跨进程缓存缺失/失效」时才有意义：
+        #   · 有缓存：`_load_cached` 约 0.2s，预热是纯浪费；
+        #   · 无缓存：预热把 6~7s 挪到启动后、用户到来前，仍有价值。
+        # 判断方式与 `get_model()` 内部完全一致（同一指纹口径），不另造逻辑。
+        try:
+            from . import db
+            rows = popularity._training_rows(db.load_draws())
+            if popularity._load_cached(rows) is not None:
+                print("[warmup] 大众偏好度：命中落盘缓存，跳过预热（%.2fs）"
+                      % (_time.time() - t0))
+                return
+        except Exception:          # noqa: BLE001 —— 判断失败就走预热，宁可多做不可漏做
+            pass
+
+        # ---- 带重试：请求路径已不再触发拟合（结构判据要求）， ----
+        # 所以「预热失败 = 功能永久不可用」必须由这里兜住。
+        # 每 30 秒重试一次，直到拟合成功或达到上限次数（避免无限刷日志）。
+        _RETRY_INTERVAL = 30
+        _MAX_ATTEMPTS = 10
+        m = None
+        for attempt in range(1, _MAX_ATTEMPTS + 1):
+            m = popularity.get_model()
+            if m.fitted:
+                break
+            print("[warmup] 第 %d 次拟合未成功，%ds 后重试（%d/%d）"
+                  % (attempt, _RETRY_INTERVAL, attempt, _MAX_ATTEMPTS))
+            _time.sleep(_RETRY_INTERVAL)
+
+        if m is not None and m.fitted:
+            print("[warmup] 大众偏好度模型已就绪: %.2fs（R²增量=%.5f）"
+                  % (_time.time() - t0, float(getattr(m, "r2_increment", 0.0) or 0.0)))
+        else:
+            print("[warmup] 大众偏好度模型未拟合（数据不足？）: %.2fs" % (_time.time() - t0))
+    except Exception as e:      # noqa: BLE001 —— 预热失败绝不影响服务启动
+        print("[warmup] 大众偏好度预热失败（不影响主链路）: %s" % e)
+
+
 # ---------- 启动：开奖日自动调度 + 闲时挖掘（均默认关闭，各自独立开关） ----------
 if config.SCHEDULER_ENABLED:
     import threading
@@ -471,3 +556,13 @@ if config.SCHEDULER_ENABLED:
 if (os.environ.get("LOTT_IDLE_MINING") or "0").strip() == "1":
     import threading as _threading
     _threading.Thread(target=_idle_mining_loop, daemon=True).start()
+
+# V14（2026-10-21）：大众偏好度模型启动预热。
+# **默认开启**，与上面两个开关不同 —— 它不产生任何新行为，只是把
+# 「第一个请求要等的 7 秒」挪到「服务启动时」。不需要它时设
+# LOTT_POPULARITY_WARMUP=0 即可（例如跑单测时想省 7 秒）。
+# 用 getenv 判断「显式关闭」而不是「显式开启」：漏配环境变量时应当
+# 得到**好的**默认（用户不等待），而不是坏默认。
+if (os.environ.get("LOTT_POPULARITY_WARMUP") or "1").strip() != "0":
+    import threading as _warm_threading
+    _warm_threading.Thread(target=_popularity_warmup, daemon=True).start()

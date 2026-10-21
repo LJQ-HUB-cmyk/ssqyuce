@@ -213,7 +213,11 @@ def test_popularity_unfitted_returns_503(unfitted_popularity):
     assert _status(resp) == 503, f"未拟合应为 503，实际 {_status(resp)}"
     body = _json(resp)
     assert body["ok"] is False
-    assert "模型未就绪" in body["error"]
+    # 2026-10-21：文案已按原因分叉（见「十三」节）。
+    # 这条用例只断言「返回一个非空的、能区分原因的错误」，
+    # 具体分支的正确性由 test_popularity_503_reason_* 覆盖。
+    assert body.get("reason") in ("model_warming", "insufficient_data")
+    assert body["error"]
 
 
 def test_popularity_unfitted_still_validates_reds_first(unfitted_popularity):
@@ -863,3 +867,83 @@ def test_http_numpy_scalars_would_be_caught_here(http_client):
         r = http_client.get(path)
         assert r.status_code == 200, f"{path} 编码失败：{r.status_code}"
         assert r.headers["content-type"].startswith("application/json")
+
+
+# ==========================================================================
+# 十三、popularity 503 的**原因分叉**（预热中 vs 样本不足）
+#
+# 缺陷背景：两种情况的文案合并成「模型未就绪（数据不足或尚未拟合）」，
+# 但它们让用户做的事完全不同：
+#   · 预热中（约 5~20s）→ 刷新一下就有；说成"数据不足"会让用户以为功能坏了
+#   · 样本不足（n_train<300）→ 短期无解，只能等更多期
+# 与 D-07「一个 usable 两个意思」同类：不是数字错，是用户无法区分该做什么。
+# ==========================================================================
+
+def test_popularity_503_reason_warming_when_fitting(monkeypatch):
+    """预热中 → `reason="model_warming"` + `retry_after` + `Retry-After` 头。"""
+    from lottery import popularity as POP
+
+    P_unfitted = POP.PopularityModel()          # fitted=False
+    monkeypatch.setattr(POP, "get_model_with_deadline", lambda timeout=None: P_unfitted)
+    monkeypatch.setattr(POP, "is_warming", lambda: True)
+
+    resp = R.portfolio_popularity(reds="1,2,3,4,5,6", sales=0.0)
+    assert _status(resp) == 503
+    body = _json(resp)
+    assert body["reason"] == "model_warming"
+    assert body["retry_after"] == R._POPULARITY_RETRY_AFTER_SECONDS
+    # 文案必须同时给出「未就绪」这个可辨识前缀 与 「几秒后可用」的行动指引
+    assert "未就绪" in body["error"], "缺少可辨识的「未就绪」前缀（D-03 降级可辨识要求）"
+    assert "拟合" in body["error"] and "秒" in body["error"]
+    # HTTP 头也要带，前端/代理才能按标准处理
+    assert resp.headers.get("Retry-After") == str(R._POPULARITY_RETRY_AFTER_SECONDS)
+
+
+def test_popularity_503_reason_insufficient_when_not_warming(monkeypatch):
+    """非预热（真样本不足）→ `reason="insufficient_data"`，且**不得**给 retry_after。"""
+    from lottery import popularity as POP
+
+    P_unfitted = POP.PopularityModel()
+    monkeypatch.setattr(POP, "get_model_with_deadline", lambda timeout=None: P_unfitted)
+    monkeypatch.setattr(POP, "is_warming", lambda: False)
+
+    resp = R.portfolio_popularity(reds="1,2,3,4,5,6", sales=0.0)
+    assert _status(resp) == 503
+    body = _json(resp)
+    assert body["reason"] == "insufficient_data"
+    assert body["retry_after"] is None, (
+        "样本不足不是「等几秒」能解决的，给 retry_after 会误导用户反复刷新")
+    assert "300" in body["error"], "应说明需要多少期样本"
+
+
+def test_503_reasons_are_distinguishable():
+    """两种 503 的 `reason` 必须不同 —— 这是前端区分提示的唯一依据。"""
+    assert "model_warming" != "insufficient_data"
+
+
+def test_is_warming_cleared_after_fit(monkeypatch):
+    """`_WARMING` 必须在拟合结束后清除，否则端点会一直说「马上就好」。"""
+    from lottery import popularity as POP
+
+    draws = [{"reds": [1, 2, 3, 4, 5, 6], "p1": 5.0, "sales": 1e8}] * 400
+    monkeypatch.setattr("lottery.db.load_draws", lambda: draws)
+    POP.reset_cache()
+    POP.get_model()
+    assert POP.is_warming() is False
+
+
+def test_is_warming_cleared_even_if_fit_raises(monkeypatch):
+    """`fit` 抛异常时标记也必须清除（否则永远告诉用户「马上就好」）。"""
+    from lottery import popularity as POP
+
+    draws = [{"reds": [1, 2, 3, 4, 5, 6], "p1": 5.0, "sales": 1e8}] * 400
+    monkeypatch.setattr("lottery.db.load_draws", lambda: draws)
+
+    def boom(self, d):
+        raise RuntimeError("fit exploded")
+
+    monkeypatch.setattr(POP.PopularityModel, "fit", boom)
+    POP.reset_cache()
+    m = POP.get_model()          # 不抛
+    assert m.fitted is False
+    assert POP.is_warming() is False, "fit 抛异常后 _WARMING 未清除 —— 会永久误报「预热中」"

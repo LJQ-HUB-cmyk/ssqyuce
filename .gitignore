@@ -60,3 +60,4 @@ data/archive/
 data/idle_mining_state.json
 data/idle_mining_state.json.tmp
 .git-safety/
+data/popularity_model.json
