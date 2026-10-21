@@ -2548,10 +2548,61 @@ function _firstTicketReds() {
 /** 降级文案：把状态码翻译成用户能懂的一句话，同时保留原始 message 供排查。 */
 function _degradeNote(what, e) {
   const st = e && e.status;
+  const pl = (e && e.payload) || {};          // 后端 JSON 体（api() 已挂在 err.payload 上）
+  // ┌─ 通用规则（2026-10-21 Product 定，适用于全站）────────────────────────┐
+  // │ 凡「粗/细两级字段**并存**」，不许用 `||` 读，必须 filter(Boolean) 后全查。│
+  // └──────────────────────────────────────────────────────────────────┘
+  //
+  // 为什么这条是**通用**的，而不只是这一处的特例：
+  //   `a || b` 的语义是「a 缺失时用 b」。但当后端把 `reason`（粗分类）与
+  //   `unfitted_reason`（细分原因）**同时**给出时，两者是层级关系、不是备选关系。
+  //   用 `||` 读，只要 a 有值（哪怕是粗的），更精确的 b 就永远读不到 ——
+  //   这不是「写错了一个值」，是**回退链在语义上不成立**。
+  //
+  // 实测（2026-10-21）：预热关闭时后端返回
+  //   reason=model_not_ready + unfitted_reason=warming_disabled
+  // 若写 `pl.reason || pl.unfitted_reason`，前端会把「部署配置关闭」
+  // （永久、该找运维）误报成「临时未就绪」（该刷新）。
+  //
+  // 守卫：tests/frontend/v14_portfolio_render_probe.py 的 [11] 一段，
+  // 按**形态**拦（正则匹配 `pl.reason || pl.unfitted_reason`），不只拦这一行。
+  const reasons = [pl.reason, pl.unfitted_reason].filter(Boolean);
+  const has = (...names) => names.some(n => reasons.indexOf(n) >= 0);
+  const retryAfter = pl.retry_after;
+
+  // 503 必须再细分，否则用户不知道该等还是该找运维。
+  // 判据用后端回的 `reason`，不用 HTTP 状态码 —— 三种 503 的"用户该做什么"完全不同：
+  //   warming           → 刷新就好（一次性，几秒）
+  //   insufficient_data → 等更多期开奖（短期无解，但功能没坏）
+  //   model_not_ready   → 看日志/找运维
+  // 只有当 `retry_after` 是**具体秒数**时才鼓励"稍后重试"；
+  // `retry_after === null` 表示后端自己也认为"等不到"，此时任何"稍后重试"
+  // 都是在让用户等一件不会发生的事。
+  if (st === 503) {
+    let hint;
+    if (has("model_warming", "warming")) {
+      const n = Number(retryAfter);
+      hint = Number.isFinite(n) && n > 0
+        ? "模型正在拟合（约 " + n + " 秒），稍后刷新即可"
+        : "模型正在拟合，稍后刷新即可";
+    } else if (has("insufficient_data")) {
+      hint = "历史样本不足（需 ≥300 期含销量与头奖注数的开奖），短期无法给出档位";
+    } else if (has("warmup_disabled", "warming_disabled")) {
+      hint = "当前部署关闭了后台预热，本卡在此部署下不可用（无重试）";
+    } else {
+      // 兜底：后端只给了泛化的 model_not_ready，且**带**了具体 retry_after 才提重试
+      const n = Number(retryAfter);
+      hint = (retryAfter !== null && retryAfter !== undefined &&
+              Number.isFinite(n) && n > 0)
+        ? "服务暂不可用（模型未就绪），约 " + n + " 秒后可再试"
+        : "服务暂不可用（模型未就绪），且该状态下不会自动恢复";
+    }
+    return "【" + what + "不可用】" + hint + "：" + String((e && e.message) || e);
+  }
+
   let hint = "接口未返回";
   if (st === 401) hint = "需要登录后查看（本卡不阻塞其余内容）";
   else if (st === 403) hint = "无权访问本卡";
-  else if (st === 503) hint = "服务暂不可用（模型未就绪或数据不足）";
   else if (st === 400) hint = "参数不合法";
   else if (st === 404) hint = "接口不存在（后端版本可能较旧）";
   else if (!st) hint = "网络超时或连接失败";

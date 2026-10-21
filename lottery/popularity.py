@@ -248,6 +248,9 @@ class PopularityModel:
             # 这与 D-07「一个 usable 两个意思」同类：拆字段，不要拆文案。
             if _WARMING.is_set():
                 why = "warming"
+            elif _RETRY_EXHAUSTED:
+                # 重试已耗尽：必须与「正在重试」区分开，否则又是一个假承诺。
+                why = "retry_exhausted"
             else:
                 why = _LAST_UNFIT_REASON
             return {
@@ -463,10 +466,59 @@ _READY = threading.Event()
 #: 端点只能笼统说「数据不足」，把「预热中」和「真样本不足」混为一谈。
 _LAST_UNFIT_REASON: str = "unknown"
 
+#: 上一次成功拟合实测耗时（秒）。用于给「预热中」的 `Retry-After` **动态估值**。
+#:
+#: ## 为什么不能写死
+#:
+#: 实测：同一台机器上 fit 耗时随负载在 5.5s ~ 21s 之间浮动
+#: （本机空闲 5.49s / 容器单核 6.06s / 本机 load 4 时 8.35s / load 12 时 21s）。
+#: 写死 5s：慢时用户 5 秒后重试仍是 503，以为功能坏了；
+#: 写死 20s：快时用户白等 15 秒。
+#: 用「上次实测耗时」当估计，两种负载下都接近真实。
+_LAST_FIT_SECONDS: Optional[float] = None
+
+#: 当前这次拟合的开始时刻（`time.time()` 口径）。用于给 `retry_after` 一个
+#: **已耗时下界**：如果已经跑了 20 秒还说「5 秒后就好」，那依然是个假承诺。
+_FIT_STARTED_AT: Optional[float] = None
+
+#: 上一次**预热**（含读盘/拟合全过程）的实测耗时（秒）。
+#:
+#: 与 `_LAST_FIT_SECONDS` 的区别：后者只计 `fit()` 本身，本值计预热线程的
+#: 端到端耗时（含 numpy 导入等），更贴近用户真实等待。
+#: 用途：作为**一致性守卫**的对照量 —— 承诺的 `retry_after` 与近期实测是否同量级。
+#: ⚠️ 它是「上次」的值，测的是**一致性**（承诺与近期实际是否同量级），
+#: 不是**准确性**（这次多久会好）。读它的人不要当精确断言用。
+_LAST_WARMUP_SECONDS: Optional[float] = None
+
+#: `suggest_retry_after()` 的上下界（秒）。上限防止异常慢机器给出荒谬的等待。
+_RETRY_AFTER_MIN = 5
+_RETRY_AFTER_MAX = 30
+#: 首次（还没有历史耗时可参考）用的保守估计。
+_RETRY_AFTER_INITIAL = 10
+
 
 def is_warming() -> bool:
     """模型是否正在后台拟合（预热线程或重试循环正在跑 `fit`）。"""
     return _WARMING.is_set()
+
+
+def warmup_enabled() -> bool:
+    """后台预热/重试是否启用（`LOTT_POPULARITY_WARMUP=0` 关闭）。
+
+    ## 为什么这个谓词必须只有一份
+
+    它决定**两件相互依赖**的事：
+
+      * `api_app` —— 要不要起预热线程（进而决定「会不会自动重试」）；
+      * `routes_portfolio` —— 503 该说「正在拟合，稍候自动就绪」
+        还是「本进程内**不会**自动就绪」。
+
+    如果两处各读一次环境变量，一旦有人改了判断方式（例如支持 `false`/`no`），
+    就会出现「线程没起，但端点还承诺会自动好」—— 用户会一直刷新一件永远不回来的事。
+    **本项目已经因为两套逻辑各说各话出过问题**（见 `_get_model_locked` 注释）。
+    """
+    import os
+    return (os.environ.get("LOTT_POPULARITY_WARMUP") or "1").strip() != "0"
 
 
 def _set_unfit_reason(reason: str, exc: Optional[BaseException] = None) -> None:
@@ -487,6 +539,83 @@ def _set_unfit_reason(reason: str, exc: Optional[BaseException] = None) -> None:
 def last_unfit_reason() -> str:
     """最近一次未拟合的原因（测试与端点诊断用）。"""
     return "warming" if _WARMING.is_set() else _LAST_UNFIT_REASON
+
+
+def record_warmup_seconds(seconds: float) -> None:
+    """记录一次预热的端到端耗时（由 `api_app._popularity_warmup` 调用）。"""
+    global _LAST_WARMUP_SECONDS
+    _LAST_WARMUP_SECONDS = float(seconds)
+
+
+#: 预热重试是否**已耗尽**（`_MAX_ATTEMPTS` 次全失败）。
+#:
+#: ## 为什么需要这个状态（2026-10-21 第三种「假承诺」）
+#
+# 前两种已修：
+#   ① `warming_disabled` —— 预热被配置关闭，「永不发生」却承诺会重试；
+#   ② 固定 `retry_after=5` —— 比实际短 2.6~7.7 倍；
+# 这一种是**重试耗尽后仍说「稍候会自动重试」**：
+#   预热循环 `for attempt in range(1, 11)` 跑完就退出了，
+#   但 `_LAST_UNFIT_REASON` 仍是 `fit_failed`，端点据此给出
+#   `retry_after=30` + 「稍候会自动重试」—— 而**不会再有任何重试**。
+#   用户会一直刷新一件永远不回来的事。
+_RETRY_EXHAUSTED = False
+
+
+def mark_retry_exhausted() -> None:
+    """标记预热重试已耗尽（由 `api_app._popularity_warmup` 在循环结束时调用）。"""
+    global _RETRY_EXHAUSTED
+    _RETRY_EXHAUSTED = True
+
+
+def clear_retry_exhausted() -> None:
+    """清除「重试已耗尽」标记（新的预热轮次开始、或拟合成功时调用）。"""
+    global _RETRY_EXHAUSTED
+    _RETRY_EXHAUSTED = False
+
+
+def is_retry_exhausted() -> bool:
+    """重试是否已耗尽 —— 端点据此决定 `retry_after` 该给值还是 `null`。"""
+    return _RETRY_EXHAUSTED
+
+
+def last_warmup_seconds() -> Optional[float]:
+    """上次预热实测耗时（秒）；从未预热过时为 `None`。
+
+    **语义**：反映「近期这台机器上预热大概要多久」，供一致性守卫比对
+    `retry_after` 是否与之同量级。**不是**对本轮等待时间的精确预测。
+    """
+    return _LAST_WARMUP_SECONDS
+
+
+def suggest_retry_after() -> int:
+    """给「模型预热中」的建议重试间隔（秒）—— 基于上次实测耗时，动态。
+
+    ## 为什么不写死（Lead 裁决）
+
+    fit 耗时随负载在 **5.5s ~ 21s** 浮动（实测：本机空闲 5.49s、容器单核 6.06s、
+    本机 load 4 时 8.35s、load 12 时 21s）。
+
+      * 写死 5s → 慢负载时用户 5 秒后重试仍是 503，**以为功能坏了**；
+      * 写死 20s → 快的时候让用户**白等 15 秒**。
+
+    用「上次实测耗时」作为估计，两种负载下都接近真实；首次无历史时用保守值 10s。
+    再夹到 `[5, 30]`：上限防止异常慢机器给出荒谬等待，下限避免过于频繁轮询。
+    """
+    import time as _time
+    # 已耗时是**下界**：如果这次已经跑了 20 秒，那「5 秒后就好」必然又是假承诺。
+    # 没有历史耗时可参考时，它同时充当估计值（`_RETRY_AFTER_INITIAL` 兜底）。
+    elapsed = (_time.time() - _FIT_STARTED_AT) if _FIT_STARTED_AT else 0.0
+
+    # 参考量优先级：预热端到端耗时（含 numpy 导入，最贴近用户真实等待）
+    # > 单次 fit 耗时 > 保守初值。取**较大者**与已耗时下界。
+    ref = _LAST_WARMUP_SECONDS or _LAST_FIT_SECONDS
+    if ref:
+        est = max(float(ref), elapsed + 1.0)
+    else:
+        est = max(float(_RETRY_AFTER_INITIAL), elapsed + 1.0)
+
+    return int(min(_RETRY_AFTER_MAX, max(_RETRY_AFTER_MIN, round(est))))
 
 
 def reset_cache() -> None:
@@ -783,6 +912,10 @@ def _get_model_locked(force_refit: bool = False) -> PopularityModel:
     # 端点会一直告诉用户「约 5 秒后就绪」，而实际永远不会就绪。
     _WARMING.set()
     info: Dict[str, Any] = {}
+    import time as _time
+    global _FIT_STARTED_AT
+    _t_fit = _time.time()
+    _FIT_STARTED_AT = _t_fit
     try:
         info = m.fit(draws) or {}
     except Exception as exc:        # noqa: BLE001 —— 模型失败绝不影响主链路
@@ -790,12 +923,18 @@ def _get_model_locked(force_refit: bool = False) -> PopularityModel:
         # 至少留下原因，供 describe() 回传 `unfitted_reason="fit_failed"`。
         _set_unfit_reason("fit_failed", exc)
     finally:
+        # 记录本次实测耗时 —— `suggest_retry_after()` 靠它给动态值。
+        # 只在真的跑过 fit 时更新（缓存命中路径不会走到这里）。
+        global _LAST_FIT_SECONDS
+        _LAST_FIT_SECONDS = _time.time() - _t_fit
+        _FIT_STARTED_AT = None
         _WARMING.clear()
     if not m.fitted and _LAST_UNFIT_REASON == "unknown":
         # `fit` 正常返回但 ok=False（典型：样本不足）——记录它自己的 reason
         _set_unfit_reason(str(info.get("reason") or "fit_failed"), None)
     _CACHE = m
     if m.fitted:
+        clear_retry_exhausted()  # 成功了，之前的「耗尽」结论作废
         _READY.set()             # 通知所有在等的请求：成果好了
         # 写盘失败绝不能影响功能（磁盘满 / 只读挂载 / 权限）。
         # `_save_cached` 内部已有 try/except，这里再兜一层 —— 因为它可能被替换、

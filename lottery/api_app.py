@@ -524,24 +524,89 @@ def _popularity_warmup():
         # ---- 带重试：请求路径已不再触发拟合（结构判据要求）， ----
         # 所以「预热失败 = 功能永久不可用」必须由这里兜住。
         # 每 30 秒重试一次，直到拟合成功或达到上限次数（避免无限刷日志）。
-        _RETRY_INTERVAL = 30
-        _MAX_ATTEMPTS = 10
+        # 重试间隔**可配**（`LOTT_POPULARITY_RETRY_INTERVAL`，默认 30s）。
+        # 可配的意义：让「重试耗尽」的端到端验证能在几秒内跑完，而不是等 300s。
+        #
+        # ⚠️ 注意这个量与 `routes_portfolio._POPULARITY_RETRY_AFTER_SECONDS` 是
+        # **两个不同的量，不许合并命名**：
+        #   · 本值 = **后台**多久重试一次；
+        #   · retry_after = 告诉**用户**多久后刷新。
+        #   两者业务含义无关（一个是系统行为，一个是用户协议），
+        #   换算出同一个数只是巧合。有测试守卫这一点。
+        _RETRY_INTERVAL = _popularity_retry_interval()
+        _MAX_ATTEMPTS = _popularity_max_attempts()
         m = None
         for attempt in range(1, _MAX_ATTEMPTS + 1):
             m = popularity.get_model()
             if m.fitted:
                 break
-            print("[warmup] 第 %d 次拟合未成功，%ds 后重试（%d/%d）"
+            print("[warmup] 第 %d 次拟合未成功，%.2fs 后重试（%d/%d）"
                   % (attempt, _RETRY_INTERVAL, attempt, _MAX_ATTEMPTS))
             _time.sleep(_RETRY_INTERVAL)
 
+        # 重试**耗尽**（循环跑满仍未 fitted）：必须显式标记，
+        # 否则端点会继续说「稍候会自动重试」—— 那是第三种假承诺。
+        if m is None or not m.fitted:
+            try:
+                popularity.mark_retry_exhausted()
+            except Exception:        # noqa: BLE001
+                pass
+
         if m is not None and m.fitted:
+            _elapsed = _time.time() - t0
+            # 记录实测预热耗时 —— 供 `retry_after` 的一致性守卫比对
+            # （承诺的重试间隔应与近期实测同量级，见 suggest_retry_after 的注释）
+            try:
+                popularity.record_warmup_seconds(_elapsed)
+            except Exception:        # noqa: BLE001 —— 记录失败不影响预热
+                pass
             print("[warmup] 大众偏好度模型已就绪: %.2fs（R²增量=%.5f）"
-                  % (_time.time() - t0, float(getattr(m, "r2_increment", 0.0) or 0.0)))
+                  % (_elapsed, float(getattr(m, "r2_increment", 0.0) or 0.0)))
         else:
             print("[warmup] 大众偏好度模型未拟合（数据不足？）: %.2fs" % (_time.time() - t0))
     except Exception as e:      # noqa: BLE001 —— 预热失败绝不影响服务启动
         print("[warmup] 大众偏好度预热失败（不影响主链路）: %s" % e)
+
+
+def _popularity_retry_interval() -> float:
+    """后台预热的重试间隔（秒）。默认 30，可用 `LOTT_POPULARITY_RETRY_INTERVAL` 覆盖。
+
+    **可配的唯一目的是测试**：验证「重试耗尽」的终态时，10 次 × 30s = 300s
+    不可接受；设成 0.1 就能在几秒内跑完完整流程。
+
+    ⚠️ 与 `routes_portfolio._POPULARITY_RETRY_AFTER_SECONDS`（告诉**用户**
+    多久后刷新）是**两个不同的量**，不可合并命名。
+    """
+    raw = (os.environ.get("LOTT_POPULARITY_RETRY_INTERVAL") or "").strip()
+    if not raw:
+        return 30.0
+    try:
+        val = float(raw)
+        return val if val > 0 else 30.0
+    except (TypeError, ValueError):
+        return 30.0
+
+
+def _popularity_max_attempts() -> int:
+    """预热最多重试几次。默认 10，可用 `LOTT_POPULARITY_MAX_ATTEMPTS` 覆盖（测试用）。"""
+    raw = (os.environ.get("LOTT_POPULARITY_MAX_ATTEMPTS") or "").strip()
+    if not raw:
+        return 10
+    try:
+        val = int(raw)
+        return val if val > 0 else 10
+    except (TypeError, ValueError):
+        return 10
+
+
+def _popularity_warmup_enabled() -> bool:
+    """预热开关的**唯一**读取处（委托给 `popularity.warmup_enabled()`）。
+
+    保留这一层薄封装的原因：`api_app` 在任何 import 阶段都不该直接依赖
+    `popularity` 的内部实现细节；而判断逻辑本身必须只有一份。
+    """
+    from . import popularity
+    return popularity.warmup_enabled()
 
 
 # ---------- 启动：开奖日自动调度 + 闲时挖掘（均默认关闭，各自独立开关） ----------
@@ -563,6 +628,9 @@ if (os.environ.get("LOTT_IDLE_MINING") or "0").strip() == "1":
 # LOTT_POPULARITY_WARMUP=0 即可（例如跑单测时想省 7 秒）。
 # 用 getenv 判断「显式关闭」而不是「显式开启」：漏配环境变量时应当
 # 得到**好的**默认（用户不等待），而不是坏默认。
-if (os.environ.get("LOTT_POPULARITY_WARMUP") or "1").strip() != "0":
+# 谓词统一走 `popularity.warmup_enabled()` —— 单一事实源。
+# 端点也要用同一个判断来决定 503 该说「稍候自动就绪」还是「本进程内不会就绪」，
+# 两处各读一次 env 迟早会漂移（本项目老毛病）。
+if _popularity_warmup_enabled():
     import threading as _warm_threading
     _warm_threading.Thread(target=_popularity_warmup, daemon=True).start()

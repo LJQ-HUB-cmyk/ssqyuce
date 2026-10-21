@@ -200,7 +200,18 @@ _POPULARITY_WAIT_SECONDS = 2.0
 
 #: 「预热中」时告诉客户端的重试间隔（秒），同时写进 `Retry-After` 头。
 #: 供前端显示「约 5 秒后就绪」，而不是让用户干等或以为功能坏了。
-_POPULARITY_RETRY_AFTER_SECONDS = 5
+#: 预热中时给客户端的**保守兜底**重试间隔（秒），同时写进 `Retry-After` 头。
+#:
+#: 实际值走 `popularity.suggest_retry_after()` 的**动态估值**（基于上次实测耗时
+#: + 当前已耗时下界，夹到 [5,30]）。这个常量是「拿不到动态值」时的兜底，
+#: 也是文案区间的上界来源。
+#:
+#: 为什么取 30 而不是 5（Lead 裁决，2026-10-21 实测）：
+#:   fit 耗时实测区间 6.06s（容器单核）/ 10.3s / 12.64s（争 CPU 时 40s+）/ 38.55s（最差）。
+#:   旧值 5 相对实测低估 2.6~7.7 倍 —— 用户照提示 5 秒后刷新仍是 503，
+#:   再刷还是 503。被消耗的是用户对披露的信任，而这正是本项目整轮在挣的东西。
+#:   30 = 常态上界之上、极端之下（20 不够，实测到过 38.55s）。
+_POPULARITY_RETRY_AFTER_SECONDS = 30
 
 
 @router.get("/api/portfolio/popularity")
@@ -274,18 +285,42 @@ def portfolio_popularity(
         # 理由：如果此刻正有拟合在跑，「预热中」就是当下最准确的原因；
         # 而 `unfitted_reason` 可能是上一次失败留下的历史值（例如先失败过
         # insufficient_data，之后预热重试又启动了）。
-        why = "warming" if POP.is_warming() else (out.get("unfitted_reason") or "unknown")
+        # ===== 原因判定优先级（从高到低）=====
+        #   ① 实时 is_warming()  —— 万一有人手动调了 `get_model()`，那是真在拟合
+        #   ② warming_disabled   —— 预热被配置关闭，本进程内**永远不会**就绪
+        #   ③ describe() 给的历史原因 —— warming / insufficient_data / fit_failed
+        #
+        # 为什么需要 ②：`LOTT_POPULARITY_WARMUP=0` 时，重试循环所在的
+        # `_popularity_warmup()` 整段被同一开关门控、请求路径又不自 fit
+        # ⇒ 模型永不就绪。此时若还说「稍候会自动重试」就是**假承诺**：
+        # 用户会一直刷新一件永远不回来的事。
+        # 注意 ① 必须高于 ②：预热关了但有人手动在拟合时，说「正在拟合」是真的。
+        _live_warming = POP.is_warming()
+        if _live_warming:
+            why = "warming"
+        else:
+            why = out.get("unfitted_reason") or "unknown"
+            if why in ("warming", "unknown") and not POP.warmup_enabled():
+                why = "warming_disabled"
 
         if why == "warming":
+            # **动态**估值（Lead 裁决）：基于上次实测 fit 耗时，夹到 [5,30]。
+            # 写死 5s 在慢负载下会让用户反复撞 503；写死 20s 在快机器上让用户白等。
+            retry_after = POP.suggest_retry_after()
+            # ===== 文案不插值（Product 指出的坑）=====
+            #
+            # 旧写法 `"...约 %d 秒后自动可用" % retry_after` 会把**点值**印给用户，
+            # 而真实区间是 6~40s —— 等于把「点值」又写死了一遍，白改。
+            # 现在：**文案给人（给区间），字段给机器（给保守上界）**，两件事分开。
+            # 将来调常量不会牵动文案，也就不会再出现「文案说 30、实际 38」这种漂移。
             return JSONResponse(
                 {"ok": False,
                  "reason": "model_warming",
                  "unfitted_reason": "warming",
-                 "retry_after": _POPULARITY_RETRY_AFTER_SECONDS,
-                 "error": ("模型未就绪：正在拟合，约 %d 秒后自动可用（稍后刷新即可）"
-                           % _POPULARITY_RETRY_AFTER_SECONDS)},
+                 "retry_after": retry_after,
+                 "error": "模型未就绪：正在拟合（通常 10~30 秒），稍后刷新即可"},
                 status_code=503,
-                headers={"Retry-After": str(_POPULARITY_RETRY_AFTER_SECONDS)})
+                headers={"Retry-After": str(retry_after)})
 
         if why == "insufficient_data":
             return JSONResponse(
@@ -297,11 +332,48 @@ def portfolio_popularity(
                            "开奖），当前无法给出档位")},
                 status_code=503)
 
+        if why == "warming_disabled":
+            # `retry_after: null` 是这条的重点：告诉前端「别等了」，
+            # 而不是给一个假的 5 秒让用户反复刷新。
+            return JSONResponse(
+                {"ok": False,
+                 # `reason` 直接给**细分值**：它是契约里最显眼的字段，
+                 # 第三方调用方会只读它。给笼统的 model_not_ready 会让读者分叉错
+                 # （Product 核 P3 时第一眼看的就是 reason）。
+                 "reason": "warming_disabled",
+                 # 兼容别名（下一版可删）：保留给已按旧契约写的调用方。
+                 "unfitted_reason": "warming_disabled",
+                 "retry_after": None,
+                 "error": ("模型未就绪：后台预热已被配置关闭"
+                           "（LOTT_POPULARITY_WARMUP=0），本进程内不会自动就绪")},
+                status_code=503)
+
+        if why == "retry_exhausted":
+            # ===== 第三种「假承诺」（2026-10-21 实测确认）=====
+            #
+            # 预热循环 `for attempt in range(1, 11)` 跑完就退出；
+            # 但 `_LAST_UNFIT_REASON` 仍是 `fit_failed`，旧代码据此给出
+            # `retry_after=30` + 「稍候会自动重试」—— **而不会再有任何重试**。
+            # 用户会一直刷新一件永远不回来的事。
+            #
+            # 所以：`retry_after: null` + 明确说「已重试 N 次仍失败」。
+            return JSONResponse(
+                {"ok": False,
+                 "reason": "retry_exhausted",
+                 "unfitted_reason": "retry_exhausted",
+                 "retry_after": None,
+                 "error": ("模型未就绪：已自动重试多次仍失败，"
+                           "本进程内不会再自动重试（需检查日志或重启服务）")},
+                status_code=503)
+
         # fit_failed / unknown：模型未就绪但不是数据问题也不是预热 —— 需看日志。
         # 文案保留「未就绪 / 未拟合」字样，便于通用降级提示匹配。
         return JSONResponse(
             {"ok": False,
-             "reason": "model_not_ready",
+             # 兜底分支：`why` 可能是 fit_failed（细分、有信息量）或 unknown（无信息量）。
+             # 原先一律写成笼统的 model_not_ready，导致「机器读的主字段比人读的字段更粗」。
+             # 现在：有细分值就给细分值；`unknown` 本身对调用方无意义，回落到 model_not_ready。
+             "reason": ("model_not_ready" if why == "unknown" else why),
              "unfitted_reason": why,
              "retry_after": _POPULARITY_RETRY_AFTER_SECONDS,
              "error": "模型未就绪（拟合未完成或失败），稍候会自动重试"},

@@ -286,6 +286,33 @@ def probe_static() -> None:
     check("starsFor(" not in _strip_js_comments(src),
           "app.js 无 starsFor() 调用（已删净）")
 
+    print("[11] 粗/细两级并存字段不得用 `||` 读（Product 2026-10-21 的通用形态）")
+    # ## 这个 bug 的形状
+    #
+    # 后端 `reason`（粗分类）与 `unfitted_reason`（细分原因）是**并存**的两级字段。
+    # 用 `pl.reason || pl.unfitted_reason` 去读，表达的是「前者缺失才用后者」——
+    # 但实际语义是「前者是粗的、后者是细的，两者都在」。
+    # 于是只要 `reason` 有值（哪怕是笼统的 `model_not_ready`），
+    # 更具体的 `unfitted_reason` 就**永远读不到**，前端把「部署配置关闭」
+    # 误报成「临时未就绪」。
+    #
+    # 正确写法：`filter(Boolean)` 后全查。
+    # 这条守卫抓的是**形态**而不是某一行：凡出现 `X || Y` 且 X/Y 都是
+    # 后端分层字段名（reason/unfitted_reason 一类），即判违规。
+    degrade = _strip_js_comments(_function_source(src, "_degradeNote"))
+    check("filter(Boolean)" in degrade,
+          "_degradeNote 用 filter(Boolean) 收集分层字段（不是 ||）")
+    # 反向断言：不得再用 `reason || unfitted_reason` 这种短路读法
+    bad_pattern = re.compile(
+        r"pl\.reason\s*\|\|\s*pl\.unfitted_reason|"
+        r"pl\.unfitted_reason\s*\|\|\s*pl\.reason")
+    check(bad_pattern.search(degrade) is None,
+          "不存在 `reason || unfitted_reason` 短路读法")
+    # 三类原因必须都被识别
+    for key in ("model_warming", "warming", "insufficient_data",
+                "warmup_disabled", "warming_disabled"):
+        check(key in degrade, f"_degradeNote 识别原因 {key}")
+
     print("[10] D3 首屏卡契约：实时拉取 + 同响应 + 算术闭合")
     check("fillHonestBounds" in src, "app.js 存在 fillHonestBounds")
     check("markHonestBoundsStale" in src, "app.js 存在 markHonestBoundsStale 降级标记")
@@ -388,11 +415,27 @@ def probe_render() -> int:
     )
 
     n = 10
+
+    def _as_dict(resp):
+        """路由处理函数可能返回 dict，也可能返回 `JSONResponse`（503 等降级分支）。
+
+        **不处理它会崩在 json.dumps(JSONResponse)** —— 实测过：模型在本进程内
+        未就绪时，popularity 路由返回 JSONResponse，探针直接 `TypeError`。
+        这里解出 JSONResponse 的 body 再解析，两种形态统一成 dict。
+        """
+        if isinstance(resp, dict):
+            return resp
+        body = getattr(resp, "body", None)
+        if body:
+            try:
+                return json.loads(body.decode("utf-8") if isinstance(body, bytes) else body)
+            except Exception:
+                pass
+        return {"ok": False, "error": "无法解析路由返回值: %r" % type(resp).__name__}
+
     fixture = {
-        "bc": json.loads(json.dumps(
-            portfolio_blue_coverage(n_tickets=n, full_ev=True), default=str)),
-        "pop": json.loads(json.dumps(
-            portfolio_popularity(reds="1,2,3,4,5,6", sales=0.0), default=str)),
+        "bc": _as_dict(portfolio_blue_coverage(n_tickets=n, full_ev=True)),
+        "pop": _as_dict(portfolio_popularity(reds="1,2,3,4,5,6", sales=0.0)),
     }
     print("\n[render] 用真实后端响应喂渲染函数（n_tickets=%d）" % n)
 
@@ -510,6 +553,19 @@ def probe_render() -> int:
               f"n={_n}: increases_expected_return is False")
 
     # --- 标准 2：偏好度只给档位 ---
+    # 模型可能在本进程未就绪（端点返回 503 + reason=model_warming）。
+    # 那种情况不是「渲染 bug」，而是「没有数据可渲染」——
+    # 必须显式区分，否则探针会在 KeyError 上崩掉，看起来像代码错误。
+    if not pop.get("tier"):
+        print("  ⚠ 后端在本进程内未就绪（reason=%r），跳过档位渲染断言。"
+              % (pop.get("reason") or pop.get("unfitted_reason")))
+        print("    这是数据未就绪，不是渲染缺陷；档位渲染已由浏览器探针在热态验证。")
+        check(pop.get("ok") is False or bool(pop.get("error")),
+              "未就绪时后端返回结构化降级信息（非空 200）",
+              str(pop)[:120])
+        # 仍须保证：降级态下渲染出的 HTML 不得出现任何注数
+        check(not re.search(r"\d+\s*注", pop_html), "降级态偏好度 HTML 无「N 注」")
+        return 0
     check("v14-tier" in pop_html, "偏好度渲染出档位徽标")
     check('data-tier="%s"' % pop["tier"] in pop_html,
           f"档位值 data-tier={pop['tier']} 出现在 HTML 里")

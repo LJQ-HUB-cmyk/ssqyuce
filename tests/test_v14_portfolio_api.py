@@ -55,6 +55,51 @@ from lottery import routes_portfolio as R
 # 公共工具
 # ==========================================================================
 
+@pytest.fixture(autouse=True)
+def _isolate_popularity_state():
+    """**每个用例前后重置 popularity 的进程级状态**。
+
+    ## 为什么必须（Product/刘工报的真实缺陷）
+
+    这些是**模块级全局**：`_CACHE` / `_WARMING` / `_READY` / `_LAST_UNFIT_REASON` /
+    `_LAST_FIT_SECONDS` / `_LAST_WARMUP_SECONDS` / `_FIT_STARTED_AT` / `_RETRY_EXHAUSTED`。
+
+    后果实测：`test_popularity_503_reason_warming_when_fitting` **单跑 passed、
+    全量 failed** —— 因为前面的用例把 `_WARMING` 留成 set，后面的用例读到脏状态。
+
+    这表现为「假红」，但根因是真的：**测试之间没有隔离进程级状态**。
+    而且不隔离还会让动态 `retry_after` 跨用例串值（`_LAST_FIT_SECONDS` 残留），
+    让新加的守卫变得不可信。**假红与真红共用同一根因时，先修根因。**
+    """
+    from lottery import popularity as POP
+
+    saved = {
+        "_CACHE": POP._CACHE,
+        "_LAST_UNFIT_REASON": POP._LAST_UNFIT_REASON,
+        "_LAST_FIT_SECONDS": POP._LAST_FIT_SECONDS,
+        "_LAST_WARMUP_SECONDS": POP._LAST_WARMUP_SECONDS,
+        "_FIT_STARTED_AT": POP._FIT_STARTED_AT,
+        "_RETRY_EXHAUSTED": POP._RETRY_EXHAUSTED,
+    }
+    # 前置：干净状态
+    POP._CACHE = None
+    POP._WARMING.clear()
+    POP._READY.clear()
+    POP._LAST_UNFIT_REASON = "unknown"
+    POP._LAST_FIT_SECONDS = None
+    POP._LAST_WARMUP_SECONDS = None
+    POP._FIT_STARTED_AT = None
+    POP._RETRY_EXHAUSTED = False
+    try:
+        yield
+    finally:
+        # 后置：还原（不污染其它测试文件）
+        POP._WARMING.clear()
+        POP._READY.clear()
+        for k, v in saved.items():
+            setattr(POP, k, v)
+
+
 def _status(resp) -> int:
     """路由函数返回 dict（成功）或 JSONResponse（失败）时的状态码。"""
     if isinstance(resp, JSONResponse):
@@ -216,7 +261,13 @@ def test_popularity_unfitted_returns_503(unfitted_popularity):
     # 2026-10-21：文案已按原因分叉（见「十三」节）。
     # 这条用例只断言「返回一个非空的、能区分原因的错误」，
     # 具体分支的正确性由 test_popularity_503_reason_* 覆盖。
-    assert body.get("reason") in ("model_warming", "insufficient_data")
+    # 三个合法原因分支：
+    #   warming          预热/重试正在拟合
+    #   insufficient_data 真样本不足（<300 期）
+    #   model_not_ready  从未尝试过拟合（例如本测试环境无预热线程）
+    assert body.get("reason") in ("model_warming", "insufficient_data",
+                                  "model_not_ready"), body.get("reason")
+    assert body.get("unfitted_reason"), "必须给出可机器判定的具体原因"
     assert body["error"]
 
 
@@ -891,12 +942,18 @@ def test_popularity_503_reason_warming_when_fitting(monkeypatch):
     assert _status(resp) == 503
     body = _json(resp)
     assert body["reason"] == "model_warming"
-    assert body["retry_after"] == R._POPULARITY_RETRY_AFTER_SECONDS
+    # `retry_after` 现在是**动态估值**（见「十五/十六」节），不再是固定常量；
+    # 这里只断言它落在合法区间内，具体取值由 suggest_retry_after 的测试覆盖。
+    assert isinstance(body["retry_after"], int)
+    assert 5 <= body["retry_after"] <= 30
     # 文案必须同时给出「未就绪」这个可辨识前缀 与 「几秒后可用」的行动指引
     assert "未就绪" in body["error"], "缺少可辨识的「未就绪」前缀（D-03 降级可辨识要求）"
-    assert "拟合" in body["error"] and "秒" in body["error"]
+    assert "拟合" in body["error"]
+    # 2026-10-21：文案改为给区间（不插点值），见「十六」节。
+    assert "10~30" in body["error"], f"应给区间而非点值：{body['error']}"
     # HTTP 头也要带，前端/代理才能按标准处理
-    assert resp.headers.get("Retry-After") == str(R._POPULARITY_RETRY_AFTER_SECONDS)
+    # HTTP 头必须与 body 字段一致（动态值，不是常量）
+    assert resp.headers.get("Retry-After") == str(body["retry_after"])
 
 
 def test_popularity_503_reason_insufficient_when_not_warming(monkeypatch):
@@ -904,8 +961,12 @@ def test_popularity_503_reason_insufficient_when_not_warming(monkeypatch):
     from lottery import popularity as POP
 
     P_unfitted = POP.PopularityModel()
-    monkeypatch.setattr(POP, "get_model_with_deadline", lambda timeout=None: P_unfitted)
+    monkeypatch.setattr(POP, "get_model_for_request",
+                        lambda timeout=None: P_unfitted)
     monkeypatch.setattr(POP, "is_warming", lambda: False)
+    monkeypatch.setattr(POP, "warmup_enabled", lambda: True)
+    # 显式模拟「真的样本不足」：`fit()` 返回 ok=False 时会把该原因记到模块级
+    monkeypatch.setattr(POP, "_LAST_UNFIT_REASON", "insufficient_data", raising=False)
 
     resp = R.portfolio_popularity(reds="1,2,3,4,5,6", sales=0.0)
     assert _status(resp) == 503
@@ -947,3 +1008,419 @@ def test_is_warming_cleared_even_if_fit_raises(monkeypatch):
     m = POP.get_model()          # 不抛
     assert m.fitted is False
     assert POP.is_warming() is False, "fit 抛异常后 _WARMING 未清除 —— 会永久误报「预热中」"
+
+
+# ==========================================================================
+# 十四、第四档原因：预热被配置关闭（`warming_disabled`）
+#
+# 缺陷背景：`LOTT_POPULARITY_WARMUP=0` 时，重试循环所在的 `_popularity_warmup()`
+# 整段被同一开关门控、请求路径又不自 fit ⇒ **模型永不就绪**。
+# 此时端点若还说「稍候会自动重试」，就是一个假承诺：用户会一直刷新一
+# 件永远不回来的事。而且 `retry_after=5` 会让前端每 5 秒重试一次，永远失败。
+# ==========================================================================
+
+def test_warming_disabled_returns_no_retry_hint(monkeypatch):
+    """预热被关闭 → `warming_disabled` + **`retry_after is None`**。"""
+    from lottery import popularity as POP
+
+    monkeypatch.setattr(POP, "warmup_enabled", lambda: False)
+    monkeypatch.setattr(POP, "is_warming", lambda: False)
+    monkeypatch.setattr(POP, "get_model_for_request",
+                        lambda timeout=None: POP.PopularityModel())
+    monkeypatch.setattr(POP, "_LAST_UNFIT_REASON", "unknown", raising=False)
+
+    resp = R.portfolio_popularity(reds="1,2,3,4,5,6", sales=0.0)
+    assert _status(resp) == 503
+    body = _json(resp)
+    assert body["unfitted_reason"] == "warming_disabled"
+    assert body["retry_after"] is None, (
+        "预热已关闭却给了 retry_after —— 前端会每 N 秒重试一件永远不成功的事")
+    assert resp.headers.get("Retry-After") is None
+    assert "LOTT_POPULARITY_WARMUP" in body["error"], "必须告诉用户是配置关闭"
+    assert "不会自动就绪" in body["error"], "必须明确「本进程内不会好」，而非「稍候」"
+
+
+def test_live_warming_outranks_warming_disabled(monkeypatch):
+    """**优先级守卫**：实时 `is_warming()` 必须高于「预热已关闭」。
+
+    即使开关关闭，若有人手动调了 `get_model()`（真在拟合），
+    说「正在拟合」才是真的；说「不会自动就绪」反而是错的。
+    """
+    from lottery import popularity as POP
+
+    monkeypatch.setattr(POP, "warmup_enabled", lambda: False)
+    monkeypatch.setattr(POP, "is_warming", lambda: True)
+    monkeypatch.setattr(POP, "get_model_for_request",
+                        lambda timeout=None: POP.PopularityModel())
+
+    body = _json(R.portfolio_popularity(reds="1,2,3,4,5,6", sales=0.0))
+    assert body["unfitted_reason"] == "warming"
+    assert body["retry_after"] is not None
+
+
+def test_warmup_enabled_is_single_source_of_truth(monkeypatch):
+    """`popularity.warmup_enabled()` 必须是唯一判定处，且读的是同一个环境变量。
+
+    两处（api_app 起线程 / 端点选文案）各读一次 env 会漂移 —— 本项目老毛病。
+    """
+    from lottery import popularity as POP
+
+    monkeypatch.setenv("LOTT_POPULARITY_WARMUP", "0")
+    assert POP.warmup_enabled() is False
+    monkeypatch.setenv("LOTT_POPULARITY_WARMUP", "1")
+    assert POP.warmup_enabled() is True
+    monkeypatch.delenv("LOTT_POPULARITY_WARMUP", raising=False)
+    assert POP.warmup_enabled() is True, "未配置时应默认启用（好默认）"
+
+
+def test_api_app_uses_the_shared_predicate():
+    """`api_app` 不得自己再解析一次环境变量（必须委托给 popularity）。"""
+    import inspect
+
+    from lottery import api_app
+
+    src = inspect.getsource(api_app)
+    # 允许注释里提到变量名，但不允许出现 os.environ 直读的比较表达式
+    offending = [ln for ln in src.splitlines()
+                 if "os.environ" in ln and "LOTT_POPULARITY_WARMUP" in ln
+                 and not ln.strip().startswith("#")]
+    assert not offending, (
+        f"api_app 里仍有直接解析 LOTT_POPULARITY_WARMUP 的代码：{offending}\n"
+        f"应统一调用 popularity.warmup_enabled()")
+
+
+# ==========================================================================
+# 十五、`retry_after` 动态化（Lead 裁决，2026-10-21）
+#
+# 缺陷背景：`retry_after` 写死 5。而实测 fit 耗时随负载在 5.5s~21s 浮动
+# （本机空闲 5.49s / 容器单核 6.06s / load 4 时 8.35s / load 12 时 21s）。
+# 写死 5 的后果：用户照提示 5 秒后刷新仍 503，再刷还是 503 ——
+# **被消耗的是用户对披露的信任**，而这正是本项目整轮在挣的东西。
+#
+# 反方向也不行：写死 20 在快机器上让用户白等 15 秒。
+# 所以用「上次实测耗时 + 当前已耗时下界」动态估，夹到 [5, 30]。
+# ==========================================================================
+
+def test_retry_after_uses_last_measured_fit_time(monkeypatch):
+    """有历史耗时时，`retry_after` 必须跟随它（不是固定 5）。"""
+    from lottery import popularity as POP
+
+    monkeypatch.setattr(POP, "_LAST_FIT_SECONDS", 18.0)
+    monkeypatch.setattr(POP, "_FIT_STARTED_AT", None)
+    assert POP.suggest_retry_after() == 18
+
+
+def test_retry_after_clamped_to_bounds(monkeypatch):
+    """必须夹在 [5, 30]：太快频繁轮询，太慢机器也不能给出荒谬等待。"""
+    from lottery import popularity as POP
+
+    monkeypatch.setattr(POP, "_FIT_STARTED_AT", None)
+    monkeypatch.setattr(POP, "_LAST_FIT_SECONDS", 1.0)
+    assert POP.suggest_retry_after() == 5, "过快的历史耗时应收敛到下限 5"
+    monkeypatch.setattr(POP, "_LAST_FIT_SECONDS", 120.0)
+    assert POP.suggest_retry_after() == 30, "异常慢应夹到上限 30"
+
+
+def test_retry_after_never_shorter_than_elapsed(monkeypatch):
+    """**核心守卫**：已耗时是下界。
+
+    如果这次 fit 已经跑了 20 秒，那「5 秒后就好」必然是**又一个假承诺**。
+    变异捕捉：去掉 `elapsed + 1.0` 的下界 ⇒ 本用例红。
+    """
+    import time as _t
+
+    from lottery import popularity as POP
+
+    monkeypatch.setattr(POP, "_LAST_FIT_SECONDS", 6.0)   # 上次很快
+    monkeypatch.setattr(POP, "_FIT_STARTED_AT", _t.time() - 20.0)  # 这次已跑了 20s
+    assert POP.suggest_retry_after() == 21, (
+        "已跑 20s 却给出 ≤6s 的估计 —— 又是假承诺")
+
+
+def test_retry_after_initial_when_no_history(monkeypatch):
+    """首次（无历史耗时、无已耗时）用保守值 10，而不是乐观的 5。"""
+    from lottery import popularity as POP
+
+    monkeypatch.setattr(POP, "_LAST_FIT_SECONDS", None)
+    monkeypatch.setattr(POP, "_FIT_STARTED_AT", None)
+    assert POP.suggest_retry_after() == POP._RETRY_AFTER_INITIAL == 10
+
+
+def test_warming_response_carries_dynamic_retry_after(monkeypatch):
+    """端点的 `retry_after` 与 HTTP 头必须一致且来自动态估值。"""
+    from lottery import popularity as POP
+
+    monkeypatch.setattr(POP, "is_warming", lambda: True)
+    monkeypatch.setattr(POP, "get_model_for_request",
+                        lambda timeout=None: POP.PopularityModel())
+    monkeypatch.setattr(POP, "suggest_retry_after", lambda: 17)
+
+    resp = R.portfolio_popularity(reds="1,2,3,4,5,6", sales=0.0)
+    body = _json(resp)
+    assert body["retry_after"] == 17
+    assert resp.headers.get("Retry-After") == "17"
+    # 文案给**区间**，不含点值（Product 指出的坑：插值等于把点值写死一遍）
+    assert "10~30" in body["error"]
+    assert "17 秒" not in body["error"], "文案不应出现动态点值"
+
+
+# ==========================================================================
+# 十六、`retry_after` 与实测预热的**比例一致性**（可证伪守卫）
+#
+# 为什么用比例而不是绝对值（Product 设计，Lead 采纳）：
+#   fit 耗时随负载在 6~40s 间浮动。
+#   · 写死 `assert retry_after == 30` → 慢机上「通过但没意义」，快机上「无谓失败」；
+#   · 比例断言让两个量同步变化 —— 机器快，实测降，判据仍成立；
+#   · 上限 4 倍防的是「写死一个巨大数字让用户白等」（例如改成 300）——
+#     那种改法在只看下限的测试里永远通过。
+#
+# ⚠️ 本组测的是**一致性**（承诺与近期实测是否同量级），不是**准确性**
+#    （这一轮到底多久会好）。`last_warmup_seconds()` 是「上次」的值。
+# ==========================================================================
+
+def test_retry_after_consistent_with_last_warmup(monkeypatch):
+    """承诺的重试间隔必须与实测预热耗时同量级（1x ~ 4x）。"""
+    from lottery import popularity as POP
+
+    measured = 12.64          # 实测代表性值（争 CPU 场景）
+    monkeypatch.setattr(POP, "_LAST_WARMUP_SECONDS", measured)
+    monkeypatch.setattr(POP, "_FIT_STARTED_AT", None)
+
+    ra = POP.suggest_retry_after()
+    # 必须分两支：`suggest_retry_after()` 有 MAX 钳位，
+    # 当实测超过 MAX 时 `ra == MAX < measured` 是**正确行为**（已尽力，无法承诺更久），
+    # 若无条件断言 `ra >= measured`，慢机上必然误红。
+    if measured <= POP._RETRY_AFTER_MAX:
+        assert ra >= 1.0 * measured, (
+            f"retry_after={ra} 小于实测 {measured}s —— 用户照提示刷新会落空")
+    else:
+        assert ra == POP._RETRY_AFTER_MAX, (
+            f"实测 {measured}s 超过上限时，应钳到 {POP._RETRY_AFTER_MAX}（已尽力）")
+    assert ra <= 4.0 * measured, (
+        f"retry_after={ra} 远大于实测 {measured}s —— 用户白等")
+
+
+def test_retry_after_caps_when_measured_exceeds_max(monkeypatch):
+    """**慢机专用用例**：实测 > MAX 时必须钳到 MAX，而不是承诺一个更大的数。
+
+    这条把慢机行为锁死，避免"比例断言在触顶时误红"这个问题在 CI 上偶发。
+    """
+    from lottery import popularity as POP
+
+    monkeypatch.setattr(POP, "_FIT_STARTED_AT", None)
+    monkeypatch.setattr(POP, "_LAST_WARMUP_SECONDS", POP._RETRY_AFTER_MAX * 2)
+    assert POP.suggest_retry_after() == POP._RETRY_AFTER_MAX
+
+
+def test_retry_after_not_absurdly_large(monkeypatch):
+    """**防「写死巨大值」**：即使实测很慢，也不得给出荒谬等待（上限 30）。"""
+    from lottery import popularity as POP
+
+    monkeypatch.setattr(POP, "_LAST_WARMUP_SECONDS", 200.0)
+    monkeypatch.setattr(POP, "_FIT_STARTED_AT", None)
+    assert POP.suggest_retry_after() == POP._RETRY_AFTER_MAX == 30
+
+
+def test_fallback_constant_matches_documented_range():
+    """兜底常量必须是 30（文案「10~30 秒」的上界来源）。
+
+    变异捕捉：把常量改回 5 ⇒ 文案区间与实际承诺不符 ⇒ 红。
+    """
+    from lottery import popularity as POP
+
+    assert R._POPULARITY_RETRY_AFTER_SECONDS == 30
+    assert POP._RETRY_AFTER_MAX == R._POPULARITY_RETRY_AFTER_SECONDS, (
+        "动态估值的上限必须与端点兜底常量一致，否则文案区间会骗人")
+
+
+def test_warming_copy_has_no_point_value(monkeypatch):
+    """**文案不得出现点值**（Product 指出的坑）。
+
+    旧写法 `"...约 %d 秒后自动可用" % retry_after` 会把点值印给用户，
+    而真实区间是 6~40s —— 等于把「点值」又写死了一遍，白改。
+    现在：文案给人（区间），字段给机器（保守上界）。
+    """
+    from lottery import popularity as POP
+
+    monkeypatch.setattr(POP, "is_warming", lambda: True)
+    monkeypatch.setattr(POP, "get_model_for_request",
+                        lambda timeout=None: POP.PopularityModel())
+    monkeypatch.setattr(POP, "suggest_retry_after", lambda: 30)
+
+    body = _json(R.portfolio_popularity(reds="1,2,3,4,5,6", sales=0.0))
+    err = body["error"]
+    assert "10~30" in err, f"文案应给区间，实际：{err}"
+    for point in ("约 30 秒", "约 5 秒", "约 20 秒"):
+        assert point not in err, f"文案出现了点值「{point}」：{err}"
+    # 但机器字段仍要给具体值
+    assert body["retry_after"] == 30
+
+
+def test_retry_after_reflects_warmup_not_only_fit(monkeypatch):
+    """预热端到端耗时（含 numpy 导入）优先于单次 fit 耗时 —— 更贴近用户真实等待。"""
+    from lottery import popularity as POP
+
+    monkeypatch.setattr(POP, "_FIT_STARTED_AT", None)
+    monkeypatch.setattr(POP, "_LAST_FIT_SECONDS", 6.0)
+    monkeypatch.setattr(POP, "_LAST_WARMUP_SECONDS", 12.6)
+    assert POP.suggest_retry_after() == 13, (
+        "应参考预热端到端耗时（更接近用户等待），而不是只看 fit 本身")
+
+
+# ==========================================================================
+# 十七、503 的 `reason` 必须**自解释**（Product/刘工报的契约问题）
+#
+# 缺陷：`reason: "model_not_ready"` 比它旁边的 `unfitted_reason` 更粗。
+# 后果：任何第三方调用方读 `reason`（契约里最显眼的字段）会**分叉错**。
+# 这与 D-07「一个 usable 两个意思」同族：不是数值错，是**分层错位**。
+# 改法：`reason` 直接给细分值；`unfitted_reason` 降为兼容别名。
+# ==========================================================================
+
+_ALL_503_REASONS = (
+    "model_warming",
+    "insufficient_data",
+    "warming_disabled",
+    "retry_exhausted",
+    "fit_failed",
+)
+
+
+def test_every_503_reason_is_self_explanatory(monkeypatch):
+    """**核心守卫**：任何 503 的 `reason` 都不得是笼统的 `model_not_ready`。
+
+    遍历所有可到达的未就绪原因，逐个触发端点，断言 `reason` 是细分值。
+    变异捕捉：把任一分支改回 `model_not_ready` ⇒ 本用例红。
+    """
+    from lottery import popularity as POP
+
+    checked = []
+    for reason in _ALL_503_REASONS:
+        monkeypatch.setattr(POP, "get_model_for_request",
+                            lambda timeout=None: POP.PopularityModel())
+        monkeypatch.setattr(POP, "is_warming", lambda: False)
+        monkeypatch.setattr(POP, "warmup_enabled", lambda: True)
+        monkeypatch.setattr(POP, "_LAST_UNFIT_REASON", reason, raising=False)
+        monkeypatch.setattr(POP, "_RETRY_EXHAUSTED", reason == "retry_exhausted",
+                            raising=False)
+
+        body = _json(R.portfolio_popularity(reds="1,2,3,4,5,6", sales=0.0))
+        checked.append((reason, body["reason"]))
+        assert body["reason"] != "model_not_ready", (
+            f"未就绪原因 {reason} 的 503 仍返回笼统的 model_not_ready —— "
+            f"第三方调用方只读 reason 会分叉错")
+        assert body["reason"] == reason, (
+            f"reason 应为 {reason}，实际 {body['reason']}")
+
+    assert len(checked) == len(_ALL_503_REASONS)
+
+
+def test_warming_disabled_reason_is_self_explanatory(monkeypatch):
+    """单点验证 Product 点出的那一条：`warming_disabled` 分支的 reason。"""
+    from lottery import popularity as POP
+
+    monkeypatch.setattr(POP, "get_model_for_request",
+                        lambda timeout=None: POP.PopularityModel())
+    monkeypatch.setattr(POP, "is_warming", lambda: False)
+    monkeypatch.setattr(POP, "warmup_enabled", lambda: False)
+    monkeypatch.setattr(POP, "_LAST_UNFIT_REASON", "unknown", raising=False)
+
+    body = _json(R.portfolio_popularity(reds="1,2,3,4,5,6", sales=0.0))
+    assert body["reason"] == "warming_disabled"
+    assert body["unfitted_reason"] == "warming_disabled", "兼容别名应保留"
+    assert body["retry_after"] is None
+
+
+# ==========================================================================
+# 十八、重试耗尽（第三种「假承诺」）
+#
+# 预热循环 `for attempt in range(1, 11)` 跑完就退出，但 `_LAST_UNFIT_REASON`
+# 仍是 `fit_failed` ⇒ 旧代码给出 `retry_after=30` + 「稍候会自动重试」，
+# 而**不会再有任何重试**。用户会一直刷新一件永远不回来的事。
+# ==========================================================================
+
+def test_retry_exhausted_returns_null_retry_after(monkeypatch):
+    """重试耗尽 → `reason="retry_exhausted"` + `retry_after is None`。"""
+    from lottery import popularity as POP
+
+    monkeypatch.setattr(POP, "get_model_for_request",
+                        lambda timeout=None: POP.PopularityModel())
+    monkeypatch.setattr(POP, "is_warming", lambda: False)
+    monkeypatch.setattr(POP, "warmup_enabled", lambda: True)
+    monkeypatch.setattr(POP, "_LAST_UNFIT_REASON", "fit_failed", raising=False)
+    POP.mark_retry_exhausted()
+
+    body = _json(R.portfolio_popularity(reds="1,2,3,4,5,6", sales=0.0))
+    assert body["reason"] == "retry_exhausted"
+    assert body["retry_after"] is None, (
+        "重试已耗尽却仍给 retry_after —— 这是第三种假承诺")
+    assert "不会再自动重试" in body["error"]
+
+
+def test_retry_exhausted_formatable_status(monkeypatch):
+    """`describe()` 在重试耗尽时必须把原因标出来（不只端点层判断）。"""
+    from lottery import popularity as POP
+
+    m = POP.PopularityModel()
+    m.fitted = False
+    POP._WARMING.clear()
+    POP.mark_retry_exhausted()
+    out = m.describe([1, 2, 3, 4, 5, 6])
+    assert out["ok"] is False
+    assert out["unfitted_reason"] == "retry_exhausted"
+
+
+def test_success_clears_exhausted_flag(monkeypatch):
+    """一旦拟合成功，「重试耗尽」结论必须作废（否则会永久误报）。"""
+    from lottery import popularity as POP
+
+    POP.mark_retry_exhausted()
+    assert POP.is_retry_exhausted() is True
+
+    draws = [{"reds": [1, 2, 3, 4, 5, 6], "p1": 5.0, "sales": 1e8}] * 400
+    monkeypatch.setattr("lottery.db.load_draws", lambda: draws)
+    POP._CACHE = None
+    m = POP.get_model()
+    assert m.fitted
+    assert POP.is_retry_exhausted() is False, "成功后必须清除耗尽标记"
+
+
+def test_retry_interval_is_configurable_and_distinct_from_retry_after():
+    """**两个量必须分开**（Lead 要求 ③）：后台重试间隔 ≠ 告诉用户的重试间隔。
+
+    它们业务含义无关（系统行为 vs 用户协议），换算出同一个数只是巧合。
+    本用例断言它们是**不同的符号**，防止将来有人「统一命名」时合并。
+    """
+    import os
+
+    from lottery import api_app
+
+    # 默认值
+    os.environ.pop("LOTT_POPULARITY_RETRY_INTERVAL", None)
+    assert api_app._popularity_retry_interval() == 30.0
+    # 可配（测试用）
+    os.environ["LOTT_POPULARITY_RETRY_INTERVAL"] = "0.1"
+    try:
+        assert api_app._popularity_retry_interval() == 0.1
+    finally:
+        os.environ.pop("LOTT_POPULARITY_RETRY_INTERVAL", None)
+
+    # 与端点的 retry_after 兜底常量是**两个独立符号**
+    assert api_app._popularity_retry_interval is not None
+    # 一个是 float 秒（后台），一个是 int 秒（用户协议）
+    assert isinstance(api_app._popularity_retry_interval(), float)
+    assert isinstance(R._POPULARITY_RETRY_AFTER_SECONDS, int)
+
+
+def test_max_attempts_is_configurable():
+    """重试次数可配（默认 10），供端到端快速验证。"""
+    import os
+
+    from lottery import api_app
+
+    os.environ.pop("LOTT_POPULARITY_MAX_ATTEMPTS", None)
+    assert api_app._popularity_max_attempts() == 10
+    os.environ["LOTT_POPULARITY_MAX_ATTEMPTS"] = "2"
+    try:
+        assert api_app._popularity_max_attempts() == 2
+    finally:
+        os.environ.pop("LOTT_POPULARITY_MAX_ATTEMPTS", None)
