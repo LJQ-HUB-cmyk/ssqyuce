@@ -1592,3 +1592,74 @@ def test_blue_coverage_sixth_ev_never_affected_by_full_ev_failure(monkeypatch):
     assert body["ev_ratio_sixth"] == pytest.approx(5 / 32, abs=1e-9)
     assert body["ev_sixth_yuan"] == pytest.approx(3.125, abs=1e-9)
     assert body["ok"] is True, "六等奖仍可用 ⇒ 整体仍应 200"
+
+
+# ==========================================================================
+# 二十一、D-17 同类自查：`capabilities` 的实测值读取失败也不许静默
+#
+# 自查方法（qi-delivery 建议、我执行的）：一次 grep + AST 扫"静默 except"，
+# 对每处问三问：① 能力受限还是故障？② 什么没坏写了吗？③ 前端拿得到吗？
+#
+# 结果发现 `_capability_items()` 里这处仍是静默：
+#     except Exception: _r2_now, _p_now = None, None
+# 后果：用户在 `popularity_rank` 的 evidence 里看到「模型未拟合，暂无实测」，
+# 却分不清是「模型本来就没拟合」（等更多期）还是「读取时崩了」（查日志）。
+# 这与 D-17 修的 `ev_ratio_full`、D-07 的 `usable` 两义同族。
+# ==========================================================================
+
+def test_capabilities_no_degraded_in_normal_path():
+    """**判据 4（不误报）**：正常路径 `degraded=False` 且 `degraded_items` 为空。"""
+    body = _json(R.portfolio_capabilities())
+    assert body["degraded"] is False
+    assert body["degraded_items"] == []
+    assert body["n_capabilities"] == 4, "降级不应影响能力项数目"
+
+
+def test_capabilities_reports_degraded_when_popularity_read_fails(monkeypatch):
+    """实测值读取失败 → 必须进 `degraded_items`，三段齐全且具体。"""
+    from lottery import popularity as POP
+
+    monkeypatch.setattr(POP, "get_model",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("模型读取崩溃")))
+
+    body = _json(R.portfolio_capabilities())
+    assert body["degraded"] is True
+    items = body["degraded_items"]
+    assert len(items) == 1
+    item = items[0]
+    assert item["id"] == "popularity_measured"
+    assert "读取失败" in item["reason"]
+    assert "RuntimeError" in item["reason"]
+    # 必须说明**什么没坏** —— 否则用户以为整个能力清单不可信
+    assert "文档记录值" in item["reason"]
+    assert "不受影响" in item["reason"]
+    # how_to_restore 要可执行
+    assert "get_model" in item["how_to_restore"]
+    assert "联系管理员" not in item["how_to_restore"]
+
+
+def test_capabilities_keeps_documented_value_when_measured_fails(monkeypatch):
+    """降级只影响「实测值」，文档记录值仍必须给出（降级范围要精确）。"""
+    from lottery import popularity as POP
+
+    monkeypatch.setattr(POP, "get_model",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
+    body = _json(R.portfolio_capabilities())
+    cap = next(c for c in body["capabilities"] if c["id"] == "popularity_rank")
+    documented = [e for e in cap["evidence"] if not e.get("measured_now")]
+    assert documented, "文档记录值被降级连带删掉了 —— 降级范围过大"
+    joined = "\n".join(e["value"] for e in documented)
+    assert "0.0077" in joined or "0.77" in joined
+
+
+def test_capabilities_measured_marked_unavailable_on_failure(monkeypatch):
+    """失败时「实测值」那条 evidence 的 value 应显示不可用，而不是静默留空。"""
+    from lottery import popularity as POP
+
+    monkeypatch.setattr(POP, "get_model",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
+    body = _json(R.portfolio_capabilities())
+    cap = next(c for c in body["capabilities"] if c["id"] == "popularity_rank")
+    measured = [e for e in cap["evidence"] if e.get("measured_now")]
+    assert measured, "实测值那条 evidence 不应整条消失"
+    assert measured[0]["value"], "实测值 evidence 的 value 不应为空"

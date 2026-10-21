@@ -190,15 +190,15 @@ def test_scheduler_hook_exists_in_source(isolated_env):
     #   （假绿：删真实调用、只在注释留名仍通过；假红：注释里提到名字就误报）。
     # 改用 `code_text()`：剥 docstring + 注释，只留纯代码文本，行序与源码一致。
     from _source_assert import code_text
-    src = code_text(api_app._scheduler_step)
-    assert "prereg_scheduler" in src, (
+    code = code_text(api_app._scheduler_step)
+    assert "prereg_scheduler" in code, (
         "_scheduler_step 里找不到 prereg_scheduler —— 前置注册写入接线被删了")
-    assert "register_scan_candidates" in src
+    assert "register_scan_candidates" in code
     # 顺序断言：下面这句注释里说「第一次写成 src.index('evaluate_prereg') 命中了注释」——
     # **现在 src 已不含注释**，所以这个坑从根上消失了；但顺序断言本身仍有价值：
     # 它要求"写入调用"出现在"评估调用"之前。
-    i_write = src.index("register_scan_candidates(")
-    i_eval = src.index("hypothesis.evaluate_prereg(")
+    i_write = code.index("register_scan_candidates(")
+    i_eval = code.index("hypothesis.evaluate_prereg(")
     assert i_write < i_eval, (
         "写入必须在 evaluate_prereg 之前，否则本期候选要等下一期才进系统")
 

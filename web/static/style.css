@@ -832,3 +832,23 @@ footer { color: var(--muted); font-size: 12px; text-align: center; margin-top: 2
   border-style: dashed; border-color: var(--gold); color: var(--gold);
   font-weight: 600;
 }
+
+/* ===== 部分口径降级提示（D-17）=====
+   设计意图：这是「能力受限」，不是「故障」，所以用中性琥珀而非红色。
+   但**不能太弱**——它必须让用户明确知道"这个数本次不存在，不是本来就没有"。
+   与 .v10-honesty（披露）区分开：披露是「一直如此」，降级是「这次除外」。 */
+.v14-degraded {
+  margin: 8px 0; padding: 9px 11px; border-radius: 8px;
+  border: 1px solid var(--gold); border-left: 3px solid var(--gold);
+  background: rgba(212, 175, 55, .10);
+}
+.v14-degraded-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; }
+.v14-degraded-head b { color: var(--gold); font-size: 12px; }
+.v14-degraded-sub { font-size: 10.5px; color: var(--muted); }
+.v14-degraded-list { margin: 6px 0 0; padding-left: 18px; font-size: 11.5px; line-height: 1.65; }
+.v14-degraded-list li { color: var(--text); }
+.v14-degraded-fix {
+  margin-top: 7px; padding-top: 6px; border-top: 1px dashed var(--border);
+  font-size: 10.5px; line-height: 1.6; color: var(--muted);
+}
+.v14-degraded-fix b { color: var(--text); }

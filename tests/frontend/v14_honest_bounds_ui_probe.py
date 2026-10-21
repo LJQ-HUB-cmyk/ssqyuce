@@ -22,8 +22,45 @@
     QA_BASE=http://127.0.0.1:18011 QA_USER=qa_ui QA_PASS='<口令>' \\
       python3 tests/frontend/v14_honest_bounds_ui_probe.py
 
+  ## 从零复现（三步，可直接粘）
+
+  第一步：建隔离实例（**绝不碰生产库**，与 scripts/isolated_test.sh 同一套约定）
+
+      T=/tmp/ui-repro; rm -rf $T; mkdir -p $T
+      cp data/ssq.db $T/ssq.db
+      export PYTHONPATH=$PWD LOTT_HOME=$T/home LOTT_DB=$T/ssq.db \
+             LOTT_BOOT_REFRESH_RULES=0 LOTT_SCHEDULER=0 LOTT_IDLE_MINING=0 \
+             LOTT_COOKIE_NAME=ssq_sid LOTT_COOKIE_SECURE=0
+      .venv/bin/python -c "from lottery import auth; auth.create_user('qa_ui','<口令>')"
+
+  第二步：起服务（用 nohup 或独立终端，别和第三步放同一个 shell）
+
+      .venv/bin/python -m lottery.cli serve --host 127.0.0.1 --port 18011
+
+  第三步：等模型就绪后跑探针
+
+      # popularity 冷启动要拟合 8~13s，未就绪时返回 503 属正常行为；
+      # 探针需要 200 才能验证档位渲染。轮询到 200 再跑：
+      until curl -sf -o /dev/null \
+        "http://127.0.0.1:18011/api/portfolio/popularity?reds=1,2,3,4,5,6"; do sleep 3; done
+
+      QA_BASE=http://127.0.0.1:18011 QA_USER=qa_ui QA_PASS='<口令>' \
+        python3 tests/frontend/v14_honest_bounds_ui_probe.py
+
+  ## 最近一次实跑（供交付报告引用）
+
+      HEAD      fa16a02
+      日期      2026-10-21T15:40 UTC
+      实例端口  18111（隔离临时库，跑完销毁）
+      结果      全部通过（40 条，含真实布局判定）
+      覆盖      首屏卡可见/不可折叠 · 窄屏 375px 折行无溢出 ·
+                jumpToCard 两级切换+滚入视口 · 蓝球卡四数同容器 ·
+                披露 6 行全可见 · 偏好度档位渲染 · footer 链接跳转 ·
+                全程无 pageerror
+
 依赖系统 python 的 playwright + /usr/bin/chromium（项目 .venv 里没有 playwright）。
 截图落在 `/tmp/ssq_ui_probe/`，路径会打印出来。
+**注意**：截图在 /tmp 会被清理；可复现的是上面的命令，不是截图。
 """
 from __future__ import annotations
 

@@ -141,7 +141,7 @@
 
 | ID | 交付项 | 负责人 | 优先级 | 状态 | 说明 |
 |---|---|---|---|---|---|
-| **D-01** | 前端接线（popularity / blue-coverage 两卡） | 刘工 | **P0** | **代码完成 / 视觉未验证** | **两处浏览器探针均未执行**（`v14_honest_bounds_ui_probe.py`、`v14_popularity_coldstart_probe.py`）；`app.js` 有函数 ≠ 页面能看到 |
+| **D-01** | 前端接线（popularity / blue-coverage 两卡） | 刘工 | **P0** | ✅ **视觉已验证**（待补复现命令） | 刘工实跑：`v14_honest_bounds_ui_probe.py` **40 条全过**（含窄屏 375px、`jumpToCard` 两级切换、无 pageerror）+ `v14_popularity_coldstart_probe.py --live` **三阶段全过**。**齐交付早前「未跑」依据已过期** |
 | **D-02** | `engine.py` 拆分方案 | 高架构 | **P0** | **待签收** | 方案 1219 行已交付，含 10 刀切法 + 平铺替代方案；**代码未动，等签收** |
 | **D-03** | 后端端点边界加固（参数校验 / 503 降级） | 李工 | **P0** | ⚠️ **有条件通过**（待变异实证） | 16 条测试在位、400/503 齐；**条件：逐条变异实证后转正** |
 | **D-04** | 能力清单端点 `GET /api/capabilities` | 李工 | **P0** | **待验收** | `lottery/routes_capabilities.py` 已建，21 条测试单跑全绿；见 §2.4 |
@@ -156,6 +156,7 @@
 | **D-13** | 能力边界文档（不可预测性证据报告） | 高架构+许产品 | P2 | 未开始 | 见 §6 |
 | **D-18a** | A 类：`getsource` 断言 AST 化（**精确 10 处 / 3 文件**） | 严QA | P2 | **新立项** | 见 §12-W；D-17 后开始 |
 | **D-18b** | B 类：`read_text` 断言剥注释（**精确 115 处 / 15 文件**，基线不增长） | 严QA | P2 | **新立项** | 复用 `_strip_js_comments` / `_strip_html_comments` |
+| **D-19** | `/api/capabilities` 前端接入（`cannot` 段必须与 `can` 同屏且不可折叠） | 刘工 | P2 | **新立项** | 见 §12-AC |
 | **D-16** | `popularity` 冷启动 12~28s（同步路径跑训练） | 李工 | P1 | ✅ **已签收**（`4fd5a0e`） | 见 §12-M；浏览器探针合并至 D-01 |
 | **D-14** | `pass_constraints` 奇偶分支直测 | 严QA | P2 | ✅ **已完成** | `test_qa_self_guards.py:96` 直测 + `:161` 隔离性检查 |
 
@@ -2357,11 +2358,31 @@ u = ast.unparse(ast.parse(src))
 ### 12-AA.1 最终地板（齐交付亲跑）
 
 ```
-@2026-10-21 15:2x   HEAD = c1fa172
-load average: 5.76（非独占，7 个 pytest 并发）
-.venv/bin/python -m pytest tests/ -q --ignore=tests/frontend
-→ 1597 passed, 24 skipped, 1 xfailed, 1 warning in 236.08s   EXIT=0
+@2026-10-21 15:2x   HEAD = c1fa172   → 1597 passed, 24 skipped, 1 xfailed   EXIT=0
+@2026-10-21 15:38  HEAD = fa16a02
+  全量 → 3 failed, 1598 passed（跑时工作区仍在变）
+  定向稳定 → tests/test_p2_dependency_direction.py → **1 failed, 8 passed**
 ```
+
+### 12-AA.1b 🔴 `fa16a02` 存在真实缺陷（红线 1 未守住）
+
+```
+lottery/routes_portfolio.py:13   from typing import Dict, List            ← 缺 Optional
+lottery/routes_portfolio.py:518  def _capability_items(degraded_sink: Optional[List[Dict]] = None)
+                                 → test_route_modules_have_no_undefined_globals  FAILED
+```
+**D-17 改动引入。一行修复已验证**：
+```diff
+- from typing import Dict, List
++ from typing import Dict, List, Optional
+```
+worktree 实测：`tests/test_p2_dependency_direction.py → 9 passed`。
+
+**运行时影响**：`:11` 有 `from __future__ import annotations` ⇒ 标注字符串化，**服务不崩**；
+但地板破了，且若将来去掉 future import 或调用 `typing.get_type_hints()` ⇒ **NameError**。
+
+**结论：`1597 passed`（`c1fa172`）是最后一个可信地板。`fa16a02` 待修复+复跑后才能重新钉。**
+**修复并复跑前，本看板不得声称「红线 1 未破」。**
 
 **可信度声明（按红线 4 第 ⑤ 款）**：
 | 指标 | 可信 | 说明 |
@@ -2383,7 +2404,7 @@ load average: 5.76（非独占，7 个 pytest 并发）
 | D-14 | `pass_constraints` 直测 | ✅ **已完成** | `test_qa_self_guards.py:96`/`:161` |
 | D-09/D-10 | 恒真断言 / e-BH 搬家 | ✅ **已完成**（`ee7560b`） | — |
 | P3 | `warming_disabled` 第四档 | ✅ **已签收** | `retry_after: None` 明示「别等了」 |
-| **D-17** | 两处静默 except | ⚠️ **部分完成** | `routes_capabilities.py:298` ✅；`routes_portfolio.py:458` ❌ 仍静默 |
+| **D-17** | 两处静默 except | ✅ **已签收**（`fa16a02`） | 两处均进 `degraded_items`；齐交付三闸亲验 + 形态守卫实证 |
 | **D-18a** | A 类 9 行 AST 化 | 📋 **进行中**（严QA） | **`:393/:394` 已在误报**（齐交付复现） |
 | **D-03** | 端点边界加固 | ⚠️ **有条件通过** | 条件：逐条变异实证后转正 |
 | **D-01** | 前端两卡 | ⚠️ **代码完成 / 视觉未验证** | **两处浏览器探针均未执行** |
@@ -2412,6 +2433,127 @@ load average: 5.76（非独占，7 个 pytest 并发）
 | 4 | **「结论错会暴露，论据错会被继承」** | 看板 §12-Y.6 |
 
 ---
+
+## 12-AB. ✅ D-17 签收（`fa16a02`，齐交付三闸亲验）
+
+### 12-AB.1 两处静默 except 均已闭环
+
+**① `routes_capabilities.py:298-302`**（前一轮已达标）：进 `degraded_items`，三段齐备。
+
+**② `routes_portfolio.py:461-485`**（本轮新增）：
+```python
+except Exception as exc:
+    full_ratio = None; assumption = None
+    ev_degraded = [{
+        "id": "ev_ratio_full",
+        "reason": "整注返奖比（含一/二等奖浮动奖）本次不可用：{type}: {exc}。"
+                  "六等奖口径（返奖比恒为 15.625%）不受影响，仍已正常返回。",
+        "how_to_restore": "检查 engine._single_ticket_ev 是否可用，以及奖金假设表配置；"
+                          "修复后重新请求本端点即可恢复。",
+    }]
+out["degraded_items"] = ev_degraded     # 端点层汇编，不改 blue_coverage（守写域）
+```
+
+### 12-AB.2 齐交付三闸实测（worktree `fa16a02`，非采信转述）
+
+| # | 判据 | 齐交付实测 |
+|---|---|---|
+| 1 | 异常路径 → `degraded_items` 出现 | ✅ 注入 `_single_ticket_ev` 抛 `RuntimeError` → **1 条**，`id=ev_ratio_full`，`reason`/`how_to_restore` 俱在，**六等奖仍 0.15625** |
+| 2 | **不误报**：正常路径 | ✅ `degraded_items = []`；`full_ev=false` 时同样 `[]` |
+| 3 | **形态守卫不是空转** | ✅ 注入未登记全局 `_NEW_STATE_FORGOTTEN = 0.0` → `test_reset_cache_covers_every_mutable_module_global` **1 failed** |
+
+**定向跑**：`tests/test_d04_capabilities_api.py` + `test_v14_portfolio_api.py` + `test_d03_boundary_hardening.py` → **200 passed**。
+
+### 12-AB.3 判据 4（不误报）是这一项的真正难点
+
+> 只测「有异常时会报」，不测「没异常时不报」，
+> 结果会是**永远报降级** —— 用户习惯性忽略它，**比静默更糟**。
+
+**李工加了三条针对性测试**：
+| 场景 | 期望 | 实测 |
+|---|---|---|
+| 正常路径 | `degraded_items == []` | ✅ |
+| 用户主动 `full_ev=false` | **不算降级**（是他自己的选择，不是故障） | ✅ |
+| 真实异常 | 报 1 条 | ✅ |
+
+**「用户主动关闭」不算降级**这一条李工自己加的，**齐交付未要求** ——
+> **它区分了「系统坏了」与「用户不要」，这两种情况的正确响应完全不同。**
+
+### 12-AB.4 reason 措辞：故障 vs 能力受限
+
+李工按齐交付提示，在 `reason` 中**明说什么没坏**：
+> 「…本次不可用：…。**六等奖口径（返奖比恒为 15.625%）不受影响，仍已正常返回。**」
+
+**为什么必须写「什么没坏」**：用户看到 `degraded_items` 有内容，
+**第一反应是「整个端点不可信」**。写明「六等奖仍正常」，把降级范围限死在整注口径。
+
+> **这是「拆字段不拆文案」原则用在 `reason` 语义上** —— 降级要精确到「哪一个数」。
+
+### 12-AB.5 进程级状态污染：守卫本身不可信比没有守卫更糟
+
+李工自报的根因（比齐交付怀疑的更深）：
+```
+_WARMING 残留              → is_warming() 跨用例为真 → 误报「预热中」
+_LAST_WARMUP_SECONDS 残留  → suggest_retry_after() 返回上个用例的值
+                           → 比例守卫 order-dependent（换顺序就红/绿）
+```
+**第二类最严重：守卫本身不可信，比没有守卫更糟。**
+
+**修法两层**：① `reset_cache()` 清全部 6 个模块级状态；
+② **形态守卫**动态扫模块级可变全局，未登记即红 —— **齐交付实证其有牙**。
+
+**李工自述**：「形态守卫首跑就抓到了 `_FEATURE_ZH`」——
+**说明它真能发现"未登记的可变全局"，不是针对已知 6 个的特判。**
+
+### 12-AB.6 地板
+
+```
+李工：1601 passed, 24 skipped, 1 xfailed（load 4.04）
+齐交付：1597 passed（load 5.76, HEAD c1fa172）
+HEAD 现为 fa16a02 —— 需重钉最终地板
+```
+
+## 12-AC. D-19 立项 + 两条新纪律（刘工自查产出）
+
+### 12-AC.1 D-19：`/api/capabilities` 前端未接入
+
+```
+$ grep -n "api/capabilities" web/static/app.js
+（未接入）
+```
+**刘工的划分获采纳**：
+- `blue-coverage` 的 `degraded_items` 零命中 = **「我漏了」**，本轮修完 ✅
+- `/api/capabilities` 整块未接 = **「整块没做」**，独立立项 D-19
+
+**齐交付补充验收硬约束**：
+> **`cannot` 段的可见面积/位置不得低于 `can` 段，且必须同屏、不许折叠。**
+> **若只展示 `can` 不展示 `cannot`，该端点从「让用户看到系统做不到什么」
+> 变成「吹牛工具」——比不接更糟，因为它有「官方认证」的外观。**
+
+### 12-AC.2 新纪律：同一事实只允许一处判据
+
+刘工的实现（原话）：
+```js
+// 「有没有降级」完全由 degraded_items 是否为空决定，单一判据。
+// full_ev=false 时后端也返回空数组（那是用户主动选择，不是降级），
+// 所以前端不需要另外判断 full_ev —— 也不会凭空造出降级提示。
+```
+**他拒绝在前端再判断一次 `full_ev`**，理由：「会变成两处判据，将来后端改了前端不知道」。
+
+> **这是「一个词两个意思」的对偶：一件事两处判断。**
+> **同样会分叉，只是分叉点在「判断逻辑」而非「词义」。**
+
+**已入交付门**：
+> **同一事实只允许一处判据。前端不得重复后端的判断逻辑 ——
+> 否则后端改了判断，前端不知道，两边静默分叉。**
+
+### 12-AC.3 降级 UI 的三条设计（刘工提出，齐交付认可）
+
+| 设计 | 理由 |
+|---|---|
+| 标题写「**部分**口径降级」，不写「整卡失败」 | 六等奖那组是好的；「降级」默认解读是「整个坏了」 |
+| `how_to_restore` 标注「**给运维**」 | 后端文案含 `_single_ticket_ev` 等函数名，直接甩给用户等于没说 |
+| **渲染后端 `reason` 原文**，不自己另写 | 否则又变成两份口径 —— 正是 `52.29 vs 53.19` 那个病的预防 |
 
 ## 13. 齐交付的错误日志（全部留档，不删）
 

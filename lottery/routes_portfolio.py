@@ -10,7 +10,7 @@ P2 模块化：从 `api_app.py` 的 V4 域切出。
 """
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse
@@ -515,7 +515,7 @@ def portfolio_blue_coverage(
 # 不许出现营销措辞，不许把"能排序"说成"能预测"，不许省略负面证据。
 # ==========================================================================
 
-def _capability_items() -> List[Dict]:
+def _capability_items(degraded_sink: Optional[List[Dict]] = None) -> List[Dict]:
     """能力清单的四条结论（纯数据，便于单测直接比对）。
 
     `evidence` 里的每个数字都必须能在代码或 `docs/reviews/` 找到出处，
@@ -526,13 +526,33 @@ def _capability_items() -> List[Dict]:
     # 注意这与文档写的 +0.0077 / p=0.005 **不一致** —— 口径相同（扩展窗口时序
     # + 置换 200 次），但数据期数不同（文档基于 3266 期，当前库 3517 期）。
     # 如实并列，不挑一个好看的说。
+    #: 本段自身的降级项（D-17 同类，2026-10-21 自查发现）。
+    #:
+    #: 缺陷：旧代码 `except: _r2_now, _p_now = None, None` 是**静默**的。
+    #: 用户在 `popularity_rank` 的 evidence 里看到「模型未拟合，暂无实测」，
+    #: 却**分不清**是「模型本来就没拟合」还是「读取模型时崩了」——
+    #: 前者是数据不足（等更多期），后者是故障（要查日志）。
+    #: 这与 D-17 修的 `ev_ratio_full`、以及 D-07 的 `usable` 两义同族：
+    #: **不是数字错，是用户无法区分该做什么。**
+    # `degraded_sink` 由端点传入，用于把本段的降级项汇编进最终响应的 `degraded_items`。
+    cap_degraded: List[Dict] = degraded_sink if degraded_sink is not None else []
     try:
         from . import popularity as POP
         _m = POP.get_model()
         _r2_now = (round(float(_m.r2_increment), 5) if _m.fitted else None)
         _p_now = (round(float(_m.p_value), 4) if _m.fitted else None)
-    except Exception:            # noqa: BLE001 —— 取不到就不给"实测"字段
+    except Exception as exc:     # noqa: BLE001 —— 取不到就不给"实测"字段
         _r2_now, _p_now = None, None
+        cap_degraded.append({
+            "id": "popularity_measured",
+            "reason": (f"「大众偏好排序」的**本次实测值**读取失败："
+                       f"{type(exc).__name__}: {exc}。"
+                       f"该项的文档记录值（R²=+0.0077 / 置换 p=0.005）不受影响，"
+                       f"仍已正常给出；结论本身不变（依然只是「能做但极弱」）。"),
+            "how_to_restore": (
+                "检查 lottery/popularity.py 的 get_model() 与数据库可用性；"
+                f"若是预热未完成，稍后重试即可；修复后重新请求本端点。"),
+        })
 
     return [
         {
@@ -701,7 +721,10 @@ def portfolio_capabilities() -> Dict:
     不做营销文案，不把"能排序"说成"能预测"，不省略任何负面证据，
     不使用「提高中奖率/提高命中率/更划算/稳赚」这类词。
     """
-    items = _capability_items()
+    # 传入 sink：让 `_capability_items` 里那处 `except` 的降级项
+    # 能被汇编进响应的 `degraded_items`（否则它仍是静默的 —— D-17 同类）。
+    _cap_degraded: List[Dict] = []
+    items = _capability_items(degraded_sink=_cap_degraded)
     return _jsonable({
         "ok": True,
         "n_capabilities": len(items),
@@ -716,6 +739,10 @@ def portfolio_capabilities() -> Dict:
             "本系统不改变任何一注的中奖概率，也不改变期望值。"
             "双色球为独立随机事件，长期期望为负（整注返奖比约 53.2%）。"
         ),
+        # 降级项（D-17）：正常路径为空 —— 不误报。
+        # 目前只有一项可能：`popularity_measured`（本次实测值读取失败）。
+        "degraded_items": _cap_degraded,
+        "degraded": bool(_cap_degraded),
         "usage_note_zh": (
             "读这个端点的正确方式：先看「做不到」和「极弱」的四条，"
             "再看唯一一条真实收益（蓝球覆盖）后面跟着的成本与返奖比。"

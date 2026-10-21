@@ -2656,6 +2656,15 @@ function renderBlueCoverage(d) {
     : (Number(evSixth) - Number(cost));
 
   const lines = Array.isArray(d.disclosure_lines) ? d.disclosure_lines : [];
+  // 部分口径降级项（D-17）。正常路径下后端返回空数组 ⇒ 这里什么都不渲染，
+  // 满足「没异常时不误报」。
+  //
+  // ⚠ `full_ev=false` 时后端**也**返回空数组 —— 因为那是**用户主动选择**
+  // 不要整注口径，不是降级。所以前端不需要另外判断 `full_ev`：
+  // 「有没有降级」完全由 `degraded_items` 是否为空决定，单一判据。
+  // （若哪天前端加了 `full_ev=false` 开关，也不得凭空造出降级提示 ——
+  //   用户的主动选择不该被当成系统故障。）
+  const degraded = Array.isArray(d.degraded_items) ? d.degraded_items : [];
   const disclosureHtml = lines.length
     ? lines.map((ln, i) =>
         '<div class="v14-line" data-line="' + (i + 1) + '">' +
@@ -2692,6 +2701,35 @@ function renderBlueCoverage(d) {
           metric("整注返奖比（一~六等全计）", _pct(d.ev_ratio_full, 2),
             "含浮动奖估算 · 长期仍为负期望") +
           metric("整注期望回收", "¥" + _yuan(d.ev_full_yuan, 2), "按上项返奖比 × 成本") +
+        "</div>"
+      : "") +
+    // ---- 部分口径降级（D-17，2026-10-21）----
+    //
+    // 后端在「整注返奖比算不出来」时不会静默：它把这些写进 `degraded_items`
+    // （id + reason + how_to_restore），六等奖口径仍然照常返回。
+    //
+    // 前端不渲染它 = **后端已经不再静默，前端仍在静默**，
+    // 用户会以为「整注返奖比」这个数本来就不存在，而不是「本次算不出来」。
+    // 这与 D-17 要修的「静默 except」是同一类病，只是发生在传递链的另一层。
+    //
+    // 措辞分层（与后端一致）：
+    //   · 明说「部分口径不可用」，**不是**「整卡失败」—— 六等奖那组指标是好的；
+    //   · `how_to_restore` 标注为「给运维的」，避免让普通用户去读函数名。
+    (degraded.length
+      ? '<div class="v14-degraded" id="blueCovDegraded">' +
+        '<div class="v14-degraded-head"><b>⚠ 部分口径降级</b>' +
+        '<span class="v14-degraded-sub">下列数据本次不可用，其余指标不受影响</span></div>' +
+        '<ul class="v14-degraded-list">' +
+          degraded.map(it =>
+            '<li data-degraded-id="' + escHtml(String(it.id || "")) + '">' +
+            escHtml(String(it.reason || it.id || "未提供原因")) + "</li>").join("") +
+        "</ul>" +
+        (degraded.some(it => it.how_to_restore)
+          ? '<div class="v14-degraded-fix"><b>恢复方法（给运维）：</b>' +
+            degraded.filter(it => it.how_to_restore)
+              .map(it => escHtml(String(it.how_to_restore))).join("；") +
+            "</div>"
+          : "") +
         "</div>"
       : "") +
     // n > 16：蓝球池（16 个）被占满。**概率**已封顶，「至少中一次」不会再提高；

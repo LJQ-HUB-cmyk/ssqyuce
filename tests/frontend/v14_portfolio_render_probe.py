@@ -463,6 +463,21 @@ store['#popBody'] = { innerHTML: '' };
 store['#popTag'] = { textContent: '' };
 renderBlueCoverage(fixture.bc);
 renderPopularity(fixture.pop);
+// 额外：注入 degraded_items 场景，验证降级提示真的渲染出来
+const bcDegraded = Object.assign({}, fixture.bc, {
+  degraded_items: [{
+    id: 'ev_ratio_full',
+    reason: '整注返奖比（含一/二等奖浮动奖）本次不可用：RuntimeError: boom。六等奖口径不受影响。',
+    how_to_restore: '检查 lottery/engine.py 的 _single_ticket_ev',
+  }],
+});
+delete bcDegraded.ev_ratio_full;
+delete bcDegraded.ev_full_yuan;
+store['#blueCovBody'].innerHTML = '';
+renderBlueCoverage(bcDegraded);
+const bcDegradedHtml = store['#blueCovBody'].innerHTML;
+renderBlueCoverage(fixture.bc);
+const bcNormalHtml = store['#blueCovBody'].innerHTML;
 // ---- 行为矩阵：粗/细两级 reason 的各种组合，看渲染出哪句文案 ----
 // 这一组是**行为断言**，不依赖源码字面量。
 // 正则形态守卫只防「写法回退」（有人把 filter(Boolean) 改回 ||），
@@ -524,6 +539,8 @@ process.stdout.write(JSON.stringify({
   popTag: store['#popTag'].textContent,
   degrade: degradeOut,
   degradeDynamic: dynamicOut,
+  bcDegraded: bcDegradedHtml,
+  bcNormal: bcNormalHtml,
 }));
 """
 
@@ -762,6 +779,23 @@ def probe_render() -> int:
     # ⑦ 空 payload 兜底 → 不得承诺重试
     check(_lacks("empty", "稍后刷新", "秒后可再试"),
           "⑦ 无 reason 且无 retry_after 时兜底文案不承诺重试", deg.get("empty", ""))
+
+    # --- D-17：部分口径降级必须渲染出来（后端报了，前端不能吞）---
+    print("  · [D-17] degraded_items 的渲染 / 不误报")
+    deg_html = out.get("bcDegraded") or ""
+    nor_html = out.get("bcNormal") or ""
+    check("blueCovDegraded" in deg_html,
+          "degraded_items 非空时渲染出降级块")
+    check("部分口径降级" in deg_html, "降级块标题说明「部分口径降级」而非「整卡失败」")
+    check("整注返奖比" in deg_html, "降级块包含后端给的 reason 原文")
+    check("_single_ticket_ev" in deg_html, "降级块包含 how_to_restore（给运维）")
+    check("给运维" in deg_html, "how_to_restore 标注了受众（不让普通用户去读函数名）")
+    # 判据 4：正常路径（空数组）不得出现降级提示
+    check("blueCovDegraded" not in nor_html and "部分口径降级" not in nor_html,
+          "degraded_items 为空时不渲染任何降级提示（不误报）")
+    # 六等奖那组指标在降级态下仍须正常显示（说明是"部分"降级）
+    check("15.625%" in deg_html,
+          "降级态下六等奖返奖比仍显示（证明只是部分口径不可用）", deg_html[:200])
 
     # --- 动态原因矩阵：后端每个原因都必须被前端识别（不落兜底）---
     # 判据不是「源码里出现过这个字符串」（那样改个名字就能骗过），
