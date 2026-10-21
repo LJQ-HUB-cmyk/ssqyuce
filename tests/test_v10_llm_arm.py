@@ -39,6 +39,8 @@ T13 蓝球与其它字段口径：delta_blue 独立于红球、enabled_default �
 """
 from __future__ import annotations
 
+import ast
+
 import json
 import random
 
@@ -354,9 +356,16 @@ def test_t8_llm_source_hypothesis_never_becomes_usable(monkeypatch):
     assert snap.get("counts", {}).get("usable", 0) == 0
 
     # 再确认那行短路仍在源码里（双保险：行为 + 静态）
-    import inspect
-    src = inspect.getsource(patterns_runtime.build_snapshot)
-    assert '!= "llm"' in src
+    #
+    # D-18a：原来用 `assert '!= "llm"' in inspect.getsource(...)`，两个方向都会错 ——
+    #   · 假绿：删掉真实比较、只在 docstring 里留着 `!= "llm"` → 仍然通过（getsource 含 docstring）
+    #   · 假红：docstring 里写「这里用 != "llm" 排除 LLM」→ 无辜变红
+    # 改用 AST 结构查询：只认**真实的比较表达式**。
+    # 注意不能用 `code_text()`：`ast.unparse` 会把 "llm" 规范成 'llm'，断言会假红。
+    from _source_assert import has_compare
+    assert has_compare(patterns_runtime.build_snapshot,
+                       op=ast.NotEq, string_const="llm"), \
+        "build_snapshot 里找不到 `!= \"llm\"` 这段短路 —— LLM 假说可能又能变 usable 了"
 
 
 def test_t9_eligible_does_not_imply_llm_tickets(monkeypatch):
@@ -381,10 +390,27 @@ def test_t9_eligible_does_not_imply_llm_tickets(monkeypatch):
     ch = methods.resolve_channels()
     assert ch["llm_can_pick"] is False
     # 引擎的出号判据只认这个快照（见 engine.predict_next 的 llm_only 分支）
-    import inspect
-    src = inspect.getsource(E.predict_next)
-    assert 'channels.get("llm_can_pick")' in src or "llm_can_pick" in src
-    assert 'llm_can_pick' in src, "引擎必须用 llm_can_pick 作为唯一出号判据"
+    #
+    # D-18a：原来用 `in inspect.getsource(...)`，会被 docstring 骗（假绿）
+    # 也会被 docstring 误伤（假红）。拆成两条：
+    #   · 结构：**真的调用了** `channels.get("llm_can_pick")`（含引号 ⇒ 必须 AST，不能 unparse）
+    #   · 文本：标识符 `llm_can_pick` 出现在**剥掉 docstring/注释后**的代码里
+    # 原来那句 `or "llm_can_pick" in src` 是弱兜底，等于把结构断言降级成文本断言，
+    # 这里去掉 —— 结构那一半已经独立断言了。
+    from _source_assert import code_text, has_call
+    assert has_call(E.predict_next, attr="get", string_arg="llm_can_pick"), \
+        ("predict_next 里没有真实调用 `channels.get(\"llm_can_pick\")` —— "
+         "引擎可能不再以该快照作为出号判据")
+    # 【已删除一条冗余断言】原 `assert "llm_can_pick" in src`。
+    #
+    # 理由（实测）：上面的 `has_call(...)` 若通过，则「`.get("llm_can_pick")` 真实调用存在」，
+    # 而真实调用必然让剥注释后的代码文本包含 `llm_can_pick` 这个子串 ——
+    # 所以「has_call 通过 ⇒ 子串断言必然通过」，后者信息量为 0。
+    #
+    # 变异实证（把两处调用改成 `_channels.get(_x_llm_can_pick)`）：
+    #   has_call  → False（红，抓住）
+    #   子串断言  → True （绿，放过）   ← 证实它更弱
+    # 按「若存在更强的判据能让它信息量归零 —— 它不是判据，是注释」删除。
 
 
 # ==================== T10/T11：边界不炸 ====================

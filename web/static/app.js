@@ -2589,6 +2589,15 @@ function _degradeNote(what, e) {
       hint = "历史样本不足（需 ≥300 期含销量与头奖注数的开奖），短期无法给出档位";
     } else if (has("warmup_disabled", "warming_disabled")) {
       hint = "当前部署关闭了后台预热，本卡在此部署下不可用（无重试）";
+    } else if (has("retry_exhausted")) {
+      // 预热重试循环已跑完（后端 `for attempt in range(1, 11)` 退出）。
+      // 与 warming_disabled 同属「**本进程内不会再就绪**」，但原因不同：
+      // 前者是配置关闭、后者是重试失败。文案必须同样明确「别再等」，
+      // 否则用户会一直刷新一件永远不回来的事 —— 这是后端注释点名的
+      // 「第三种假承诺」。
+      hint = "模型多次重试仍失败，本进程内不会再自动恢复（需管理员查看日志或重启服务）";
+    } else if (has("fit_failed")) {
+      hint = "模型拟合失败（非数据不足），需管理员查看日志";
     } else {
       // 兜底：后端只给了泛化的 model_not_ready，且**带**了具体 retry_after 才提重试
       const n = Number(retryAfter);

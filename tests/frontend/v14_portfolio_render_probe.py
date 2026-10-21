@@ -33,6 +33,95 @@ node 沙箱里，喂**真实后端响应**（`--fixture` 由路由处理函数�
 所以：看到本探针因后端签名变化而红，正确的反应是**同步改探针与前端**，
 而不是给它加 try/except、加 `getattr` 兜底、或干脆删掉它。
 
+## [11] 段的两类守卫：形态 + 行为（缺一不可）
+
+`[11]` 守的是「粗/细两级字段必须都读」这条规则，用了**两道互补的守卫**：
+
+| 类型 | 抓什么 | 漏什么 |
+|---|---|---|
+| **形态守卫**（正则扫源码） | 有人把 `filter(Boolean)` 改回 `\|\|` | 换变量名、换行、先赋值再 `\|\|` 等变体 |
+| **行为守卫**（喂响应体看输出） | 逻辑回退本身，与写法无关 | 源码层面看不出但行为已错的怪写法 |
+
+行为守卫喂 7 组 payload（粗+细、只有细、只有粗且已是细分值、空），
+断言渲染出的**用户可见文案**是否落到正确分支。
+
+### 变异验证（2026-10-21 实做，不是设想）
+
+把 `[pl.reason, pl.unfitted_reason].filter(Boolean)` 人为改成
+`[pl.reason || pl.unfitted_reason].filter(Boolean)`，重跑探针：
+
+```
+✗ 不存在 `reason || unfitted_reason` 短路读法
+✗ ① 细字段 warming_disabled 透传为「无重试」
+     → 【测试卡不可用】服务暂不可用（模型未就绪），且该状态下不会自动恢复
+✗ ② 细字段 insufficient_data 透传为「样本不足」
+✗ ③ 细字段 warming 透传为「正在拟合」
+结果：4 条断言失败
+```
+
+**两道守卫同时亮**，且行为守卫直接给出用户会看到的错误文案。
+这就是「变异验证」与「跑一遍绿的」的区别：绿的只证明当前对，
+变异红的才证明**将来错了会被发现**。
+
+## 原因取值域：不许手工枚举（实测反例，2026-10-21）
+
+前文「变异验证」说的是「改坏能不能抓到」。这条说的是**另一类失效**：
+**清单本身缺项，而缺项是静默的** —— 不会报错，只是少测一条。
+
+### 实测：我手工列了 5 个原因，错了 3 处
+
+```python
+# 第一版（手工枚举，错）
+for key in ("model_warming", "warming", "insufficient_data",
+            "warmup_disabled", "warming_disabled"):
+```
+
+从**后端源码**抽出来的真实取值域是 6 个：
+
+```
+fit_failed, insufficient_data, model_warming,
+retry_exhausted, warming, warming_disabled
+```
+
+对比结果：
+
+| 问题 | 明细 |
+|---|---|
+| **虚构了 1 个** | `warmup_disabled` —— 后端从来不返回这个值（实际叫 `warming_disabled`） |
+| **漏了 2 个** | `retry_exhausted`（重试循环耗尽）、`fit_failed`（拟合失败） |
+
+**漏掉 `retry_exhausted` 的后果不是"少一条测试"，而是**：这是后端注释里
+明确点名的「第三种假承诺」—— 重试已用尽、模型永不再就绪，若前端落兜底
+文案「服务暂不可用（模型未就绪）」，用户会一直刷新一件永远不回来的事。
+**我的手工清单恰好漏了它。**
+
+### 现在的做法
+
+`reason_domain` 由正则从 `routes_portfolio.py` / `popularity.py` **源码抽取**，
+传进 Node harness，**每个原因 × 两个字段位置（`reason` / `unfitted_reason`）**
+都喂一遍，断言渲染结果不含兜底标记：
+
+```python
+fallback_mark = "服务暂不可用（模型未就绪）"
+unreached = [f"{name}/{slot}" for ... if fallback_mark in txt]
+check(not unreached, "后端全部 N 个原因都被识别（无落兜底）", ...)
+```
+
+**判据不是「源码里出现过这个字符串」**（那样改个名字就能骗过），
+而是「喂该原因、看输出是否仍是兜底」。
+
+### 变异验证（同样实做）
+
+把 `else if (has("retry_exhausted"))` 删掉，重跑：
+
+```
+✗ 后端全部 6 个原因都被识别（无落兜底）
+  → 以下原因落到了兜底分支，说明前端没接住：
+    retry_exhausted/as_reason, retry_exhausted/as_unfitted
+```
+
+**报出的是精确位置**，不是"某个测试红了"。
+
 ## 为什么不进 pytest 主套件
 
 `tests/frontend/` 是前端取证目录（Lead 2026-10-21 裁定），与李工的
@@ -365,7 +454,7 @@ globalThis.TICKET_PRICE_YUAN = 2;
 globalThis.POP_TIER_CLASS = { low: 'cool', mid: 'common', high: 'hot' };
 
 for (const fn of ['_pct', '_yuan', '_renderDisclosureLine',
-                  'renderBlueCoverage', 'renderPopularity']) {
+                  'renderBlueCoverage', 'renderPopularity', '_degradeNote']) {
   (0, eval)(grab(fn));
 }
 store['#blueCovBody'] = { innerHTML: '' };
@@ -374,11 +463,67 @@ store['#popBody'] = { innerHTML: '' };
 store['#popTag'] = { textContent: '' };
 renderBlueCoverage(fixture.bc);
 renderPopularity(fixture.pop);
+// ---- 行为矩阵：粗/细两级 reason 的各种组合，看渲染出哪句文案 ----
+// 这一组是**行为断言**，不依赖源码字面量。
+// 正则形态守卫只防「写法回退」（有人把 filter(Boolean) 改回 ||），
+// 却漏得掉 `payload.reason || payload.unfitted_reason`、换行、先赋值再 || 等变体。
+// 行为断言喂**响应体**看**输出文案**，与写法无关 —— 这才是最终判据。
+const degradePayloads = {
+  // ① 粗字段笼统 + 细字段是「预热被配置关闭」→ 必须说「无重试」
+  coarse_with_disabled: { reason: 'model_not_ready', unfitted_reason: 'warming_disabled', retry_after: null },
+  // ② 粗字段笼统 + 细字段是「样本不足」→ 必须说「样本不足」
+  coarse_with_insufficient: { reason: 'model_not_ready', unfitted_reason: 'insufficient_data', retry_after: null },
+  // ③ 粗字段笼统 + 细字段是「预热中」→ 必须说「正在拟合」且给秒数
+  coarse_with_warming: { reason: 'model_not_ready', unfitted_reason: 'warming', retry_after: 5 },
+  // ④ 只有细字段（后端某天只回 unfitted_reason）→ 仍须识别
+  fine_only_disabled: { unfitted_reason: 'warming_disabled', retry_after: null },
+  // ⑤ 只有粗字段是细分值（后端已改成主字段直给）→ 仍须识别
+  coarse_is_detail: { reason: 'warmup_disabled', retry_after: null },
+  // ⑥ 真·预热中（主字段直接给细分值）
+  warming_direct: { reason: 'model_warming', retry_after: 8 },
+  // ⑦ 什么都不给 → 兜底文案不得承诺重试
+  empty: {},
+};
+const degradeOut = {};
+for (const [k, payload] of Object.entries(degradePayloads)) {
+  degradeOut[k] = _degradeNote('测试卡', {
+    status: 503, message: (payload && payload.error) || 'err', payload: payload,
+  });
+}
+
+// ---- 动态原因矩阵（不手工枚举）----
+// Product 2026-10-21 指出：手工白名单是「将来忘了加」的经典来源。
+// 我的第一版正是手工枚举了 5 个值 —— 实测**虚构了 1 个**（warmup_disabled，
+// 后端实际叫 warming_disabled）、**漏了 2 个**（retry_exhausted / fit_failed）。
+// 所以改成由 Python 侧从后端源码抽出取值域再传进来，这里逐个跑。
+//
+// 判据：每个原因都必须渲染出**非兜底**文案。
+// 兜底文案的特征是「服务暂不可用（模型未就绪）」—— 出现它 = 该分支没被识别。
+const FALLBACK_MARK = '服务暂不可用（模型未就绪）';
+const reasonDomain = fixture.reason_domain || [];
+const dynamicOut = {};
+for (const name of reasonDomain) {
+  // 同一原因可能出现在 `reason`（主字段）或 `unfitted_reason`（细分字段），
+  // 两种位置都要覆盖 —— 后端确实两个字段各有一套取值。
+  dynamicOut[name] = {
+    as_reason: _degradeNote('测试卡', {
+      status: 503, message: 'err', payload: { reason: name, retry_after: null },
+    }),
+    as_unfitted: _degradeNote('测试卡', {
+      status: 503, message: 'err',
+      payload: { reason: 'model_not_ready', unfitted_reason: name, retry_after: null },
+    }),
+  };
+}
+dynamicOut.__fallback_mark__ = FALLBACK_MARK;
+
 process.stdout.write(JSON.stringify({
   bc: store['#blueCovBody'].innerHTML,
   pop: store['#popBody'].innerHTML,
   bcTag: store['#blueCovTag'].textContent,
   popTag: store['#popTag'].textContent,
+  degrade: degradeOut,
+  degradeDynamic: dynamicOut,
 }));
 """
 
@@ -433,9 +578,25 @@ def probe_render() -> int:
                 pass
         return {"ok": False, "error": "无法解析路由返回值: %r" % type(resp).__name__}
 
+    # 从**后端源码**抽全部原因取值，供 harness 动态跑（不手工枚举）。
+    #
+    # 为什么不手工写：我的第一版手工列了 5 个，实测虚构 1 个、漏 2 个。
+    # 手工清单的失效是静默的 —— 漏掉的值不会报错，只是**少测一条**。
+    # 而这里少测的含义是：后端某天新增一个降级原因，前端没接住，
+    # 用户看到兜底文案「服务暂不可用（模型未就绪）」，而没有任何测试会红。
+    _rt = (REPO / "lottery" / "routes_portfolio.py").read_text(encoding="utf-8")
+    _pop = (REPO / "lottery" / "popularity.py").read_text(encoding="utf-8")
+    reason_domain = sorted(
+        set(re.findall(r'"reason":\s*"([a-z_]+)"', _rt))
+        | set(re.findall(r'"unfitted_reason":\s*"([a-z_]+)"', _rt))
+        | set(re.findall(r'_set_unfit_reason\(\s*"([a-z_]+)"', _pop))
+    )
+    print("  · 后端原因取值域（源码抽取）: " + ", ".join(reason_domain))
+
     fixture = {
         "bc": _as_dict(portfolio_blue_coverage(n_tickets=n, full_ev=True)),
         "pop": _as_dict(portfolio_popularity(reds="1,2,3,4,5,6", sales=0.0)),
+        "reason_domain": reason_domain,
     }
     print("\n[render] 用真实后端响应喂渲染函数（n_tickets=%d）" % n)
 
@@ -551,6 +712,73 @@ def probe_render() -> int:
               f"n={_n}: increases_hit_probability is False")
         check(_r["honesty_flags"]["increases_expected_return"] is False,
               f"n={_n}: increases_expected_return is False")
+
+    # --- 行为断言：粗/细两级 reason 的组合必须渲染出**细分**文案 ---
+    # Product 2026-10-21 的加严要求：正则形态守卫只防写法回退，
+    # 行为断言才防**逻辑回退**。这里喂响应体、看输出文案，与写法无关。
+    print("  · [行为] 降级文案按粗/细 reason 正确分叉")
+    deg = out.get("degrade") or {}
+
+    def _has(key, *needles):
+        txt = deg.get(key, "")
+        return all(n in txt for n in needles)
+
+    def _lacks(key, *needles):
+        txt = deg.get(key, "")
+        return all(n not in txt for n in needles)
+
+    # ① 粗=model_not_ready + 细=warming_disabled → 「无重试」，且不得说「稍后刷新」
+    check(_has("coarse_with_disabled", "无重试"),
+          "① 细字段 warming_disabled 透传为「无重试」", deg.get("coarse_with_disabled", ""))
+    check(_lacks("coarse_with_disabled", "稍后刷新", "秒后可再试"),
+          "① 不得出现「稍后刷新/秒后可再试」（那是给临时故障的）",
+          deg.get("coarse_with_disabled", ""))
+
+    # ② 粗=model_not_ready + 细=insufficient_data → 「样本不足」
+    check(_has("coarse_with_insufficient", "样本不足"),
+          "② 细字段 insufficient_data 透传为「样本不足」", deg.get("coarse_with_insufficient", ""))
+    check(_lacks("coarse_with_insufficient", "稍后刷新"),
+          "② 不得说「稍后刷新」（样本不足等再久也没用）",
+          deg.get("coarse_with_insufficient", ""))
+
+    # ③ 粗=model_not_ready + 细=warming → 「正在拟合」+ 秒数
+    check(_has("coarse_with_warming", "正在拟合"),
+          "③ 细字段 warming 透传为「正在拟合」", deg.get("coarse_with_warming", ""))
+    check(_has("coarse_with_warming", "5"),
+          "③ 且带上 retry_after 的具体秒数", deg.get("coarse_with_warming", ""))
+
+    # ④ 只有细字段（无 reason）→ 仍须识别
+    check(_has("fine_only_disabled", "无重试"),
+          "④ 只有 unfitted_reason 时仍能识别", deg.get("fine_only_disabled", ""))
+
+    # ⑤ 只有粗字段且已是细分值 → 仍须识别
+    check(_has("coarse_is_detail", "无重试"),
+          "⑤ reason 直给 warmup_disabled 时能识别", deg.get("coarse_is_detail", ""))
+
+    # ⑥ 主字段直接 model_warming → 「正在拟合」+ 秒数
+    check(_has("warming_direct", "正在拟合", "8"),
+          "⑥ reason=model_warming 时给出秒数", deg.get("warming_direct", ""))
+
+    # ⑦ 空 payload 兜底 → 不得承诺重试
+    check(_lacks("empty", "稍后刷新", "秒后可再试"),
+          "⑦ 无 reason 且无 retry_after 时兜底文案不承诺重试", deg.get("empty", ""))
+
+    # --- 动态原因矩阵：后端每个原因都必须被前端识别（不落兜底）---
+    # 判据不是「源码里出现过这个字符串」（那样改个名字就能骗过），
+    # 而是**喂该原因、看渲染结果是否仍是兜底文案**。
+    print("  · [动态] 后端全部原因逐一喂入，验证不落兜底")
+    dyn = out.get("degradeDynamic") or {}
+    fallback_mark = dyn.get("__fallback_mark__") or "服务暂不可用（模型未就绪）"
+    unreached = []
+    for name, pair in dyn.items():
+        if name.startswith("__"):
+            continue
+        for slot, txt in pair.items():
+            if fallback_mark in txt:
+                unreached.append(f"{name}/{slot}")
+    check(not unreached,
+          f"后端全部 {len([k for k in dyn if not k.startswith('__')])} 个原因都被识别（无落兜底）",
+          "以下原因落到了兜底分支，说明前端没接住：" + ", ".join(unreached))
 
     # --- 标准 2：偏好度只给档位 ---
     # 模型可能在本进程未就绪（端点返回 503 + reason=model_warming）。

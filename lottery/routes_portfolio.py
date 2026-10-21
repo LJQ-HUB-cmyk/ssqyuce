@@ -420,6 +420,9 @@ def portfolio_blue_coverage(
     from . import blue_coverage as BC
     full_ratio = None
     assumption = None
+    #: 本端点自身的降级项（D-17）。**正常路径下必须为空** ——
+    #: 否则会「永远报降级」，用户习惯性忽略，比静默更糟（判据 4）。
+    ev_degraded: List[Dict] = []
     if full_ev:
         try:
             from . import engine
@@ -455,11 +458,36 @@ def portfolio_blue_coverage(
             # `_single_ticket_ev` 返回的 `prize_assumption` 是**人读字符串**，
             # 不是 dict；这里两者都保留：dict 供结构化渲染，text 供披露文本。
             assumption = dict(assumption, text=str(ev.get("prize_assumption") or ""))
-        except Exception:        # noqa: BLE001 —— 取不到就只给六等奖口径
+        except Exception as exc:     # noqa: BLE001 —— 取不到就只给六等奖口径
             full_ratio = None
             assumption = None
+            # ===== D-17：不许静默，也不许只进日志 =====
+            #
+            # 降级为「只给六等奖口径」本身是**合理的能力受限**（不是崩溃），
+            # 但用户必须知道**为什么缺少整注返奖比**，否则会以为这个数不存在。
+            #
+            # Lead 的要求分三层，缺一不可：
+            #   ① 不能静默（旧代码 `except: pass`）；
+            #   ② 不能只进日志（日志没人看）；
+            #   ③ **必须进 `degraded_items`**，带 id + reason + how_to_restore。
+            #
+            # 这里的措辞刻意区分「能力受限」与「故障」：写明是「整注口径不可用」，
+            # 而不是笼统的「发生错误」——因为六等奖口径仍然正常返回。
+            ev_degraded = [{
+                "id": "ev_ratio_full",
+                "reason": (f"整注返奖比（含一/二等奖浮动奖）本次不可用："
+                           f"{type(exc).__name__}: {exc}。"
+                           f"六等奖口径（返奖比恒为 15.625%）不受影响，仍已正常返回。"),
+                "how_to_restore": (
+                    "检查 lottery/engine.py 的 _single_ticket_ev 是否可用，"
+                    "以及奖金假设表（_PRIZE_ASSUMPTION）配置是否正确；"
+                    "修复后重新请求本端点即可恢复。"),
+            }]
     out = BC.optimize(n_tickets, full_ev_ratio=full_ratio,
                       prize_assumption=assumption)
+    # 降级项在**端点层**汇编（`BC.optimize` 属 blue_coverage 的写域，不改它）。
+    # 正常路径下 `ev_degraded` 为空 ⇒ 响应里不出现该项 ⇒ 「没异常时不误报」（判据 4）。
+    out["degraded_items"] = ev_degraded
     # 显式标注六等奖口径 —— 今天为这一个数倒了三个人核算，
     # 加一个字段，后面任何人看一眼响应就知道它用的是哪个口径，不必读代码。
     # 取值只有 "strict"（本端点）与 "published"（引擎默认/历史发表值）。

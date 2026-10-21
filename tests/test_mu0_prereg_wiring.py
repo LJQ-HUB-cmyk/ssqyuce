@@ -185,16 +185,18 @@ def test_scheduler_hook_exists_in_source(isolated_env):
     这是最后一道防线：若有人删了那段 try/except，运行期测试仍可能因为
     其它路径写入而误绿，但源码扫描不会骗人。
     """
-    import inspect
     from lottery import api_app
-    src = inspect.getsource(api_app._scheduler_step)
+    # D-18a：原来用 `inspect.getsource(...)` 做子串匹配，会被 docstring/注释骗
+    #   （假绿：删真实调用、只在注释留名仍通过；假红：注释里提到名字就误报）。
+    # 改用 `code_text()`：剥 docstring + 注释，只留纯代码文本，行序与源码一致。
+    from _source_assert import code_text
+    src = code_text(api_app._scheduler_step)
     assert "prereg_scheduler" in src, (
         "_scheduler_step 里找不到 prereg_scheduler —— 前置注册写入接线被删了")
     assert "register_scan_candidates" in src
-    # 顺序断言必须比"调用点"而不是注释里的同名字样：
-    # 我第一次写成 `src.index("evaluate_prereg")`，结果命中的是**注释里**讲断链时
-    # 提到的那次出现（注释在代码之前），导致假红。
-    # 正确做法：比较两处**实际调用**的位置。
+    # 顺序断言：下面这句注释里说「第一次写成 src.index('evaluate_prereg') 命中了注释」——
+    # **现在 src 已不含注释**，所以这个坑从根上消失了；但顺序断言本身仍有价值：
+    # 它要求"写入调用"出现在"评估调用"之前。
     i_write = src.index("register_scan_candidates(")
     i_eval = src.index("hypothesis.evaluate_prereg(")
     assert i_write < i_eval, (

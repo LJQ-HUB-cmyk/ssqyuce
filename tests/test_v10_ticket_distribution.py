@@ -377,10 +377,24 @@ def test_objective_names_normalize_via_alias_table():
 
 
 def test_no_objective_contains_an_ev_term():
-    """任何模式都不许把目标写成「提高期望」：_ticket_objective 源码里不得有 EV 项。"""
-    src = inspect.getsource(E._ticket_objective)
-    assert "portfolio_expected_value" not in src
-    assert "expected_reward" not in src
+    """任何模式都不许把目标写成「提高期望」：_ticket_objective **代码**里不得有 EV 项。
+
+    ## D-18a：为什么不能再用 `in inspect.getsource(...)`
+
+    `getsource` **包含 docstring**，于是两个方向都会错：
+
+    * **假红**（已实证）：只在 `_ticket_objective` 的 docstring 里补一句
+      「本目标函数不使用 portfolio_expected_value」——
+      **代码一字未动，断言就红了**，逼人去删注释而不是改代码。
+    * **假绿**：若有人把真实引用删掉、只在 docstring 里留名，断言仍通过。
+
+    改用 `code_text()`：先剥 docstring（`ast`），再 `ast.unparse` 成纯代码文本。
+    注释与 docstring 都不进结果，标识符文本形态不变（已实测）。
+    """
+    from _source_assert import code_text
+    code = code_text(E._ticket_objective)
+    assert "portfolio_expected_value" not in code
+    assert "expected_reward" not in code
     meta = E._objective_meta("ev_conserving", 4, blue_owned_by_plan=True)
     assert meta["optimizes_ev"] is False
     meta2 = E._objective_meta("pmax_high", 4, blue_owned_by_plan=True)
@@ -388,10 +402,27 @@ def test_no_objective_contains_an_ev_term():
 
 
 def test_dead_code_removed_from_objective():
-    """§3.4.1 死代码：``cover_bonus * n / max(1, n)``（恒等于 cover_bonus）必须消失。"""
-    src = inspect.getsource(E._ticket_objective)
-    assert "max(1, n)" not in src
-    assert "cover_bonus" not in src
+    """§3.4.1 死代码：``cover_bonus * n / max(1, n)``（恒等于 cover_bonus）必须消失。
+
+    ## D-18a：改判据 + 反向误报已实证
+
+    原写法 `assert "max(1, n)" not in inspect.getsource(...)` 有一个**真实的误报**：
+
+        只往 `_ticket_objective` 的 docstring 加一行
+        「已删除死代码 cover_bonus * n / max(1, n)」
+        → 代码逻辑一字未动 → 本测试变红（已实测复现）
+
+    这对断言正是「注释解释历史」最容易触碰的地方，所以必须剥 docstring。
+
+    修后仍保留**文本匹配**（不走 AST 结构）—— 理由：
+    `max(1, n)` 这个**字面形态**才是死代码的特征；换成 AST 结构判断会漂移成
+    「不存在这样的调用」，且变量改名（`cover_bonus` → `cb`）后文本仍能抓到，
+    AST 结构反而抓不到。`ast.unparse` 会保留 `max(1, n)` 的空格形态（已实测）。
+    """
+    from _source_assert import code_text
+    code = code_text(E._ticket_objective)
+    assert "max(1, n)" not in code
+    assert "cover_bonus" not in code
 
 
 def test_ev_conserving_objective_is_blind_to_blue_when_plan_owns_blue():

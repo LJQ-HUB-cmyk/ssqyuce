@@ -1424,3 +1424,171 @@ def test_max_attempts_is_configurable():
         assert api_app._popularity_max_attempts() == 2
     finally:
         os.environ.pop("LOTT_POPULARITY_MAX_ATTEMPTS", None)
+
+
+# ==========================================================================
+# 十九、`reset_cache()` 必须清**全部**模块级状态（第 3 类守卫：防将来）
+#
+# 缺陷（Product/刘工实测）：旧实现只清 `_CACHE` + `_READY`，留下 6 个残留。
+# 其中最严重的是耗时类残留 —— 新增的「比例守卫」读 `_LAST_WARMUP_SECONDS`
+# 做断言，残留会让它 order-dependent（换测试顺序就红/绿）。
+# **守卫本身不可信，比没有守卫更糟。**
+#
+# 本条是「形态守卫」：不枚举期望值，而是**扫模块的模块级可变状态**逐个确认。
+# 防的是「将来加第 7 个状态但忘了加进 reset_cache」。
+# ==========================================================================
+
+def test_reset_cache_clears_all_module_state():
+    """`reset_cache()` 后，所有模块级可变状态必须回到初始值。"""
+    from lottery import popularity as POP
+
+    POP._WARMING.set()
+    POP._LAST_WARMUP_SECONDS = 38.55
+    POP._LAST_FIT_SECONDS = 12.6
+    POP._FIT_STARTED_AT = 123.0
+    POP._LAST_UNFIT_REASON = "fit_failed"
+    POP._RETRY_EXHAUSTED = True
+
+    POP.reset_cache()
+
+    assert POP._CACHE is None
+    assert POP.is_warming() is False, "_WARMING 残留 → 端点误报「预热中」"
+    assert POP._LAST_WARMUP_SECONDS is None, (
+        "_LAST_WARMUP_SECONDS 残留 → suggest_retry_after() 返回上个用例的值，"
+        "比例守卫变 order-dependent")
+    assert POP._LAST_FIT_SECONDS is None
+    assert POP._FIT_STARTED_AT is None
+    assert POP._LAST_UNFIT_REASON == "unknown"
+    assert POP.is_retry_exhausted() is False
+
+
+def test_reset_cache_restores_suggest_retry_after_to_initial():
+    """行为层验证：reset 后 `suggest_retry_after()` 必须回到初值，不受残留影响。"""
+    from lottery import popularity as POP
+
+    POP._LAST_WARMUP_SECONDS = 38.55     # 慢机残留
+    assert POP.suggest_retry_after() == POP._RETRY_AFTER_MAX
+    POP.reset_cache()
+    assert POP.suggest_retry_after() == POP._RETRY_AFTER_INITIAL, (
+        "reset 后仍用残留耗时算 retry_after")
+
+
+def test_reset_cache_covers_every_mutable_module_global():
+    """**形态守卫（防将来）**：扫 `popularity` 的模块级可变全局，逐个验证被清。
+
+    这条不枚举"已知的 6 个"，而是**动态发现**模块里所有 `Optional/bool/float`
+    形态的私有可变状态（排除常量与函数/类/模块）。
+    将来有人加第 7 个状态却忘了加进 `reset_cache()`，本用例会红。
+    """
+    import types
+
+    from lottery import popularity as POP
+
+    # 明确属于「不可变配置/常量」的名字（不需要 reset）
+    _CONST_LIKE = {
+        "MODEL_VERSION", "TIER_LOW_Q", "TIER_HIGH_Q", "FEATURE_NAMES",
+        "_RETRY_AFTER_MIN", "_RETRY_AFTER_MAX", "_RETRY_AFTER_INITIAL",
+        "_CACHE_FILENAME",
+        # 中文标签查找表：只读常量语义（没人会在运行时改它）。
+        # 形态守卫首跑时抓到它 —— 说明守卫确实能发现"未登记的可变全局"。
+        "_FEATURE_ZH",
+    }
+    # 明确属于「可变状态、必须在 reset_cache 里清」的名字
+    _MUST_RESET = {
+        "_CACHE", "_WARMING", "_READY", "_FIT_THREAD_ACTIVE",
+        "_LAST_UNFIT_REASON", "_LAST_FIT_SECONDS", "_LAST_WARMUP_SECONDS",
+        "_FIT_STARTED_AT", "_RETRY_EXHAUSTED",
+    }
+    # 锁对象不是"状态"，不清
+    _LOCK_LIKE = {"_CACHE_LOCK", "_FIT_TRIGGER_LOCK"}
+
+    mutable = set()
+    for name, val in vars(POP).items():
+        if name.startswith("__") or name in _CONST_LIKE or name in _LOCK_LIKE:
+            continue
+        if isinstance(val, (types.FunctionType, type, types.ModuleType)):
+            continue
+        if name.startswith("_") and not callable(val):
+            mutable.add(name)
+
+    missing = mutable - _MUST_RESET
+    assert not missing, (
+        f"以下模块级可变状态未登记在 reset_cache 的清理清单里：{sorted(missing)}\n"
+        f"若它们会被测试或请求路径修改，就会造成跨用例状态污染"
+        f"（本次实测：_LAST_WARMUP_SECONDS 残留让比例守卫 order-dependent）")
+
+
+# ==========================================================================
+# 二十、D-17：`blue-coverage` 的整注口径失败必须**可被端点报告**
+#
+# 旧代码：
+#     except Exception:        # noqa: BLE001 —— 取不到就只给六等奖口径
+#         full_ratio = None
+#         assumption = None
+# 这是**静默**：用户看到 `sixth_mode=None`、没有 `ev_ratio_full`，
+# 但不知道是"没请求"还是"取不到"，更不知道该怎么办。
+#
+# Lead 的要求分三层（缺一不可）：
+#   ① 不能静默；② 不能只进日志（日志没人看）；③ **必须进 `degraded_items`**。
+# 另加：④ 没异常时**不得**报降级（否则永远报 = 用户习惯性忽略，比静默更糟）。
+# ==========================================================================
+
+def test_blue_coverage_reports_degraded_when_full_ev_fails(monkeypatch):
+    """判据 1+2+3：异常时必须进 `degraded_items`，且三段字段齐全具体。"""
+    from lottery import engine
+
+    def boom(*a, **k):
+        raise RuntimeError("模拟奖金假设表损坏")
+
+    monkeypatch.setattr(engine, "_single_ticket_ev", boom)
+
+    body = _json(R.portfolio_blue_coverage(n_tickets=10))
+    items = body["degraded_items"]
+    assert items, "整注口径失败却没有任何降级项 —— 仍是静默"
+    assert len(items) == 1
+
+    item = items[0]
+    assert item["id"] == "ev_ratio_full"
+    # reason 要说清**是什么坏了**，不许写"发生错误"
+    assert "整注返奖比" in item["reason"]
+    assert "RuntimeError" in item["reason"], "应带上异常类型，便于排查"
+    assert "发生错误" not in item["reason"], "不许用笼统措辞"
+    # 同时要说清**什么没坏** —— 否则用户会以为整个端点不能用
+    assert "六等奖" in item["reason"]
+    # how_to_restore 必须是可执行动作，不许写"请联系管理员"
+    assert item["how_to_restore"]
+    assert "_single_ticket_ev" in item["how_to_restore"]
+    assert "联系管理员" not in item["how_to_restore"]
+
+
+def test_blue_coverage_no_degraded_when_ev_succeeds():
+    """**判据 4（最易漏）**：正常路径下不得出现降级项。
+
+    只测"有异常时会报"、不测"没异常时不报"，结果是永远报降级 ——
+    用户会习惯性忽略它，**比静默更糟**。
+    """
+    body = _json(R.portfolio_blue_coverage(n_tickets=10))
+    assert body["degraded_items"] == [], (
+        f"正常路径却报了降级项：{body['degraded_items']}")
+    assert body["sixth_mode"] == "strict"
+    assert "ev_ratio_full" in body
+
+
+def test_blue_coverage_degraded_when_full_ev_disabled_by_request():
+    """用户主动 `full_ev=False` **不算降级**（那是他自己的选择，不是故障）。"""
+    body = _json(R.portfolio_blue_coverage(n_tickets=10, full_ev=False))
+    assert body["degraded_items"] == [], (
+        "用户主动关闭整注口径不应被报成降级 —— 那是预期行为，不是故障")
+    assert body["sixth_mode"] is None
+
+
+def test_blue_coverage_sixth_ev_never_affected_by_full_ev_failure(monkeypatch):
+    """整注口径失败时，六等奖口径必须完全不受影响（这是降级的边界）。"""
+    from lottery import engine
+
+    monkeypatch.setattr(engine, "_single_ticket_ev",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
+    body = _json(R.portfolio_blue_coverage(n_tickets=10))
+    assert body["ev_ratio_sixth"] == pytest.approx(5 / 32, abs=1e-9)
+    assert body["ev_sixth_yuan"] == pytest.approx(3.125, abs=1e-9)
+    assert body["ok"] is True, "六等奖仍可用 ⇒ 整体仍应 200"

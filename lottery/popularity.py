@@ -619,11 +619,39 @@ def suggest_retry_after() -> int:
 
 
 def reset_cache() -> None:
-    """清空进程内模型缓存（测试与 `force_refit` 用）。"""
-    global _CACHE
+    """清空**全部**进程内可变状态（测试与 `force_refit` 用）。
+
+    ## 为什么必须清全部，而不只是模型缓存（2026-10-21 实测）
+
+    旧实现只清 `_CACHE` 与 `_READY`，留下 5 个残留：
+
+    | 残留 | 后果 |
+    |---|---|
+    | `_WARMING` | `is_warming()` 跨用例为真 → 端点误报「预热中」 |
+    | `_LAST_WARMUP_SECONDS` | `suggest_retry_after()` 返回**上个用例**的值 |
+    | `_LAST_FIT_SECONDS` | 同上 |
+    | `_FIT_STARTED_AT` | 参与「已耗时下界」计算 → 估计值异常 |
+    | `_LAST_UNFIT_REASON` | `describe()` 报告错误的未就绪原因 |
+    | `_RETRY_EXHAUSTED` | 端点误报「不会再重试」 |
+
+    **其中耗时类残留最严重**：新增的「比例守卫」正是读 `_LAST_WARMUP_SECONDS`
+    做断言。它一旦被上个用例的残留值影响，守卫就变成 **order-dependent** ——
+    同一份代码换个测试顺序就可能红或绿。
+    **守卫本身不可信，比没有守卫更糟。**
+
+    这条不是"测试卫生"问题，是"守卫可信度"问题。
+    """
+    global _CACHE, _LAST_WARMUP_SECONDS, _LAST_FIT_SECONDS, _FIT_STARTED_AT
+    global _LAST_UNFIT_REASON, _RETRY_EXHAUSTED
     with _CACHE_LOCK:
         _CACHE = None
         _READY.clear()
+        _WARMING.clear()
+        _LAST_WARMUP_SECONDS = None
+        _LAST_FIT_SECONDS = None
+        _FIT_STARTED_AT = None
+        _LAST_UNFIT_REASON = "unknown"
+        _RETRY_EXHAUSTED = False
 
 
 # ---------- 落盘缓存（跨进程重启复用，跳过 7 秒重拟合） ----------
