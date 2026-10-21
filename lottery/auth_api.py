@@ -186,13 +186,37 @@ def auth_me(request: Request):
 
     为什么不用 401：前端启动探测要区分"没登录"和"接口坏了"，
     401 会让前端的统一错误处理把它当异常弹窗。
+
+    ## `csrf_token` 下发（API-1 v1.0 §3.1，2026-10-21）
+
+    已登录时一并返回**本会话自己的** `csrf_token`，与 `/api/auth/login` 下发的
+    是同一个值。
+
+    为什么必须有这条：`csrf_token` 原先只在 login 响应体里给。前端刷新页面后
+    内存态清空、Cookie 仍在 → 会话有效但拿不到 csrf → **所有写操作恒 403**
+    （实测：`{"ok":false,"error":"CSRF 校验失败"}`），且该 403 不带
+    `auth_required`，前端无法识别为「需要重新登录」。
+
+    ⚠️ **不得每次调用新生成**：契约 §3.1 明确要求返回会话记录里的那个值。
+    若在此处 `new_csrf_token()`，多标签页 / 并发请求会各自拿到不同值而互相
+    失效，缺陷从「刷新丢 csrf」变成「每请求都换 csrf」，更隐蔽也更难查。
     """
     sess = session_from_request(request)
     if not sess:
         return {"ok": True, "authenticated": False, "user": None,
-                "auth_enforced": config.auth_enforced()}
+                "auth_enforced": config.auth_enforced(), "csrf_token": None}
+
+    # API-1 v1.1 §3.1 硬约束：authenticated===true 时 csrf_token **必须非空**。
+    # 正常路径 create_session 一定写了；但老数据/手工插库可能为空。若这里用
+    # `or None` 兜底，就把「已登录 + null」这个**按 v1.1 属契约违背**的形态合法化了。
+    # 处理：为空则补一个并持久化回该会话（同时满足「非空」与「稳定」）。
+    csrf = (sess.get("session") or {}).get("csrf_token") or ""
+    if not csrf:
+        csrf = auth.ensure_session_csrf(sess["session"]["session_id"])
     return {"ok": True, "authenticated": True, "user": _me_payload(sess["user"]),
-            "auth_enforced": config.auth_enforced()}
+            "auth_enforced": config.auth_enforced(),
+            # 取自会话记录（或补齐后已持久化的值），**不新造临时值**。
+            "csrf_token": csrf}
 
 
 @router.post("/api/auth/login")

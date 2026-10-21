@@ -249,10 +249,16 @@ def get_conn() -> sqlite3.Connection:
 
     签名与历史实现一致 —— 这是刻意为之：改造的是内部实现，
     不是 200+ 处调用点。
+
+    测试上下文的**生产库护栏**挂在这里：这是全项目唯一的建连入口，
+    放在此处的覆盖率是 100%（改 config 里定义一个没人调的函数等于没做）。
     """
     conn = getattr(_TLS, "conn", None)
     if conn is not None:
         return conn
+    # 测试上下文里若 DB_PATH 指向生产库 → 直接 raise（见 config.guard_prod_db）。
+    # 只在建连那一刻检查，正常生产运行无 pytest 痕迹，不触发。
+    config.guard_prod_db()
     conn = sqlite3.connect(str(config.DB_PATH), timeout=5.0)
     _configure(conn)
     _ensure_initialized(conn)

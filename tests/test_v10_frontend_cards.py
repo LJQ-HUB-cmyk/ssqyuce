@@ -34,6 +34,20 @@ import pytest
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 INDEX_HTML = WEB_DIR / "index.html"
 APP_JS = WEB_DIR / "static" / "app.js"
+
+def _js_code() -> str:
+    """剥离注释后的 app.js。
+
+    ⚠️ 为什么需要（2026-10-21）：本文件有断言用「字符串是否出现」来验证前端行为。
+    若该字符串**同时出现在注释里**，删掉实现后断言仍然通过 —— 典型假绿。
+    实测发现本文件 ``\u201c照常出号\u201d``、``\u201c不受系统配额限制\u201d`` 两处在注释中也有，
+    故改用本函数。新增此类断言一律用它。
+    """
+    import re as _re
+    js = APP_JS.read_text(encoding="utf-8")
+    js = _re.sub(r"/\*.*?\*/", "", js, flags=_re.S)
+    js = _re.sub(r"(?<![:\"'])\s*//[^\n]*", "", js)
+    return js
 STYLE_CSS = WEB_DIR / "static" / "style.css"
 
 # 明确的跨来源/跨族合计字段名：这些**不得**出现在禁止相加的返回体里
@@ -339,7 +353,7 @@ def test_three_cards_dom_and_renderers_exist():
 
 def test_frontend_renders_honesty_and_no_sum():
     """前端必须渲染诚实边界提示与「禁止相加」，且不得渲染合计行。"""
-    js = APP_JS.read_text(encoding="utf-8")
+    js = _js_code()   # 剥离注释：「禁止相加」在注释里也出现
     assert "v10-honesty" in js, "缺少诚实边界提示条样式类"
     assert "改变分布不改变 EV" in js
     assert "trusted=False 是随机彩票的诚实结论" in js

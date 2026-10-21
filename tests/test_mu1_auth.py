@@ -309,6 +309,108 @@ def test_me_returns_200_when_anonymous(client):
     assert r.json()["authenticated"] is False
 
 
+# ---------------------------------------------------------------------------
+# `/api/auth/me` 下发 csrf_token（API-1 v1.0 §3.1，2026-10-21）
+#
+# 缺陷背景：csrf_token 原先只在 login 响应体里给。前端刷新页面后内存态清空，
+# 会话仍有效但拿不到 csrf → **所有写操作恒 403**（`CSRF 校验失败`），且该 403
+# 不带 `auth_required`，前端无法识别为「需要重新登录」。
+# ---------------------------------------------------------------------------
+
+def test_me_returns_null_csrf_when_anonymous(client):
+    """未登录时 `csrf_token` 字段必须存在且为 `null`（不是缺字段、不是空串）。"""
+    body = client.get("/api/auth/me").json()
+    assert "csrf_token" in body, "字段必须存在，不随登录态增删（契约 §1.6 空值四态）"
+    assert body["csrf_token"] is None, "未登录应为 null，不是 '' 或缺字段"
+
+
+def test_me_returns_same_csrf_as_login(client, normal_user):
+    """已登录时 `me` 的 csrf_token 必须与 login 下发值**完全相同**。
+
+    这是本次变更的全部意义：前端刷新后靠它恢复写能力，不必重新登录。
+    """
+    u, pw = normal_user
+    login = client.post("/api/auth/login", json={"username": "alice", "password": pw})
+    login_csrf = login.json()["csrf_token"]
+    assert login_csrf
+
+    me = client.get("/api/auth/me").json()
+    assert me["csrf_token"] == login_csrf, (
+        "me 下发的 csrf 必须与 login 同值；若每次新生成，多标签页会互相失效")
+
+
+def test_me_csrf_is_stable_across_calls(client, normal_user):
+    """连续多次调用 `me` 必须返回同一个 csrf 值（不得每次新生成）。
+
+    契约 §3.1 明确要求「取自会话记录」。若实现误写成 `new_csrf_token()`，
+    三次调用会得到三个不同值 —— 本用例把「不许新造」钉成可回归的断言。
+    """
+    u, pw = normal_user
+    client.post("/api/auth/login", json={"username": "alice", "password": pw})
+    values = {client.get("/api/auth/me").json()["csrf_token"] for _ in range(3)}
+    assert len(values) == 1, f"csrf_token 在多次调用间发生变化：{values}"
+
+
+def test_me_csrf_enables_write_after_page_refresh(client, normal_user):
+    """端到端：模拟页面刷新丢掉内存 csrf → 写操作 403 → 用 me 恢复后成功。
+
+    缺陷 1 的回归用例，对应前端 `recoverCsrfAndHint` 的契约依据。
+    """
+    u, pw = normal_user
+    client.post("/api/auth/login", json={"username": "alice", "password": pw})
+
+    # 刷新后：Cookie 还在，内存 csrf 丢了 → 写操作必须 403
+    blocked = client.post("/api/auth/password",
+                          json={"old_password": pw, "new_password": "AliceNewPass456"})
+    assert blocked.status_code == 403, "无 csrf 的写操作应当被拒"
+    assert "CSRF" in blocked.json().get("error", "")
+
+    # 用 me 拿回 csrf 后重试 → 必须成功
+    csrf = client.get("/api/auth/me").json()["csrf_token"]
+    ok = client.post("/api/auth/password",
+                     json={"old_password": pw, "new_password": "AliceNewPass456"},
+                     headers={"X-CSRF-Token": csrf})
+    assert ok.status_code == 200, f"用 me 的 csrf 应当能写：{ok.text}"
+    assert ok.json().get("relogin_required") is True
+
+
+def test_me_never_returns_null_csrf_when_authenticated(client, normal_user, isolated_env):
+    """**API-1 v1.1 §3.1 硬约束**：`authenticated===true` 时 `csrf_token` 不得为空。
+
+    回归背景：v1.1 之前，§1.6「字段必须存在」+ §3.1「未登录为 null」两条叠加，
+    会让「已登录 + csrf_token:null」成为**字面合法值**，而它实际是缺陷。
+    v1.1 把这条钉死为实现缺陷。
+
+    本用例构造最恶劣的情形：会话记录里的 csrf_token 被人为清空（模拟老数据 /
+    手工插库）。实现必须补一个并落库，**不能返回 null 让前端去猜**。
+    """
+    from lottery import auth, db
+
+    u, pw = normal_user
+    client.post("/api/auth/login", json={"username": "alice", "password": pw})
+    session_id = client.cookies.get("__Host-ssq_sid")
+    assert session_id, "登录后应有会话 Cookie"
+
+    # 人为清空会话的 csrf，模拟异常数据
+    conn = db.get_conn()
+    conn.execute("UPDATE user_sessions SET csrf_token='' WHERE session_id=?", (session_id,))
+    conn.commit()
+    auth.invalidate_session_cache(session_id)
+
+    body = client.get("/api/auth/me").json()
+    assert body["authenticated"] is True
+    assert body["csrf_token"], "已登录时 csrf_token 必须非空（v1.1 契约违背判定）"
+
+    # 且必须稳定：不能每次调用新造
+    again = client.get("/api/auth/me").json()["csrf_token"]
+    assert again == body["csrf_token"], "补齐后必须稳定，不能在每次调用时变化"
+
+    # 且必须落库（下一次会话解析仍能读到同一个值）
+    row = conn.execute("SELECT csrf_token FROM user_sessions WHERE session_id=?",
+                       (session_id,)).fetchone()
+    assert row and row[0] == body["csrf_token"], "补齐的 csrf 必须持久化回会话记录"
+
+
 def test_login_success_sets_cookie_and_returns_csrf(client, normal_user):
     u, pw = normal_user
     r = client.post("/api/auth/login", json={"username": "alice", "password": pw})
@@ -627,3 +729,178 @@ def test_token_protects_info_endpoint(client, monkeypatch):
     assert ok.status_code == 200
     # 探活永远例外（容器 healthcheck 不带 token）
     assert client.get("/api/health").status_code == 200
+
+
+def test_csrf_repair_failure_is_audited_not_swallowed(isolated_env, monkeypatch):
+    """落库失败时必须留痕（高架构 2026-10-21 合规条件 3）。
+
+    为什么这条必须存在：落库失败意味着下次调用**又生成一个新值**，「同值稳定」
+    失效。若静默吞掉，线上表现是「偶发 csrf 失效」，且日志里什么都没有——
+    这正是最难查的一类故障。
+    """
+    from lottery import auth
+
+    u = auth.create_user("csrfrepair", "Fixture-Pass-123", role="user")
+    sess = auth.create_session(u["user_id"])
+    sid = sess["session_id"]
+
+    # 清空 csrf，触发补齐路径
+    from lottery import db
+    conn = db.get_conn()
+    conn.execute("UPDATE user_sessions SET csrf_token='' WHERE session_id=?", (sid,))
+    conn.commit()
+    auth.invalidate_session_cache(sid)
+
+    # 让 UPDATE 失败：sqlite3.Connection.execute 是只读属性，不能直接 patch，
+    # 改用代理对象包住连接，只对目标 UPDATE 抛异常、其余转发（audit 的 INSERT 需正常）。
+    real_execute = conn.execute
+
+    class BoomConn:
+        def execute(self, sql, *a, **kw):
+            if "UPDATE user_sessions SET csrf_token" in sql:
+                raise RuntimeError("simulated_write_failure")
+            return real_execute(sql, *a, **kw)
+
+        def commit(self):
+            return conn.commit()
+
+        def __getattr__(self, name):
+            return getattr(conn, name)
+
+    monkeypatch.setattr(db, "get_conn", lambda: BoomConn())
+
+    before = real_execute("SELECT COUNT(*) FROM user_audit_log").fetchone()[0]
+    value = auth.ensure_session_csrf(sid)          # 不得抛异常（不能把 me 变 500）
+    after = real_execute("SELECT COUNT(*) FROM user_audit_log").fetchone()[0]
+
+    assert value, "即便落库失败，本次返回值仍须非空（契约 §3.1 硬约束）"
+    assert after > before, "落库失败必须写审计，不得静默吞掉"
+    last = real_execute(
+        "SELECT action, result FROM user_audit_log ORDER BY rowid DESC LIMIT 1").fetchone()
+    assert last["action"] == "session.csrf_repair_failed"
+    assert last["result"] == "failed"
+
+
+def test_csrf_repair_is_idempotent_and_never_rotates(isolated_env):
+    """已有非空 csrf 时，任何调用都不得轮换（合规条件 1）。
+
+    轮换会让另一个标签页手里的旧 token 立刻失效，缺陷从「刷新丢 csrf」
+    变成「多标签页互踢」——更难复现。
+    """
+    from lottery import auth, db
+
+    u = auth.create_user("csrfrotate", "Fixture-Pass-123", role="user")
+    sess = auth.create_session(u["user_id"])
+    original = sess["csrf_token"]
+    for _ in range(5):
+        assert auth.ensure_session_csrf(sess["session_id"]) == original
+    stored = db.get_conn().execute(
+        "SELECT csrf_token FROM user_sessions WHERE session_id=?",
+        (sess["session_id"],)).fetchone()[0]
+    assert stored == original, "已存在的 csrf 不得被轮换"
+
+
+# ---------------------------------------------------------------------------
+# BUG-1：非 ASCII 凭据导致 500（`hmac.compare_digest` 对 str 只支持 ASCII）
+#
+# 缺陷性质：500 不是「校验失败」，是**服务端崩溃**。任何人发一个带中文字符的
+# 请求头/请求体就能触发 ⇒ 外部可控的服务端异常，会进告警、污染监控。
+# 契约 API-1 §1.4 要求 CSRF 失败 = 403、未认证 = 401，**都不含 500**。
+#
+# 同源三处：`require_csrf`（X-CSRF-Token 头）、`claim_bootstrap_token`
+# （bootstrap 请求体）、`api_app._token_ok`（Authorization 头）。
+# ---------------------------------------------------------------------------
+
+_NON_ASCII_CASES = ["中文csrf", "café", "naïve", "日本語", "emoji🔒"]
+
+
+def test_non_ascii_csrf_does_not_crash_and_correct_token_still_works(client, normal_user):
+    """非 ASCII 触发失败后，正确 csrf 仍能用（证明没有污染会话状态）。
+
+    注意：不能用 TestClient 传非 ASCII 头（httpx 在客户端就拒），
+    故走单元层 `require_csrf` 触发同一逻辑，再验证 HTTP 层正确 csrf 仍可用。
+    """
+    from lottery import auth
+    u, pw = normal_user
+    client.post("/api/auth/login", json={"username": "alice", "password": pw})
+    sess = {"csrf_token": client.get("/api/auth/me").json()["csrf_token"]}
+    assert auth.require_csrf(sess, "中文csrf") is False
+    csrf = client.get("/api/auth/me").json()["csrf_token"]
+    ok = client.post("/api/auth/password",
+                     json={"old_password": pw, "new_password": "AliceNewPass456"},
+                     headers={"X-CSRF-Token": csrf})
+    assert ok.status_code == 200, f"正确 csrf 应仍可用：{ok.text}"
+
+
+def test_require_csrf_returns_false_not_raises_for_non_ascii(isolated_env):
+    """单元层：`require_csrf` 对非 ASCII 必须返回 False，不得抛异常。"""
+    from lottery import auth
+
+    session = {"csrf_token": "ascii-token-abc"}
+    for bad in _NON_ASCII_CASES:
+        assert auth.require_csrf(session, bad) is False, f"{bad!r} 应返回 False"
+    assert auth.require_csrf(session, "ascii-token-abc") is True
+
+
+def test_claim_bootstrap_token_returns_false_not_raises_for_non_ascii(isolated_env,
+                                                                    monkeypatch):
+    """单元层：`claim_bootstrap_token` 对非 ASCII 必须返回 False，不得抛异常。
+
+    这处是 Lead 初判「安全」、经实测确认会 500 的一处（他复核时把 str 转了 bytes
+    才没触发）。保留注释以免后人又把它判回「安全」。
+    """
+    from lottery import auth
+
+    monkeypatch.setenv("LOTT_BOOTSTRAP_TOKEN", "ascii-bootstrap-token")
+    for bad in _NON_ASCII_CASES:
+        assert auth.claim_bootstrap_token(bad) is False
+    assert auth.claim_bootstrap_token("ascii-bootstrap-token") is True
+
+
+
+
+def test_non_ascii_header_reaches_compare_digest_via_latin1(isolated_env, normal_user):
+    """BUG-1 的真实可达路径：Starlette 用 latin-1 解码请求头字节。
+
+    为什么不能直接用 TestClient 传 `headers={"X-CSRF-Token": "中文"}`：
+    httpx/h11 在**客户端**就拒绝非 ASCII 头（`UnicodeEncodeError`），
+    所以那种写法测的是 httpx，不是被测代码 —— 这是构造假绿/假红的典型陷阱。
+
+    真实路径（已实测）：客户端发原始字节 `b"caf\xe9"`，Starlette
+    `Headers(raw=[...])` 按 latin-1 解码得到 `"café"`（含非 ASCII）→
+    落入 `require_csrf` → 修复前 `hmac.compare_digest(str,str)` 抛 TypeError → 500。
+
+    本用例直接在该解码结果上验证 `require_csrf`，锚定缺陷真正发生的那一层。
+    """
+    from starlette.datastructures import Headers
+    from lottery import auth
+
+    # 模拟服务端收到的原始头字节（非 ASCII）
+    raw = Headers(raw=[(b"x-csrf-token", b"caf\xe9")])
+    decoded = raw.get("x-csrf-token")
+    assert decoded and any(ord(ch) > 127 for ch in decoded), (
+        "前提校验：latin-1 解码后必须含非 ASCII，否则本用例失去意义")
+
+    session = {"csrf_token": "ascii-token"}
+    # 修复前：这里抛 TypeError（→ 500）；修复后：返回 False（→ 403）
+    assert auth.require_csrf(session, decoded) is False
+
+    # 同样验证 Authorization 头那条路径 —— **必须调用产品函数 `_token_ok`**。
+    # 教训（2026-10-21 变异测试抓到）：我曾在这里直接调 `hmac.compare_digest` 验证，
+    # 于是「把产品代码改回 str 比较」这个变异**没有被任何用例抓到**（退出码 0）——
+    # 测的是标准库，不是被测代码。断言必须锚在产品的那个函数上。
+    from lottery import api_app, config
+    import types
+
+    raw_auth = Headers(raw=[(b"authorization", b"Bearer caf\xe9")])
+    got = raw_auth.get("authorization")
+    assert got and any(ord(ch) > 127 for ch in got), "前提：latin-1 解码后含非 ASCII"
+
+    req = types.SimpleNamespace(headers={"authorization": got})
+    old_token = config.API_TOKEN
+    try:
+        config.API_TOKEN = "TOKEN_FIXTURE"
+        # 修复前：抛 TypeError（→500）；修复后：返回 False（→401）
+        assert api_app._token_ok(req) is False
+    finally:
+        config.API_TOKEN = old_token

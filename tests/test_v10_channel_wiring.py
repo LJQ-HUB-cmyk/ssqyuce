@@ -26,6 +26,20 @@ WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 INDEX_HTML = WEB_DIR / "index.html"
 APP_JS = WEB_DIR / "static" / "app.js"
 
+def _js_code() -> str:
+    """剥离注释后的 app.js。
+
+    ⚠️ 为什么需要（2026-10-21）：本文件有断言用「字符串是否出现」来验证前端行为。
+    若该字符串**同时出现在注释里**，删掉实现后断言仍然通过 —— 典型假绿。
+    实测发现本文件 ``\u201c照常出号\u201d``、``\u201c不受系统配额限制\u201d`` 两处在注释中也有，
+    故改用本函数。新增此类断言一律用它。
+    """
+    import re as _re
+    js = APP_JS.read_text(encoding="utf-8")
+    js = _re.sub(r"/\*.*?\*/", "", js, flags=_re.S)
+    js = _re.sub(r"(?<![:\"'])\s*//[^\n]*", "", js)
+    return js
+
 
 # ---------------------------------------------------------------- 公共构造器
 
@@ -259,7 +273,7 @@ def test_cfgllm_checkbox_not_hardcoded_checked():
 
 def test_frontend_has_localstorage_version_migration():
     """``app.js`` 必须有一次性默认值迁移（旧 ``localStorage.cfgLlm`` 会吃掉新默认值）。"""
-    js = APP_JS.read_text(encoding="utf-8")
+    js = _js_code()   # 剥离注释：llm_can_pick 等在注释里也出现
     assert "cfgLlmVersion" in js, "缺少 localStorage 默认值版本号，老用户旧值不会被迁移"
     assert "migrateCfgDefaults" in js
     assert "removeItem(\"cfgLlm\")" in js

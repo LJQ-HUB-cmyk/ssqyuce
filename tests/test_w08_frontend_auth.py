@@ -38,6 +38,27 @@ def _css() -> str:
     return STYLE_CSS.read_text(encoding="utf-8")
 
 
+def _js_code() -> str:
+    """返回**剥离注释后**的 JS 源码。
+
+    ⚠️ 为什么必须剥注释（2026-10-21 实测教训）：
+    本用例最初用 ``assert "www-authenticate" in js.lower()`` 断言三形态判定存在。
+    做变异测试时把代码里的 ``headers.get("www-authenticate")`` 全删掉，
+    测试**仍然通过** —— 因为文件顶部的文档注释里写着 ``WWW-Authenticate``，
+    转小写后正好满足断言。也就是说那条断言测的是"注释里提过这个词"，
+    不是"代码实现了这个判断"。
+
+    一个抓不住回归的断言，比没有断言更危险：它给人"已验证"的错觉。
+    所以所有涉及"代码是否存在某行为"的断言，一律用本函数剥离注释后再比。
+    """
+    js = _js()
+    # 去掉 /* ... */ 块注释（含 JSDoc），保留字符串字面量里的内容
+    js = re.sub(r"/\*.*?\*/", "", js, flags=re.S)
+    # 去掉 // 行注释（避开 http:// 这类出现在字符串里的情况：要求 // 前不是 ':'）
+    js = re.sub(r"(?<![:\"'])\s*//[^\n]*", "", js)
+    return js
+
+
 def _ids_in_html() -> set:
     return set(re.findall(r'id="([^"]+)"', _html()))
 
@@ -148,13 +169,83 @@ def test_login_does_not_persist_csrf_to_localstorage():
 
 
 # ---------------------------------------------------------------------------
-# 4. 401 处理
+# 4. 401 / 403 / 423 鉴权失败处理
 # ---------------------------------------------------------------------------
+#
+# 断言原则（2026-10-21 修订，李工）：**断言行为，不断言实现字面量**。
+#
+# 背景：本用例原先断言源码里必须出现 `"r.status === 401"`。刘工 task-4 把
+# 401/403/423 分支抽成 `handleAuthFailure()` 后，行为完全一致（已用真浏览器
+# Playwright 取证：修复后 overlayShown=true、并发 5 个写操作只跳一次），
+# 但字面量 `r.status === 401` 不再出现 → 测试假红。
+#
+# 教训：字符串级断言把「实现写法」当成了「契约」。真正的契约是
+# `docs/team/design/API-1-auth-session.md` §1.4 的三形态判定：
+#   401 + WWW-Authenticate: Cookie → 跳登录
+#   401 + WWW-Authenticate: Bearer → 提示，不跳登录
+#   401 无该头                    → 登录接口凭据错，就地显示
+#   403 + CSRF                    → 恢复 csrf，不按会话失效处理
+#   423                           → 提示，不自动重试
+# 所以断言改成：三个形态各自的关键行为标记都在，且不绑定具体写法。
 
 def test_api_handles_401_by_showing_login():
-    js = _js()
-    assert "r.status === 401" in js
-    assert "showAuthOverlay(true" in js
+    """401 三分支：只有 `Cookie` 分支会跳登录层，且跳登录只有一个入口。
+
+    断言对象是**剥离注释后的代码**（见 `_js_code`）：注释里提到不算实现。
+    """
+    js = _js_code()
+    low = js.lower()
+    # ① 按响应头区分三形态（而不是按路径枚举）
+    assert "www-authenticate" in low, (
+        "401 必须按 WWW-Authenticate 头区分三形态（契约 API-1 §1.4），"
+        "否则 423/403 与真正的会话失效会被混为一谈")
+    # ② 三种形态都要有对应处理标记
+    assert "cookie" in low and "bearer" in low, (
+        "必须同时处理 Cookie 与 Bearer 两种 401 形态（契约 §1.4 前两行）")
+    # ③ 跳登录层确实存在（行为结果，不是写法）
+    assert "showAuthOverlay(true" in js, "必须存在跳登录层的动作"
+    # ④ 401 判定仍然存在于代码（允许 `status === 401` 或 `r.status === 401`，
+    #    不为任何单一写法背书）
+    assert re.search(r"(?:\bstatus\b|\br\.status\b)\s*===\s*401", js), (
+        "必须仍存在 401 判定分支")
+
+
+def test_csrf_failure_is_not_treated_as_session_expiry():
+    """403 + CSRF 必须走「恢复凭据」而不是「会话失效」。
+
+    契约 API-1 §1.5：CSRF 失败是 403 且 body 无 `auth_required`，
+    若按 401 处理会让用户反复被踢出登录。这条正是缺陷 1/2 的根治点，
+    刘工 task-4 用 `csrfRecovering` 做了并发去重。
+    """
+    js = _js_code()
+    assert "CSRF" in js, "必须识别 CSRF 失败文案"
+    assert re.search(r"csrfRecovering|recoverCsrf", js), (
+        "CSRF 恢复必须有并发去重标记（契约 §1.5 + task-4 AC「并发只跳一次」）")
+    # ⑤' 必须真的**判定** CSRF 文案，而不只是"调用恢复语句还在"。
+    #     2026-10-21 变异验证实测：把 `if (msg.indexOf("CSRF") >= 0)` 整句换成
+    #     `if (false)` 后，下面的调用断言仍然通过（调用语句没被删，只是永不执行）——
+    #     说明单靠「调用存在」锚不住「条件正确」。等价破坏必须两种都试。
+    assert re.search(r'indexOf\(\s*"CSRF"\s*\)', js), (
+        "必须按后端文案判定 403 CSRF（契约 §1.5 只给了文案，没有错误码），"
+        "否则条件恒假时调用语句仍在、测试假绿")
+    # ⑤ 恢复必须被**真正调用**：只定义不调用 = 死代码。
+    #    2026-10-21 变异测试实测：把 `recoverCsrfAndHint(path);` 这行删掉，
+    #    上面两条断言仍然全绿（函数定义还在，字符串仍在代码里）——典型假绿。
+    #    注意必须要求**末尾分号**：函数定义 `async function recoverCsrfAndHint(path) {`
+    #    本身就能匹配 `recoverCsrfAndHint(path)`——我第一次就是这么写的，删掉调用仍全绿。
+    assert re.search(r"\brecoverCsrfAndHint\s*\(\s*path\s*\)\s*;", js), (
+        "403 CSRF 分支必须实际调用 recoverCsrfAndHint(path);（带分号＝调用，定义行无分号），"
+        "只定义不调用等于没恢复")
+    # ⑥ 恢复函数不能读共享的 AUTH 对象来判断成败（读它 = 读原值 = 什么都没验）。
+    #    实测教训：旧写法 `const j = await loadAuthState(); if (j.csrf)` 永远判成功、永不跳登录。
+    assert not re.search(r"const\s+j\s*=\s*await\s+loadAuthState\(\)", js), (
+        "恢复里不得读 loadAuthState() 的返回值（共享 AUTH 对象），必须重新探测 /api/auth/me")
+
+
+def test_locked_account_is_not_auto_retried():
+    """423 账号锁定：只提示，不自动重试（重试会续锁）。"""
+    js = _js_code()
+    assert "423" in js, "必须显式处理 423 账号锁定（契约 API-1 §1.4）"
 
 
 def test_boot_probes_auth_before_loading_data():

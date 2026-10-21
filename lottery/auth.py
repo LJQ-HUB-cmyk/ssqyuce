@@ -181,6 +181,51 @@ def new_csrf_token() -> str:
     return base64.urlsafe_b64encode(os.urandom(CSRF_TOKEN_BYTES)).decode("ascii").rstrip("=")
 
 
+def ensure_session_csrf(session_id: str) -> str:
+    """返回该会话的 csrf_token；记录中为空则补一个并**持久化**后返回。
+
+    为什么需要（API-1 v1.1 §3.1 硬约束）：
+    `authenticated===true` 时 `csrf_token` **必须非空**，否则构成契约违背。
+    正常路径 `create_session` 一定写了 csrf_token；但老数据 / 手工插库可能为空。
+    此时既不能返回 null（违反契约），也不能每次调用新造（多标签页会互相失效）。
+    正确做法：补一次并写回会话记录 —— 同时满足"非空"与"稳定"。
+
+    幂等：记录里已有值则直接返回，不做任何写操作。
+    """
+    from . import db
+    conn = db.get_conn()
+    row = conn.execute(
+        "SELECT csrf_token FROM user_sessions WHERE session_id=?", (session_id,)
+    ).fetchone()
+    if row is None:
+        # 会话不存在：调用方本不该走到这里（resolve_session 已过滤）。
+        # 返回一个值但不落库，且不抛异常，避免把 me 变成 500；
+        # 但**必须留痕**，否则这是一次静默的契约异常（高架构 2026-10-21 条件 3）。
+        audit("session.csrf_missing", result="denied",
+              detail={"session_id": session_id[:8], "reason": "session_row_absent"})
+        return new_csrf_token()
+    existing = (row["csrf_token"] or "").strip()
+    if existing:
+        return existing
+    fresh = new_csrf_token()
+    persisted = False
+    try:
+        conn.execute("UPDATE user_sessions SET csrf_token=? WHERE session_id=?"
+                     " AND (csrf_token IS NULL OR csrf_token='')", (fresh, session_id))
+        conn.commit()
+        persisted = True
+    except Exception as e:   # noqa: BLE001
+        # 不静默吞（高架构条件 3）：落库失败意味着下次调用很可能**又生成一个新值**，
+        # 即「同值稳定」失效。必须可观测，否则线上表现为「偶发 csrf 失效」且无从查起。
+        audit("session.csrf_repair_failed", result="failed",
+              detail={"session_id": session_id[:8], "reason": type(e).__name__})
+    if persisted:
+        audit("session.csrf_repaired", result="ok",
+              detail={"session_id": session_id[:8], "reason": "was_empty"})
+    invalidate_session_cache(session_id)   # 让缓存下次重建时带上新值
+    return fresh
+
+
 _SESSION_CACHE: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}
 _SESSION_CACHE_LOCK = threading.Lock()
 
@@ -494,11 +539,22 @@ def revoke_user_sessions(user_id: int, *, reason: str = "",
 
 
 def require_csrf(session: Dict[str, Any], token: Optional[str]) -> bool:
-    """双提交校验：请求头 `X-CSRF-Token` 必须等于会话里的 csrf_token。"""
+    """双提交校验：请求头 `X-CSRF-Token` 必须等于会话里的 csrf_token。
+
+    ⚠️ **必须转 bytes 再比**（BUG-1，2026-10-21）：
+    `hmac.compare_digest` 对 `str` 只支持 ASCII，遇到任何非 ASCII 字符**抛 TypeError**
+    （实测：`'中文csrf'` / `'café'` / `'naïve'` 全部触发）。CSRF token 来自请求头，
+    是**外部可控输入** ⇒ 任何人发一个带中文字符的 `X-CSRF-Token` 就能把该请求打成 500。
+    500 不等于「CSRF 校验失败」：会进告警、污染监控、traceback 可能带内部路径。
+    而契约 API-1 §1.4 要求 CSRF 失败必须是 **403**。
+
+    转 bytes 后对任意非 ASCII 都返回 False（不抛异常），语义正确：
+    不匹配即校验失败 → 403。
+    """
     want = (session or {}).get("csrf_token") or ""
     if not want or not token:
         return False
-    return hmac.compare_digest(str(token), str(want))
+    return hmac.compare_digest(str(token).encode("utf-8"), str(want).encode("utf-8"))
 
 
 # ---------------------------------------------------------------------------
@@ -619,11 +675,17 @@ def claim_bootstrap_token(provided: str) -> bool:
     口令来自 ``LOTT_BOOTSTRAP_TOKEN``。**没有默认值**——未配置时引导通道整体关闭
     （返回 False），避免出现"默认口令"这种能被告警扫到的做法。
     用常量时间比较；成功一次后调用方必须立刻清空该 env（见 `consume_bootstrap_token`）。
+
+    ⚠️ **必须转 bytes**（BUG-1 同源，2026-10-21 实测）：`provided` 来自请求体
+    `payload["token"]`，是外部可控 str；非 ASCII 时 `compare_digest` 抛 TypeError →
+    `/api/auth/bootstrap` 返回 500。Lead 初判此处「安全」是误判（他复核时把 str
+    转成了 bytes 才没触发），本处经实测确认会 500，一并修掉。
     """
+
     expected = (os.environ.get("LOTT_BOOTSTRAP_TOKEN") or "").strip()
     if not expected or not provided:
         return False
-    return hmac.compare_digest(provided, expected)
+    return hmac.compare_digest(str(provided).encode("utf-8"), str(expected).encode("utf-8"))
 
 
 def consume_bootstrap_token() -> None:

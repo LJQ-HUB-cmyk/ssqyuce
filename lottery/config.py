@@ -14,6 +14,71 @@ DATA_DIR = BASE / "data"
 RAW_DIR = DATA_DIR / "raw"
 DB_PATH = Path(os.environ.get("LOTT_DB", str(DATA_DIR / "ssq.db")))
 
+# ---------------------------------------------------------------------------
+# 生产库路径护栏（2026-10-21）
+#
+# ## 为什么要有这个
+#
+# `os.environ.get(K, default)` 的行为是：**变量名拼错不报错，静默回落到默认值**，
+# 而本项目的默认值恰好是**生产库**。于是：
+#
+#   LOTT_DATA_DIR=/tmp/xx .venv/bin/python -c "..."   # 该变量不存在，被忽略
+#   → 所有 TestClient 写入 静默落到 ssqyuce/data/ssq.db
+#
+# 这不是假设：同一天内两个不同的人独立踩了同一个坑。
+#   * 李工：设 `LOTT_DATA_DIR` → 造出 tester1；
+#   * 高架构：设 `LOTT_DATA_DIR` → 造出 probe_admin 等 6 个（含 2 个 admin）。
+# 两次都"以为隔离了"，实际写了生产库，且**没有任何报错**。
+#
+# ## 护栏做什么
+#
+# 在**测试上下文**（pytest 运行中，或显式 `LOTT_REQUIRE_ISOLATION=1`）里，
+# 若实际生效的 `DB_PATH` 就是生产库，**直接抛异常中止**，把"静默写生产库"
+# 变成"一次响亮的失败"。
+#
+# 生产运行不受影响（无 pytest 痕迹、未设该 flag，护栏不触发）；
+# 真实库专用通道 `LOTT_TEST_REAL_DB=1`（真值锁用例）显式豁免。
+# ---------------------------------------------------------------------------
+
+#: 生产库规范路径（本文件所在包的上一级 = ssqyuce 项目根）
+PROD_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "ssq.db"
+
+
+def is_test_context() -> bool:
+    """当前是否处于测试上下文。判据取"存在即算"，宁可多拦一次也不漏。"""
+    if os.environ.get("LOTT_REQUIRE_ISOLATION") == "1":
+        return True
+    return any(os.environ.get(k) for k in
+               ("PYTEST_CURRENT_TEST", "PYTEST_VERSION", "PYTEST_ADDOPTS"))
+
+
+def guard_prod_db(*, allow_real: bool = False) -> None:
+    """测试上下文里若 DB_PATH 指向生产库，直接 raise。
+
+    `allow_real=True` 与 `LOTT_TEST_REAL_DB=1` 供真实库专用通道使用。
+    """
+    if allow_real or os.environ.get("LOTT_TEST_REAL_DB") == "1":
+        return
+    if not is_test_context():
+        return
+    try:
+        same = DB_PATH.resolve() == PROD_DB_PATH.resolve()
+    except OSError:          # 路径不可解析时按"非生产库"处理，避免误杀
+        return
+    if same:
+        raise RuntimeError(
+            "测试上下文里检测到 DB_PATH 指向生产库，已中止。\n"
+            f"  实际生效路径: {DB_PATH}\n"
+            f"  生产库路径  : {PROD_DB_PATH}\n"
+            "常见原因（本项目一天内踩过两次）：\n"
+            "  * 设了不存在的变量名 `LOTT_DATA_DIR` —— 它不报错，会被静默忽略；\n"
+            "  * 真正生效的是 `LOTT_DB`（数据库文件）与 `LOTT_HOME`（数据根）；\n"
+            "  * 或代码里直接给 config.DB_PATH 赋了值。\n"
+            "正确做法：用 scripts/isolated_test.sh，或显式设 LOTT_DB=/tmp/<uniq>.db 后\n"
+            "**打印实际生效路径**（不要只凭『我设了变量』就认定隔离成功）。\n"
+            "确需在真实库上跑（真值锁用例）时，显式设 LOTT_TEST_REAL_DB=1。"
+        )
+
 DATA_URL = "http://e.17500.cn/getData/ssq.TXT"
 STARTED_AT = time.time()
 # M4.5：配置后启用所有 /api/* 的 Bearer Token 校验；空值保持兼容开放。

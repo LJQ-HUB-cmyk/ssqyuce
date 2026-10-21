@@ -61,7 +61,7 @@ let AUTH = {
   authenticated: false,
   enforced: false,
   user: null,
-  csrf: "",        // /api/auth/me 不返回 CSRF，登录/引导响应里返回
+  csrf: "",        // 页面刷新后必须能从 /api/auth/me 恢复；该字段下发属契约变更（李工侧）
 };
 
 /** 是否需要在启动时弹登录层。灰度期（未 enforce）一律不弹。 */
@@ -102,6 +102,19 @@ async function loadAuthState() {
     AUTH.authenticated = !!j.authenticated;
     AUTH.enforced = !!j.auth_enforced;
     AUTH.user = j.user || null;
+    // 契约 API-1 §3.1（v1.1 硬约束）：/api/auth/me 下发 csrf_token。三分支缺一不可：
+    //   ① 未登录            → 不赋值（正常空态，值为 null）
+    //   ② 已登录 + 非空值    → 赋值（刷新后恢复写能力，无需重新登录）
+    //   ③ 已登录 + 空/缺失   → **契约违背**，不是合法空态：记日志 + 按 §1.5 兜底，
+    //                         不得静默带空值继续（否则要等写操作 403 才暴露）
+    if (j.authenticated) {
+      if (typeof j.csrf_token === "string" && j.csrf_token) {
+        AUTH.csrf = j.csrf_token;
+      } else {
+        console.error("[contract] 违背 API-1 §3.1 v1.1：authenticated=true 但 csrf_token 为空/缺失", j);
+        recoverCsrfAndHint("/api/auth/me");
+      }
+    }
     renderUserChip();
     return AUTH;
   } catch (e) {
@@ -339,9 +352,17 @@ async function doCreateUser() {
 /**
  * 统一 fetch 封装。
  *
- * 自动补 `X-CSRF-Token`（写操作）与 401 处理：
- *  * 收到 401 且后端启用鉴权 → 弹登录层，而不是抛一个"要 Bearer Token"的怪错误；
- *  * 收到 403 "需要管理员权限" → 明确提示，不静默失败。
+ * 自动补 `X-CSRF-Token`（写操作）与鉴权失败处理（口径见
+ * `docs/team/engineering/BACKEND.md` §2.1 / §2.7，本项目是 Cookie 会话制，
+ * **没有 refresh token**，401 靠 `WWW-Authenticate` 头区分三种形态）：
+ *
+ *  * 401 + `WWW-Authenticate: Cookie` → 会话失效/被踢/过期 → 跳登录层（**并发只跳一次**）；
+ *  * 401 + `WWW-Authenticate: Bearer` → 部署配了 LOTT_TOKEN 但没带 → 提示联系管理员，**不跳登录**；
+ *  * 401 无 `WWW-Authenticate` → 登录接口本身凭据错 → 就地显示，**不跳转**；
+ *  * 403 `CSRF 校验失败` → 页面刷新后 csrf 丢失（不是会话失效）→ 重新拉 `/api/auth/me`
+ *    拿新 csrf 后**重试一次**；仍失败则引导重新登录；
+ *  * 403 `需要管理员权限` → 明确提示，不静默失败；
+ *  * 423 账号锁定 → 提示倒计时，**不自动重试**（重试会续锁）。
  */
 async function api(path, opts = {}) {
   const isProbe = !!opts.authProbe;
@@ -368,18 +389,92 @@ async function api(path, opts = {}) {
     err.status = r.status;
     err.payload = payload || null;
     if (!isProbe) {
-      if (r.status === 401 && (payload && payload.auth_required)) {
-        AUTH.authenticated = false;
-        AUTH.enforced = true;
-        showAuthOverlay(true, "登录状态已失效，请重新登录。");
-      } else if (r.status === 403 && msg.indexOf("管理员") >= 0) {
-        toast("需要管理员权限：" + path);
-      }
+      handleAuthFailure(r, payload, msg, path);
     }
     throw err;
   }
   return r.json();
 }
+
+/** 401/403/423 的统一失败分支。抽成函数是为了让「并发只跳一次」的判定只有一处实现，
+ *  避免同一逻辑在多个调用点各写一份、越改越不一致。 */
+function handleAuthFailure(r, payload, msg, path) {
+  const status = r.status;
+  if (status === 401) {
+    // 按响应头区分，不按路径枚举（分路径枚举迟早漏一个）
+    const wwa = (r.headers.get("www-authenticate") || "").toLowerCase();
+    if (wwa.indexOf("cookie") >= 0) {
+      // 会话失效：只有这一支才跳登录
+      AUTH.authenticated = false;
+      AUTH.enforced = true;
+      AUTH.csrf = "";
+      showAuthOverlay(true, "登录状态已失效，请重新登录。");
+    } else if (wwa.indexOf("bearer") >= 0) {
+      // 部署配置问题：跳登录只会让人白输一次口令
+      toast("服务端要求 Bearer Token（部署配置问题），请联系管理员");
+    }
+    // 无 WWW-Authenticate → 登录接口凭据错，调用方就地显示表单错误，这里不处理
+    return;
+  }
+  if (status === 403) {
+    if (msg.indexOf("CSRF") >= 0) {
+      // 契约 API-1 §1.5：CSRF 失败是 403 不是 401（会话有效、只是防伪令牌缺失/不匹配）。
+      // 契约落地后正常不该出现；仍出现则按 §1.5 兜底：恢复一次 → 仍失败就引导重新登录。
+      recoverCsrfAndHint(path);
+      return;
+    }
+    if (msg.indexOf("管理员") >= 0) {
+      toast("需要管理员权限：" + path);
+      return;
+    }
+    if (msg.indexOf("账户不可用") >= 0) {
+      // 契约 §1.4：status 不可用（bootstrap/disabled/locked/软删）。
+      // 语义 = 这个账号不能再用了，而不是口令错；清本地态并跳登录，且**不自动重登**。
+      AUTH.authenticated = false;
+      AUTH.user = null;
+      AUTH.csrf = "";
+      showAuthOverlay(true, "该账号已不可用（被停用或锁定），请联系管理员。");
+      return;
+    }
+    return;
+  }
+  // 契约 §3.2：默认配置下「第 6 次失败」先撞限流返回 429，而不是 423 —— 两者都要表现成「稍后再试」
+  if (status === 423 || status === 429) {
+    // 423 不要自动重试（会续锁）；429 也不要（会继续消耗限流桶）
+    toast(msg || "尝试次数过多，请稍后再试");
+    return;
+  }
+}
+
+let csrfRecovering = false;
+
+/** CSRF 失效兜底：拉新 csrf → 有则静默重试一次；仍失败才引导重新登录。
+ *  `csrfRecovering` 保证并发多个 403 时只发起一次恢复、只提示一次（对齐「并发只跳一次」）。 */
+async function recoverCsrfAndHint(path) {
+  if (csrfRecovering) return;
+  csrfRecovering = true;
+  try {
+    // 注意：必须重新**发一次**探测，不能读 loadAuthState() 的返回值 ——
+    // 它返回的是「共享的 AUTH 对象」，读它等于读原值，等于「什么都没验」。
+    // （2026-10-21 浏览器实测踩到：因为读的是返回值，恢复永远判成功、永不跳登录。）
+    const j = await api("/api/auth/me", { authProbe: true });
+    if (j && j.authenticated && typeof j.csrf_token === "string" && j.csrf_token) {
+      AUTH.csrf = j.csrf_token;
+      toast("凭据已刷新，请重试刚才的操作");
+      return;
+    }
+    AUTH.authenticated = false;
+    AUTH.enforced = true;
+    showAuthOverlay(true, "页面凭据已失效，请重新登录。");
+  } catch (_) {
+    AUTH.authenticated = false;
+    AUTH.enforced = true;
+    showAuthOverlay(true, "页面凭据已失效，请重新登录。");
+  } finally {
+    csrfRecovering = false;
+  }
+}
+
 
 // ==================== 任务系统 ====================
 

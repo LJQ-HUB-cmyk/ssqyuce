@@ -17,6 +17,20 @@ from pathlib import Path
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 INDEX_HTML = WEB_DIR / "index.html"
 APP_JS = WEB_DIR / "static" / "app.js"
+
+def _js_code() -> str:
+    """剥离注释后的 app.js。
+
+    ⚠️ 为什么需要（2026-10-21）：本文件有断言用「字符串是否出现」来验证前端行为。
+    若该字符串**同时出现在注释里**，删掉实现后断言仍然通过 —— 典型假绿。
+    实测发现本文件 ``\u201c照常出号\u201d``、``\u201c不受系统配额限制\u201d`` 两处在注释中也有，
+    故改用本函数。新增此类断言一律用它。
+    """
+    import re as _re
+    js = APP_JS.read_text(encoding="utf-8")
+    js = _re.sub(r"/\*.*?\*/", "", js, flags=_re.S)
+    js = _re.sub(r"(?<![:\"'])\s*//[^\n]*", "", js)
+    return js
 STYLE_CSS = WEB_DIR / "static" / "style.css"
 
 
@@ -69,7 +83,7 @@ def test_no_stale_not_isolated_wording():
 
 def test_scope_three_states_are_explained():
     """三种来源都必须有**可读**的解释，尤其 none 要说明"照常出号、不是故障"。"""
-    js = _js()
+    js = _js_code()   # 剥离注释：这两句在注释里也出现，用 _js() 属假绿
     # renderLlmScope 的三个分支
     assert "user:" in js and "system:" in js and "none:" in js
     assert "照常出号" in js, "none 状态必须说明仍会正常出号"

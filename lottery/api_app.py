@@ -234,11 +234,18 @@ _TOKEN_EXEMPT = frozenset({"/api/health", "/api/auth/login", "/api/auth/bootstra
 
 
 def _token_ok(request: Request) -> bool:
-    """旧 LOTT_TOKEN 校验（Bearer）。"""
+    """旧 LOTT_TOKEN 校验（Bearer）。
+
+    ⚠️ **必须转 bytes**（BUG-1 同源，2026-10-21 实测）：`got` 来自 `Authorization`
+    请求头，是外部可控 str；含非 ASCII 时 `hmac.compare_digest(str, str)` 抛
+    TypeError → 该请求返回 500（而非 401）。任何人发 `Authorization: Bearer 中文`
+    即可触发。三处同源缺陷见 `auth.require_csrf` / `auth.claim_bootstrap_token`。
+    """
     if not config.API_TOKEN:
         return False
     got = request.headers.get("authorization", "")
-    return hmac.compare_digest(got, f"Bearer {config.API_TOKEN}")
+    return hmac.compare_digest(str(got).encode("utf-8"),
+                               f"Bearer {config.API_TOKEN}".encode("utf-8"))
 
 
 def _unauthorized_bearer() -> JSONResponse:
