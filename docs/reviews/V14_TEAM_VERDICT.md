@@ -249,6 +249,51 @@ data/patterns_runtime.json  : usable = 0                ← 生产快照可用�
 
 ---
 
+## 十、A 阶段落地记录（2026-10-21 追记）
+
+团队裁决的 A 方向「抽 `lottery/stats/` 可测包」已完成。落地时的**实测记录**，
+因为它踩了三个坑，每个都值得留给后来者：
+
+### 10.1 迁移动作
+
+```
+lottery/eprocess.py  →  lottery/stats/eprocess.py   （356 行，纯数学）
+lottery/rigor.py     →  lottery/stats/rigor.py      （1353 行，纯数学）
+lottery/{eprocess,rigor}.py  →  变为代理薄壳（各 ~90 行）
+```
+
+前提验证（架构审查员的判断被复现）：两个模块的内部依赖数均为 **0**，
+只用 `math`/`itertools`/`typing`/`numpy`/`scipy`。
+
+### 10.2 三个真实的坑（第一版都失败了）
+
+| 坑 | 现象 | 根因 | 解法 |
+|---|---|---|---|
+| **1. `import *` 不导出私有符号** | 一次性 16 个用例 `AttributeError`（`rigor._valid_draws`） | `import *` 跳过下划线名 | 改为全量镜像 |
+| **2. 镜像复制导致「两份状态」** | 全量跑才失败、单独跑通过（依赖测试顺序） | `monkeypatch.setattr(rigor,...)` 只改薄壳不改真源 | 改为**模块级代理**：读问真源、写双写 |
+| **3. 纯性测试盯错对象** | `test_module_is_pure_...` 必然失败 | 薄壳必然含项目内相对导入 | 检查对象改为真源 `stats/rigor.py` |
+
+**坑 2 是最有价值的**：它暴露了「兼容层一旦复制状态，就制造了第二真源」这一普适问题。
+代理方案的代价是薄壳里有一个 `_ProxyModule` 类（承载转发机制），
+收益是 `lottery.rigor.X is lottery.stats.rigor.X` 永远成立，且打桩对两个入口同时生效。
+
+### 10.3 新增守卫（`tests/test_v14_stats_package.py`，10 条）
+
+- 薄壳每个符号与真源 **`is` 相同**；
+- **私有符号必须可访问**（坑 1 的回归防护，已做变异验证：删掉私有镜像 → 2 failed）；
+- 薄壳**不得定义函数**、不得定义 `_ProxyModule` 以外的类；
+- `stats/` 下只允许标准库依赖、无环境变量/文件 IO/网络；
+- `stats/` 不得 import 任何业务模块（`db`/`config`/`engine`…）。
+
+### 10.4 验证
+
+```
+pytest tests/ -q --ignore=tests/frontend
+→ 1358 passed, 24 skipped, 1 xfailed   （迁移前基线 1348）
+```
+
+---
+
 ## 附：全部报告与复现清单
 
 | 文件 | 行数 | 内容 |

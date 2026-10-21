@@ -903,25 +903,36 @@ def test_chi_square_uniformity_insufficient_and_degenerate():
 
 
 def test_module_is_pure_no_db_config_or_network_imports():
-    """硬要求守卫：rigor 只依赖 stdlib + numpy/scipy。
+    """硬要求守卫：**数学实现层**只依赖 stdlib + numpy/scipy。
 
     不得 import 项目内其他模块（db/config/features…）、不得有网络或文件 IO。
     用源码静态检查，防止后续有人悄悄引入副作用依赖。
+
+    ## V14-A 修正：检查对象改为「真源」而不是「薄壳」
+
+    实现已迁到 `lottery/stats/rigor.py`，`lottery/rigor.py` 变成只做
+    `from .stats import rigor` 的兼容薄壳。薄壳**必然**含有项目内相对导入
+    （那正是它的职责），所以原来的检查若还盯着薄壳，就变成了一条
+    「结构上不可能通过」的测试 —— 它保护的语义（数学层无副作用依赖）
+    其实该检查真源文件 `stats/rigor.py`。
+
+    断言语义完全不变，只是把 `pathlib.Path(...)` 指向真源。
     """
     import pathlib
     import re
-    src = pathlib.Path(rigor.__file__).read_text(encoding="utf-8")
+    import lottery.stats.rigor as _pure_src
+    src = pathlib.Path(_pure_src.__file__).read_text(encoding="utf-8")
     # 只允许 stdlib + numpy/scipy
     allowed = {"__future__", "itertools", "math", "typing", "functools",
                "numpy", "scipy"}
     for m in re.finditer(r"^\s*(?:from|import)\s+([A-Za-z_][\w.]*)",
                          src, re.MULTILINE):
         top = m.group(1).split(".")[0]
-        assert top in allowed, f"rigor.py 引入了不允许的依赖: {m.group(1)}"
+        assert top in allowed, f"stats/rigor.py 引入了不允许的依赖: {m.group(1)}"
     # 不得有项目内相对导入 / 网络 / 文件 IO / 环境变量
     for bad in ("from .", "import requests", "import urllib", "import socket",
                 "sqlite3", "os.environ", "open(", "import config"):
-        assert bad not in src, f"rigor.py 含被禁止的用法: {bad!r}"
+        assert bad not in src, f"stats/rigor.py 含被禁止的用法: {bad!r}"
 
 
 def test_module_has_no_global_mutable_state_leak():
