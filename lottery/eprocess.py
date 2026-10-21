@@ -270,25 +270,49 @@ def sigma_hypergeom(k: float, target: str = "red") -> float:
 
 
 def z_scores_from_scan(scan: Dict, target: str = "red") -> List[float]:
-    """把 ``discovery.asof_scan`` 的结果转成 z 序列，**逐期按当时的 k 定标**。
+    """把 ``discovery.asof_scan`` 的结果转成 z 序列，**逐候选按 k 定标**。
 
-    `asof_scan` 的 ``hit_series`` 只留最后 200 期，所以这里直接用
-    ``obs``/``exp`` 之外还需要**逐期的 k**。为免改动 discovery 的返回结构，
-    本函数按 ``sigma_hypergeom`` 用 k 的均值近似 —— 但先检查 k 的变异度：
-    k 在回放中基本恒定（筛选规则稳定），用均值近似误差极小。
+    ## 两条必须守住的规则（都来自 2026-10-21 的两次生产事故）
 
-    若某期 ``exp`` 为 0（筛选集为空），该期不产生证据，跳过而不是产生
-    一个假的 z=0。
+    ### 1. 按 k 定标，不用固定 sigma
+
+    见 `sigma_hypergeom` 的说明：固定 0.8678 遇上并集的大筛选集会低估方差
+    1.23 倍，e 值高估 61 倍。
+
+    ### 2. **空期（exp=0）绝不能跳过**
+
+    这是本函数第一版犯的错，代价更大。当时想的是「筛选集为空 ⇒ 该期无证据」，
+    于是 `continue` 掉。但空期恰恰是**最强的证据**：它说明筛选条件没触发、
+    命中数必然是 0。跳过它等于只统计「触发了的那些期」，
+    是典型的**选择偏差**。
+
+    实测 `hot{k=7,w=10} ∩ omission_high{k=10}`（k_mean=0.219）：
+
+        跳过空期（n=641）  e = 11 351   ← 假阳性，过阈值 2700
+        保留空期（n=3217） e =     1.75  ← 正确
+
+    **高估 6490 倍。** 空期必须作为 z=0 计入序列 —— 在 H0 下「没触发」
+    和「触发了但没中」合起来才构成完整的零假设样本。
+
+    ## 关于 n 的含义
+
+    返回序列的长度恒等于回放期数（除非整段 k_mean=0）。
+    调用方的 `min_obs` 因此比较的是「回放了多少期」而不是「触发了多少期」，
+    语义正确。
     """
     obs = scan.get("obs") or []
     exp = scan.get("exp") or []
     k_mean = float(scan.get("k_mean") or 0.0)
     sigma = sigma_hypergeom(k_mean, target)
     if sigma <= 0:
-        return []
+        return []               # 整段筛选集恒为空：该候选无意义，交给调用方判 underpowered
     out: List[float] = []
     for o, e in zip(obs, exp):
-        if float(e) <= 0.0:
-            continue
-        out.append((float(o) - float(e)) / sigma)
+        e = float(e)
+        o = float(o)
+        if e <= 0.0:
+            # 空期：命中必然为 0，计入 z=0（**不是跳过**）。见上方事故说明。
+            out.append(0.0)
+        else:
+            out.append((o - e) / sigma)
     return out

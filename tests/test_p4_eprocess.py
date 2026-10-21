@@ -161,11 +161,27 @@ def test_sigma_zero_when_k_is_zero():
     assert E.sigma_hypergeom(0) == 0.0
 
 
-def test_z_scores_skip_zero_expectation():
-    """exp=0 的期不产生证据，必须跳过而不是造出 z=0。"""
+def test_empty_periods_are_counted_not_skipped():
+    """**空期（exp=0）必须计入 z=0，不能跳过**（2026-10-21 第二次事故）。
+
+    跳过空期是典型的选择偏差 —— 只统计「筛选条件触发了」的期，
+    等于把 80% 的观测扔掉，剩下的看起来自然高度一致。
+
+    实测 `hot{k=7,w=10} ∩ omission_high{k=10}`：
+        跳过空期 n=641  e=11 351  ← 假阳性
+        保留空期 n=3217 e=1.75    ← 正确
+    高估 6490 倍。
+    """
     scan = {"obs": [0.0, 2.0, 3.0], "exp": [0.0, 1.0, 1.5], "k_mean": 6}
     z = E.z_scores_from_scan(scan, "red")
-    assert len(z) == 2, "exp=0 的期未被跳过"
+    assert len(z) == 3, "空期被跳过了 —— 这是选择偏差"
+    assert z[0] == 0.0, "空期应贡献 z=0（命中必然为 0）"
+
+
+def test_all_empty_scan_returns_empty():
+    """整段筛选集恒为空时返回空序列，交由调用方判 underpowered。"""
+    scan = {"obs": [0.0] * 100, "exp": [0.0] * 100, "k_mean": 0.0}
+    assert E.z_scores_from_scan(scan, "red") == []
 
 
 def test_union_does_not_inflate_e_value_beyond_threshold():

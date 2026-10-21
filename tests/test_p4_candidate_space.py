@@ -105,17 +105,23 @@ def test_degenerate_cross_is_rejected(probe_db):
 
 
 def test_degenerate_filter_does_not_overkill(probe_db):
-    """剔除不能误杀：保留的候选其筛选集必须有实际内容（k ≥ 1）。"""
+    """剔除不能误杀：保留的候选筛选集规模必须落在判据允许区间内。
+
+    注意扫描范围要横跨整个交叉层 —— 前段大量是 `hot ∩ cold` 这类
+    必然空集，按新判据（红球 3≤k≤12）应当全部剔除，所以只扫前 400 个
+    索引会得到「全部被剔除」的假象。
+    """
     hist = CS._probe_history()
+    n = CS.layer_size(CS.LAYER_CROSS)
     kept = 0
-    for idx in range(0, 400, 3):
+    for idx in range(0, n, max(1, n // 400)):
         got = CS.candidate_at(CS.LAYER_CROSS, idx)
         if not got:
             continue
         k = len(got[0]["selector"](hist) or set())
-        assert k >= 1, f"#{idx} 选出 {k} 个号却被保留（误杀保护失效）"
+        assert 3 <= k <= 12, f"#{idx} 选出 {k} 个号却被保留（判据失效）"
         kept += 1
-    assert kept > 0, "全部候选都被剔除了，过滤过严"
+    assert kept > 0, "全层没有任何合法候选，过滤过严"
 
 
 def test_cross_never_pairs_same_family():

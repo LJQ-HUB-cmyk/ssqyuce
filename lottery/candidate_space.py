@@ -290,18 +290,26 @@ def _make_cross(idx: int) -> Optional[Tuple[Dict, str]]:
 
 
 def _cross_is_degenerate(flt: Dict, target: str) -> bool:
-    """判断交叉候选是否语义退化（筛选集为空 / 近乎全选）。
+    """判断交叉候选是否语义退化（筛选集为空 / 过小 / 近全选）。
 
-    用成分筛选器在当前历史上下文上取一次选号集，看大小。
-    单次调用成本很低（筛选器基于预计算计数）。
+    ## 三层判据（都在 2026-10-21 被真实数据打过）
 
-    判据（红球 33 选 6、蓝球 16 选 1 的背景下）：
-      * 选出 0 个号 —— obs/exp 恒为 0，z 序列全零，测不出任何东西
-      * 选出 > 12 个红号 —— 覆盖超过 1/3，z 长期负偏，无判别力
+    1. **选出 0 个号** —— `hot ∩ cold` 这类必然交集为空的组合。
+       obs/exp 恒 0，z 序列全零，e 值恒 ≈1，却计入 e-BH 分母。
 
-    **判不了就放行**（返回 False）：不能因为探测失败就把合法候选误杀。
-    但这种情况会打一次日志 —— 静默放行会让「退化过滤失效」藏起来，
-    那正是本缺陷最初没被发现的原因。
+    2. **选出号码过少（红球 < 3、蓝球 < 2）** —— 大量期数筛选集为空，
+       触发时也只中 1 个号。这类候选的「观测」高度稀疏，
+       即使保留空期（见 `z_scores_from_scan` 第 2 条规则）也几乎没有判别的
+       信息量，而筛选集大小在回放中剧烈波动会让 k_mean 定标失真。
+       实测 `hot{k=7,w=10} ∩ omission_high{k=10}` 的 k_mean 只有 0.219。
+
+    3. **选出号码过多**（红球 > 12、蓝球 > 8）—— 覆盖超过 1/3，
+       z 长期负偏，无判别力。
+
+    ## 判不了就放行
+
+    探测失败时返回 False（不能误杀合法候选），但打一次日志 ——
+    静默放行会让「退化过滤失效」藏起来，那正是本缺陷最初没被发现的原因。
     """
     try:
         hist = _probe_history()
@@ -313,13 +321,9 @@ def _cross_is_degenerate(flt: Dict, target: str) -> bool:
             _DEGRADE_PROBE_FAILED = True
             print(f"[candidate_space] 退化判断不可用（将放行全部交叉候选）: {e}")
         return False
-    if k < 1:
-        return True
-    if target == "red" and k > 12:
-        return True
-    if target == "blue" and k > 8:
-        return True
-    return False
+    if target == "blue":
+        return k < 2 or k > 8
+    return k < 3 or k > 12
 
 
 _PROBE_HIST: Optional[Any] = None
