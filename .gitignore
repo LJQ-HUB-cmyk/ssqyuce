@@ -1,5 +1,7 @@
 .venv/
 data/*.db
+data/*.db.bak*
+data/*.bak*
 
 # V10-00d 迁移前自动备份（含生产数据，绝不入库）
 data/*.pre-migrate-*
@@ -57,3 +59,4 @@ data/archive/
 # P4 闲时挖掘断点（运行时状态：游标、判定计数、可用候选，且会随挖掘推进持续变化）
 data/idle_mining_state.json
 data/idle_mining_state.json.tmp
+.git-safety/
