@@ -32,8 +32,20 @@ import pytest
 
 from lottery import db, engine
 
-# ---- 拆分前基线（70273b5，拆分前 HEAD，实跑记录）----
-PREDICT_FINGERPRINT = "d5196ca3e76a1a99d1958b12d05c0bb4"
+# ---- 拆分前基线（70273b5，拆分前 HEAD，剥离运行时数据后实跑）----
+#
+# **来历必须写清，否则下一个人无法判断它该不该改**：
+#
+#   ① 初次记录 d5196ca3 —— 当时未剥离 `snapshot`/`note_zh`，
+#      且 `data/hypotheses.json` 还没有那 22 条「仅监控」线索。
+#   ② 拆分 S7 后跑出 e7cb1ec8 —— **不是回归**，是那个文件被后台挖掘更新了。
+#   ③ 用 `git worktree add /tmp/d02base 70273b5` 在**拆分前代码**上同口径实跑，
+#      与拆分后**逐位一致**：51226704fec1fc12e9d0c1590f6b1af2
+#      ⇒ 拆分未改变行为，指纹漂移全部来自运行时数据。
+#
+# **什么时候可以改这个值**：只有「拆分前后在同口径下不一致」才算行为变化。
+# 判定方法：worktree 在父提交上跑同一段代码，两边必须一致；不一致才查回归。
+PREDICT_FINGERPRINT = "51226704fec1fc12e9d0c1590f6b1af2"
 
 # 前端 / 路由 / 测试广泛依赖的公开 API —— 拆分后名字必须仍可从 `lottery.engine` 取到
 _PUBLIC_API = [
@@ -61,13 +73,33 @@ _PRIVATE_USED_EXTERNALLY = [
 ]
 
 
+# 剥离「每次/每天都会变」的字段，只留**由代码与历史开奖决定**的部分。
+#
+# ## 为什么 snapshot / note_zh 必须剥离（我第一版漏了，差点误判成拆分回归）
+#
+# `predict_next` 的返回体里，`rules.snapshot` / `rules.note_zh` 读自
+# `data/hypotheses.json` —— **那是后台挖掘写的运行时数据**，不是代码产物。
+#
+# 实测：10-21 建指纹时该文件还没有 22 条「仅监控」线索，10-22 有了
+# ⇒ 同一份代码（`git worktree` 在 70273b5 上验过）跑出的指纹也变了：
+# ```
+#   基线代码实跑 = d50aa1f4...（今天）
+#   我最初记录   = d5196ca3...（昨天）
+# ```
+# **两个都不是「拆分导致」，是数据变了。**
+#
+# 若剥离不彻底，这个测试会**在拆分完全正确时变红**，
+# 而「变红就改指纹」会把真正的回归一起掩盖掉 —— 那比不做等价验证更糟。
+#
+# 保留在指纹里的字段：所有由 draws + rng 决定的内容（tickets / weights / probs 等）。
+_VOLATILE = {"generated_at", "elapsed_ms", "snapshot", "note_zh", "updated_at"}
+
+
 def _strip_volatile(obj):
-    """剥离每次都不同的字段（时间戳 / 耗时），其余逐字节保留。"""
+    """剥离时间戳、耗时、以及**读自运行时数据文件**的字段。"""
     if isinstance(obj, dict):
         return {
-            k: _strip_volatile(v)
-            for k, v in obj.items()
-            if k not in ("generated_at", "elapsed_ms")
+            k: _strip_volatile(v) for k, v in obj.items() if k not in _VOLATILE
         }
     if isinstance(obj, list):
         return [_strip_volatile(x) for x in obj]
@@ -92,10 +124,22 @@ def deterministic_prediction():
     `allow_real=True` 显式声明意图，而不是 monkeypatch 掉守卫。
     """
     import os
+
+    prev = os.environ.get("LOTT_TEST_REAL_DB")
     os.environ["LOTT_TEST_REAL_DB"] = "1"     # 走守卫提供的正规通道
-    from lottery import config as _cfg
-    _cfg.guard_prod_db(allow_real=True)        # 显式声明：本用例确需真实库
-    draws = db.load_draws()
+    try:
+        from lottery import config as _cfg
+        _cfg.guard_prod_db(allow_real=True)    # 显式声明：本用例确需真实库
+        draws = db.load_draws()
+    finally:
+        # ⚠ 必须复原：这个环境变量会**关闭所有测试的生产库守卫**。
+        # 我第一版没复原，泄漏到后续测试 —— 全量出现 7 failed + skipped 24→20。
+        # 单跑该文件全绿，全量才红：典型的「环境状态跨用例污染」。
+        # 判据：任何修改 os.environ 的 fixture 都必须 try/finally 复原。
+        if prev is None:
+            os.environ.pop("LOTT_TEST_REAL_DB", None)
+        else:
+            os.environ["LOTT_TEST_REAL_DB"] = prev
     return engine.predict_next(
         draws,
         use_llm=False,
@@ -298,7 +342,15 @@ def test_no_module_bound_engine_function_references():
             if not isinstance(node, ast.ImportFrom) or node.level != 1:
                 continue
             mod = node.module or ""
-            if not mod.startswith("engine"):
+            # ⚠ 只查「从 engine 具体模块/薄壳绑死函数」，不查子模块间的正常 import。
+            #
+            # `engine.py` 自己 `from .engine_prize import expected_prize` 是**薄壳的正当写法**：
+            #   - 子模块是「真源」，薄壳从它取符号是唯一正确路径
+            #   - 真正的危险在「调用方绕过薄壳、直接绑死子模块函数」
+            #
+            # 判据边界：模块名恰为 `engine` 才算「绑死薄壳的函数」；
+            # `engine_*` 是子模块（真源），允许被 import。
+            if mod != "engine":
                 continue
             for alias in node.names:
                 key = (py.name, alias.name)

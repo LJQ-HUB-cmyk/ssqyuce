@@ -1362,123 +1362,23 @@ def _pick_legacy_blue(scored: List[Dict], n_tickets: int) -> List[Dict]:
 # `jackpot_assumption` 字段原样标注，绝不假装知道真实金额。默认假设取自
 # evaluate.PRIZE_CASH 的历史均值近似（一等 ¥6,500,000 / 二等 ¥180,000）。
 TICKET_COST = 2.0
-PRIZE_CASH_FIXED = {3: 3000.0, 4: 200.0, 5: 10.0, 6: 5.0}   # 固定奖级（元）
-JACKPOT_ASSUMPTION = {
-    "first": 6_500_000.0,    # 一等奖浮动奖假设（历史均值近似，非真实值）
-    "second": 180_000.0,     # 二等奖浮动奖假设（历史均值近似，非真实值）
-    "source": "evaluate.PRIZE_CASH 历史均值近似；一/二等奖为浮动奖，此处仅为假设常量",
-}
-
-
-def expected_prize(reds: List[int], blue: int,
-                   jackpot: Optional[Dict[str, float]] = None) -> Dict:
-    """单注期望奖金（元）与其奖级概率分解。
-
-    对 6 红 + 1 蓝的单注，枚举「实际开奖的红球命中数 r」的分布并求和：
-    实际开奖的 6 个红球是从 33 个中均匀取出的 6 个，预测的 6 个红球中命中 r 个的
-    概率服从超几何分布
-
-        P(r) = C(6, r) * C(27, 6-r) / C(33, 6)
-
-    蓝球命中概率恒为 1/16（独立）。于是各奖级概率为 P(r) × p_blue 的组合。
-
-    诚实边界：任何「选号算法」都无法改变 P(r) 与 p_blue——它们只由组合数学决定。
-    本函数的作用是给出**目标函数**，让「覆盖优化」比的是期望值而不是幻觉命中率。
-    """
-    from math import comb
-    jp = dict(JACKPOT_ASSUMPTION)
-    if jackpot:
-        jp.update({k: float(v) for k, v in jackpot.items() if k in ("first", "second")})
-    total = comb(33, 6)
-    p_blue = 1.0 / B_MAX
-    cash = dict(PRIZE_CASH_FIXED)
-    cash[1] = float(jp["first"])
-    cash[2] = float(jp["second"])
-    ev = 0.0
-    prob_by_level: Dict[int, float] = {}
-    for lvl in range(1, 7):
-        prob_by_level[lvl] = 0.0
-    prob_by_hit: Dict[int, float] = {}
-    for r in range(0, 7):
-        p_r = comb(6, r) * comb(27, 6 - r) / total
-        prob_by_hit[r] = p_r
-        # 与 evaluate.prize_level 完全一致的奖级判定
-        if r == 6:
-            prob_by_level[1] += p_r * p_blue
-            prob_by_level[2] += p_r * (1.0 - p_blue)
-        elif r == 5:
-            prob_by_level[3] += p_r * p_blue
-            prob_by_level[4] += p_r * (1.0 - p_blue)
-        elif r == 4:
-            prob_by_level[4] += p_r * p_blue
-            prob_by_level[5] += p_r * (1.0 - p_blue)
-        elif r == 3:
-            prob_by_level[5] += p_r * p_blue
-            prob_by_level[6] += p_r * (1.0 - p_blue)
-        else:
-            prob_by_level[6] += p_r * p_blue
-    for lvl, p in prob_by_level.items():
-        ev += p * cash.get(lvl, 0.0)
-    return {
-        "expected_reward": ev,
-        "cost": TICKET_COST,
-        "ev_ratio": ev / TICKET_COST,
-        "prob_by_level": prob_by_level,
-        "prob_by_red_hits": prob_by_hit,
-        "blue_hit_prob": p_blue,
-        "jackpot_assumption": dict(jp),
-        "prize_cash": cash,
-    }
-
-
-def _portfolio_blue_hit_prob(blues: List[int]) -> float:
-    """一组蓝球的「至少中 1 个蓝球」概率 = 不同蓝球数 / 16（独立均匀开奖）。"""
-    if not blues:
-        return 0.0
-    return min(len(set(int(b) for b in blues)), B_MAX) / float(B_MAX)
-
-
-def portfolio_expected_value(tickets: List[Dict],
-                             jackpot: Optional[Dict[str, float]] = None) -> Dict:
-    """整组注单的期望奖金与覆盖指标。
-
-    返回 {expected_reward, cost, ev_ratio, blue_coverage_count,
-          blue_hit_prob, prize_prob_by_level, jackpot_assumption}。
-
-    **同注数下期望奖金恒等**：因为每注的红球命中分布都是同一个超几何分布、
-    蓝球命中恒为 1/16，n 注的期望严格是单注的 n 倍——覆盖优化**不改变期望**，
-    只改变「中奖频率的分布」（例如把「至少中 1 个蓝球」的概率从
-    1-(15/16)^n 提到 min(n,16)/16）。这是本项目最重要的诚实边界：
-    同样 10 注，中个蓝球的概率从 47.6% 提到 62.5%，但期望返奖比始终是 15.6%。
-    """
-    tickets = list(tickets or [])
-    n = len(tickets)
-    one = expected_prize(tickets[0]["reds"] if n else [],
-                         int(tickets[0]["blue"]) if n else 1, jackpot=jackpot)
-    blues = [int(t["blue"]) for t in tickets]
-    distinct = len(set(blues))
-    ev = one["expected_reward"] * n
-    cost = TICKET_COST * n
-    # 至少中一个蓝球：随机重复 vs 去重覆盖（对照展示）
-    p_naive = 1.0 - (1.0 - 1.0 / B_MAX) ** n if n > 0 else 0.0
-    p_cover = _portfolio_blue_hit_prob(blues)
-    return {
-        "tickets": n,
-        "expected_reward": ev,
-        "cost": cost,
-        "net": ev - cost,
-        "ev_ratio": (ev / cost) if cost > 0 else 0.0,
-        "blue_coverage_count": distinct,
-        "blue_hit_prob": p_cover,
-        "blue_hit_prob_naive": p_naive,
-        # 六等奖（蓝球命中 ¥5）期望返奖比：(5*p)/(2*n) —— 与 p/n 口径同构
-        "sixth_ev_ratio": (cash6 := 5.0) and ((cash6 * p_cover) / cost if cost > 0 else 0.0),
-        # 全部注单的奖级概率（取并集的上界近似：不同注之间不独立，此处按独立求和）
-        "prize_prob_by_level": {k: v * n for k, v in one["prob_by_level"].items()},
-        "prize_prob_by_level_note": "按各注独立求和的上界近似，非精确联合分布",
-        "jackpot_assumption": one["jackpot_assumption"],
-        "prize_cash": one["prize_cash"],
-    }
+# ===========================================================================
+# S7 奖金期望模型 —— 已于 D-02 拆出到 `lottery/engine_prize.py`
+#
+# 薄壳保留在这里，使 `engine.expected_prize` / `engine.PRIZE_CASH_FIXED` 等
+# 仍可从本模块取到（外部 27 处引用不动）。子模块内容是**逐字迁移**，逻辑未改。
+#
+# 为什么在文件末尾而不是文件头做转发：本块被后面几个函数引用（如
+# `_single_ticket_ev` 读 `PRIZE_CASH_FIXED`），末尾导入不算循环——
+# `engine_prize` 只 `from . import engine as E` 惰性取用，不在 import 期解引用。
+# ===========================================================================
+from .engine_prize import (          # noqa: E402  逐字迁移，位置受限
+    PRIZE_CASH_FIXED,
+    JACKPOT_ASSUMPTION,
+    _portfolio_blue_hit_prob,
+    expected_prize,
+    portfolio_expected_value,
+)
 
 
 # ===========================================================================
