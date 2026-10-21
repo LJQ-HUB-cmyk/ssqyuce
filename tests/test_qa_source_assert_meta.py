@@ -97,6 +97,33 @@ def _classify(tree: ast.AST) -> dict:
     2. **别名**：被赋值为「返回文本的函数调用」的变量。
 
     返回文本的函数 = 函数体里 `return` 了 文本源 或 调用（递归一层）。
+
+    ## ⚠️ 已知边界（D-22，2026-10-21 实测，**当前代码库 0 实例**）
+
+    以下三种写法**不会被追踪**，断言会绕过元守卫（写在这里而不是只写在报告里，
+    因为 docstring 是每个读代码的人都会看到的地方）：
+
+    1. **逆序定义的两层包装**
+       ```python
+       def _outer(): return _inner()      # ← 定义在 _inner 之前
+       def _inner(): return APP.read_text()
+       blob = _outer(); assert "x" in blob     # 漏检
+       ```
+       根因：第 2 遍是**单次** `ast.walk`，依赖函数出现顺序。
+
+    2. **嵌套调用** `blob = _wrap(_js_code())`
+       根因：第 3 遍只看 `node.value.func`，看不到**作为参数**的调用。
+
+    3. **派生容器** `blob = _js_code().splitlines()`
+       根因：同上，`.splitlines()` 是属性调用，不是被标记的函数名。
+
+    **实测影响**：真实代码里「比较对象非变量、但内部含文本源」的 `in` 断言
+    **= 0 处**（脚本扫描 `tests/test_*.py` 全部文件）。所以这是**未来风险**，
+    不是当前失真。
+
+    **若将来引入这些写法**：把第 2/3 遍改成**循环到不动点**（`while changed:`），
+    并让第 3 遍扫描整个 `node.value` 子树而非只看 `.func`。
+    在改之前，遇到这三种写法请**手动确认元守卫是否数到了它**。
     """
     sources = {}
     # 第一遍：找直接文本源
@@ -172,9 +199,20 @@ def _count(kind_wanted: str) -> tuple:
                 if not isinstance(sub, ast.Compare):
                     continue
                 for op, comp in zip(sub.ops, sub.comparators):
-                    if (isinstance(op, (ast.In, ast.NotIn))
-                            and isinstance(comp, ast.Name)
-                            and kinds.get(comp.id) == kind_wanted):
+                    if not isinstance(op, (ast.In, ast.NotIn)):
+                        continue
+                    # 支持两种右操作数：
+                    #  * 变量：`assert "x" in src`
+                    #  * 函数调用：`assert "x" in _js_code()`（其函数名已由 _classify 标记）
+                    #    例：`assert "候选注单" in _level2()`，`_level2` 已标为 file_text。
+                    #    `comp.func` 是 Name("_level2")（本地函数）或 Attribute("js_code")。
+                    name = None
+                    if isinstance(comp, ast.Name):
+                        name = comp.id
+                    elif isinstance(comp, ast.Call):
+                        f = comp.func
+                        name = f.id if isinstance(f, ast.Name) else getattr(f, "attr", None)
+                    if name is not None and kinds.get(name) == kind_wanted:
                         total += 1
                         where.append((p.name, node.lineno))
     return total, where
