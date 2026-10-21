@@ -195,8 +195,29 @@ def test_idle_mining_independent_of_scheduler_switch(idle_env, monkeypatch):
     from lottery import api_app
     assert hasattr(api_app, "_idle_mining_loop")
     # 接线代码读的是 LOTT_IDLE_MINING，不是 config.SCHEDULER_ENABLED
-    src = __import__("inspect").getsource(api_app._idle_mining_loop)
-    assert "LOTT_IDLE_MINING" not in src        # 门控在模块级，不在循环里
+    # ⚠ V14-3 修正（齐交付 2026-10-21）：原断言 `"LOTT_IDLE_MINING" not in src` 会被
+    # **注释**欺骗 —— 将来有人在循环的 docstring/注释里写「本循环不使用 LOTT_IDLE_MINING」
+    # （这是非常自然的写法，用于解释设计），守卫会立刻变红，**而代码完全正确**。
+    # 这属于「反向误报」（守卫把未来的正确代码判成错），比漏报更烦人：
+    # 它会让人去改注释而不是改代码。
+    # 正确做法：AST 取函数体（剥 docstring），只检查真实代码中的属性/名字引用。
+    import ast as _ast, inspect as _inspect, textwrap as _tw
+    _tree = _ast.parse(_tw.dedent(_inspect.getsource(api_app._idle_mining_loop)))
+    _body = _tree.body[0].body
+    if _body and isinstance(_body[0], _ast.Expr) and isinstance(
+            getattr(_body[0], "value", None), _ast.Constant):
+        _body = _body[1:]                      # ★ 剥 docstring
+    _names = set()
+    for _n in _ast.walk(_ast.Module(body=_body, type_ignores=[])):
+        if isinstance(_n, _ast.Name):
+            _names.add(_n.id)
+        elif isinstance(_n, _ast.Attribute):
+            _names.add(_n.attr)
+        elif isinstance(_n, _ast.Constant) and isinstance(_n.value, str):
+            # 环境变量名以字符串常量形式出现，属真实引用；注释不会进 AST
+            _names.add(_n.value)
+    assert "LOTT_IDLE_MINING" not in _names, (
+        "循环体内直接读了 LOTT_IDLE_MINING —— 门控应在模块级")
 
 
 # ---------- CPU 限流（用户硬约束：整机 ≤60%） ----------
@@ -302,10 +323,25 @@ def test_group_m_equals_real_family_pair_size(idle_env):
     assert max(sizes) > 1000, "最大族对档位数应 >1000（如 hot×sum_range 类）"
     assert len(set(sizes)) > 10, "组规模必须有显著离散度，否则常数近似才有理"
 
-    for gkey, real in list(pairs.items())[:20]:
-        assert idle_mining._group_checked(gkey, 18200, 1) == real, (
-            f"{gkey}: _group_checked 返回 {idle_mining._group_checked(gkey, 18200, 1)}，"
-            f"真实档位数 {real}")
+    # ---- D-08 验收补强：全量遍历 536 组，不切片 ----
+    #
+    # 原实现只比 `list(pairs.items())[:20]` —— 516 个组没有任何比对。
+    # 实测该抽样可被完全绕过：注入「前 20 组 + repeat|repeat2 返回真值，
+    # 其余 516 组退回常数 135」→ 26 passed 全绿。
+    # 「全部都要满足」的判据不能抽样：抽样点之外的错误永远看不见。
+    bad = []
+    checked = 0
+    for gkey, real in pairs.items():
+        got = idle_mining._group_checked(gkey, 18200, 1)
+        checked += 1
+        if got != real:
+            bad.append((gkey, real, got))
+
+    assert checked == len(pairs) == 536, (
+        f"必须逐组遍历全部 536 组，实际只遍历 {checked} 组")
+    assert not bad, (
+        f"{len(bad)}/{len(pairs)} 组 m 与真源不一致（m 记账错会直接抬高 e-BH 门槛）：\n"
+        + "\n".join(f"  {k}: 真值 {r} 实际 {g}" for k, r, g in bad[:10]))
 
 
 def test_group_key_includes_both_families(idle_env):
@@ -350,3 +386,139 @@ def test_ebh_zero_when_nothing_exceeds_local_threshold(idle_env):
     got = idle_mining._recompute_usable(cands, n_checked=306)
     # 单因子层 m≈306 ⇒ 阈值 6120；e=25 差太远
     assert got == {}
+
+
+# ---------- D-08 结构判据（严QA，2026-10-21） ----------
+
+def test_group_checked_has_no_bare_numeric_literal():
+    """**结构判据**：`_group_checked` 函数体不得出现裸数字字面量（除 0/1 哨兵）。
+
+    ## 为什么必须有这一条（行为判据不够）
+
+    行为判据「m == 真值」可以被**抽样**削弱 —— 已实证：
+    只比前 20 组时，注入「前 20 组 + `repeat|repeat2` 返回真值，
+    其余 516 组退回常数 135」→ **26 passed 全绿，完全逃脱**。
+
+    **结构判据不能抽样**：它看的是源码本身，没有"覆盖不到"的样本。
+
+    ## 病因
+
+    缺陷 ③：`135` 是族对档位数分布的**均值**（实测 mean=135.0、中位=35），
+    被当成常数写进函数体。78.4%（420/536）的组低于均值，
+    代价全落在它们身上 —— `repeat×repeat2` 真实 m=1 被放大 135 倍。
+
+    ## 判据
+
+    函数体内出现的整数字面量只允许 `{0, 1}`（哨兵/下限）。
+    出现 `135`、`306`、`2700` 这类数字 → 立即红。
+    合法实现（查 `_family_pairs()` 真源 + `max(..., 1)`）不含任何其他常数。
+    """
+    import ast as _ast
+    import inspect as _inspect
+    import textwrap as _textwrap
+
+    src = _inspect.getsource(idle_mining._group_checked)
+    tree = _ast.parse(_textwrap.dedent(src))
+
+    # ⚠ V14-3 修正（齐交付 2026-10-21）：必须剥 docstring。
+    # 否则将来有人在 docstring 里举例写「135 是均值」作说明，守卫会无辜变红
+    # —— 那是「反向误报」：守卫把未来的正确代码判成错，会逼人去改注释而不是改代码。
+    _body = tree.body[0].body
+    if _body and isinstance(_body[0], _ast.Expr) and isinstance(
+            getattr(_body[0], "value", None), _ast.Constant):
+        _body = _body[1:]
+    tree = _ast.Module(body=_body, type_ignores=[])
+
+    allowed = {0, 1}
+    offenders = []
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Constant) and isinstance(node.value, int) \
+                and not isinstance(node.value, bool):
+            if node.value not in allowed:
+                offenders.append((getattr(node, "lineno", "?"), node.value))
+
+    assert not offenders, (
+        "`_group_checked` 出现裸整数字面量（缺陷 ③ 形态：把分布均值当常数）：\n"
+        + "\n".join(f"  line {ln}: {v}" for ln, v in offenders)
+        + "\n正确做法：查 `_family_pairs()` / `candidate_space.layer_size()` 真源，"
+          "兜底只用 max(..., 1)。")
+
+
+def test_group_checked_sources_from_real_space_not_constant():
+    """**结构判据补充**：`_group_checked` 必须真的调用真源，而不是只靠兜底。
+
+    若有人把函数体改成 `return max(n_in_group, 1)`（删掉查真源），
+    「无裸常数」那条仍会通过 —— 但 m 就完全退化成"组内已过阈数"，
+    不再反映该组的检验总数。这条补住那个缺口。
+
+    ## ⚠ V14-3 修正（齐交付 2026-10-21）：必须用 AST，不能用 `in src`
+
+    原实现是 `assert "_family_pairs()" in _inspect.getsource(...)`，
+    而 `getsource` **包含 docstring** —— 该函数的 docstring 里正好写着
+    「查 `_family_pairs()`」。于是变异 E（删掉真源调用、保留 `real = None`）
+    **仍然全绿**：它测的是「源码里出现过这五个字符」，不是「代码真的调用了」。
+
+    **凡源码结构断言，一律经 AST，不得用字符串 `in`** ——
+    因为"字符串够不够"你判断不了，注释会骗你。
+
+    同时剥掉 docstring，避免「将来有人在注释里提到这个函数名 → 守卫无辜变红」。
+    """
+    import ast as _ast
+    import inspect as _inspect
+    import textwrap as _tw
+
+    tree = _ast.parse(_tw.dedent(_inspect.getsource(idle_mining._group_checked)))
+    body = tree.body[0].body
+    if body and isinstance(body[0], _ast.Expr) and isinstance(
+            getattr(body[0], "value", None), _ast.Constant):
+        body = body[1:]                      # ★ 剥 docstring
+
+    calls = set()
+    for node in _ast.walk(_ast.Module(body=body, type_ignores=[])):
+        if isinstance(node, _ast.Call):
+            f = node.func
+            if isinstance(f, _ast.Name):
+                calls.add(f.id)
+            elif isinstance(f, _ast.Attribute):
+                calls.add(f.attr)
+
+    assert "_family_pairs" in calls, (
+        "`_group_checked` 函数体里没有实际调用 `_family_pairs()` —— "
+        "交叉层不再查真源。（注意：不能只查源码字符串，docstring 里写着也会通过）")
+    assert "layer_size" in calls, (
+        "`_group_checked` 函数体里没有实际调用 `layer_size()` —— 单因子层不再查真源")
+
+
+
+def test_group_key_roundtrips_into_family_pairs():
+    """**端到端判据**：`_group_key_of` 产出的键，必须能在 `_family_pairs()` 里查到。
+
+    ## 为什么还缺这一条（判据②的补强）
+
+    `test_group_key_includes_both_families` 只在**字符串层面**验
+    `_group_key_of` 的区分度；`test_group_m_equals_real_family_pair_size`
+    只用 `_family_pairs()` 自己的键去查 —— **两者之间没有任何测试连线**。
+
+    实测缺口：把 `_group_key_of` 改回「只取 mode」（原始缺陷②），
+    它返回 `cross|0`，**不在 `_family_pairs()` 里**，于是 `_group_checked`
+    静默退回 `max(n_in_group, 1)` —— **生产环境 m 全错**，
+    而 m 比对测试**仍然全绿**（它从不经过 `_group_key_of`）。
+
+    只有这条往返测试能抓住"两半各自正确、接口对不上"的情况。
+    """
+    pairs = idle_mining._family_pairs()
+    bad = []
+    for gkey in pairs:
+        # gkey 形如 `cross|<mi>|<族A>|<族B>`；构造一个同族的真实指纹形态
+        parts = gkey.split("|")
+        assert len(parts) == 4, f"组键形态异常: {gkey}"
+        _, mi, fa, fb = parts
+        fp = f'cross|{mi}|{fa}:{{"window":10,"k":5}}|{fb}:{{"window":10,"k":5}}'
+        back = idle_mining._group_key_of(fp)
+        if back != gkey:
+            bad.append((fp, gkey, back))
+
+    assert not bad, (
+        f"{len(bad)}/{len(pairs)} 个组键无法由 `_group_key_of` 往返得到 —— "
+        f"`_group_checked` 会因查不到而静默退回 max(n_in_group,1)，m 全错：\n"
+        + "\n".join(f"  指纹 {f}\n    期望 {e} 实际 {a}" for f, e, a in bad[:5]))
