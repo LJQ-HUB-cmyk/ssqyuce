@@ -348,9 +348,14 @@ def run_once(*, budget_candidates: int = 200,
             obs = scan.get("obs") or []
             exp = scan.get("exp") or []
             if len(obs) >= MIN_OBS and len(obs) == len(exp):
-                # 红球标准差约 0.8678，蓝球方差 p*(1-p)
-                sigma = 0.8678 if flt.get("target") == "red" else 0.24
-                z_scores = [(float(o) - float(e)) / sigma for o, e in zip(obs, exp)]
+                # **逐候选按筛选集大小 k 定标**（D3，2026-10-21 生产事故修复）。
+                #
+                # 旧代码写死 sigma=0.8678（红球 k=6 时的标准差）/0.24（蓝球 k=1）。
+                # 单因子候选 k 恰在 6 附近，问题没暴露；但交叉层的并集
+                # 会让 k 涨到 10~15，此时真实 sigma=1.1862，而代码仍按
+                # 0.8678 去除 ⇒ z 被系统性放大 1.37 倍 ⇒ e 值高估 290 倍
+                # ⇒ 31 条 `hot ∪ sum_range` 被误判为「可用」。
+                z_scores = eprocess.z_scores_from_scan(scan, flt.get("target") or "red")
                 v = judge_candidate(z_scores)
                 v["layer"] = layer
                 v["index"] = idx

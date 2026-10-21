@@ -120,3 +120,71 @@ def test_no_signal_stays_monitor_not_rejected():
     assert v["decision"] in ("monitor", "usable")
     if not E.is_significant(z):
         assert v["decision"] == "monitor"
+
+
+# ---------- 方差口径（D3，2026-10-21 生产事故） ----------
+
+def test_sigma_matches_hypergeometric_exactly():
+    """**必须与 scipy 超几何精确值一致**（含有限总体校正）。
+
+    这里钉死具体数值：旧代码写死 `sigma=0.8678`（= k=6 的红球值），
+    对 k=11 的真实值 1.0607 会低估方差 1.22 倍，导致 z 被放大、
+    e 值高估 61 倍，31 条并集候选被误判为「可用」。
+    """
+    cases = {1: 0.3857, 3: 0.6468, 6: 0.8678, 8: 0.9642, 10: 1.0340, 11: 1.0607, 12: 1.0824}
+    for k, want in cases.items():
+        got = E.sigma_hypergeom(k, "red")
+        assert abs(got - want) < 5e-4, f"k={k} 得 {got:.4f}，应为 {want}"
+
+
+def test_sigma_blue_matches_binomial():
+    """蓝球：Var = k·p·(1-p)，p=1/16。"""
+    for k, want in {1: 0.2421, 2: 0.3423, 3: 0.4193}.items():
+        got = E.sigma_hypergeom(k, "blue")
+        assert abs(got - want) < 5e-4, f"blue k={k} 得 {got:.4f}，应为 {want}"
+
+
+def test_sigma_grows_with_k_until_finite_population_kicks_in():
+    """筛选集越大方差越大 —— 但**超过一半号码后有限总体校正会让方差回落**。
+
+    k=6（理论期望值）→ 0.868，k=11 → 1.061，k=15 → 1.120 峰值，
+    k=20 → 1.099 已开始回落。这不是 bug：从 33 个号里选 20 个以上时，
+    命中数被上界 6 压住，方差必然收缩。
+    """
+    rising = [E.sigma_hypergeom(k) for k in (1, 3, 6, 10, 15)]
+    assert rising == sorted(rising), f"k≤15 区间 sigma 应单调增长: {rising}"
+    assert E.sigma_hypergeom(20) < E.sigma_hypergeom(15), "k 接近总体大小时应回落"
+
+
+def test_sigma_zero_when_k_is_zero():
+    """空筛选集没有方差可言，返回 0 让调用方跳过（不产生假 z）。"""
+    assert E.sigma_hypergeom(0) == 0.0
+
+
+def test_z_scores_skip_zero_expectation():
+    """exp=0 的期不产生证据，必须跳过而不是造出 z=0。"""
+    scan = {"obs": [0.0, 2.0, 3.0], "exp": [0.0, 1.0, 1.5], "k_mean": 6}
+    z = E.z_scores_from_scan(scan, "red")
+    assert len(z) == 2, "exp=0 的期未被跳过"
+
+
+def test_union_does_not_inflate_e_value_beyond_threshold():
+    """**回归防护**：并集候选按正确方差定标后，e 值应大幅回落。
+
+    实测 `hot{k=7,w=100} ∪ sum_range` 的 k_mean=11.21：
+      旧口径（固定 0.8678）e=34612 → 假阳性
+      新口径（ka=11.21 → sigma=1.0656）e≈568 → 合理
+    这里用合成序列锁定「k 大时必须用大 sigma」这一行为。
+    """
+    rng = np.random.default_rng(7)
+    # 构造 k=11 的扫描结果：持续的正向偏离（模拟真实存在的中等效应）
+    obs = [2.10 + rng.normal(0, 1.0, 1)[0] for _ in range(500)]
+    exp = [2.04] * 500
+    scan = {"obs": obs, "exp": exp, "k_mean": 11.21}
+    z_new = E.z_scores_from_scan(scan, "red")
+    e_new = E.verdict(z_new, min_obs=30)["e_value"]
+    z_old = [(o - e) / 0.8678 for o, e in zip(obs, exp)]
+    e_old = E.verdict(z_old, min_obs=30)["e_value"]
+    assert e_new < e_old, "按 k 定标后 e 值应低于固定 sigma 的口径"
+    # sigma 比为 1.0656/0.8678 = 1.228，e 值按平方放大，故 >1.3 是可断言的
+    assert e_old / max(e_new, 1e-9) > 1.3, f"低估方差导致高估不足: {e_old/e_new:.2f}x"

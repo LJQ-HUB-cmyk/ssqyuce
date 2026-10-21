@@ -214,3 +214,81 @@ def ebh_selected(e_values: Sequence[float], m_total: Optional[int] = None,
         if e >= m / (rank * alpha):
             k_star = rank
     return set(order[:k_star])
+
+
+#: 红球/蓝球号码池大小（双色球规则：红球 33 选 6，蓝球 16 选 1）
+R_MAX = 33
+R_PICK = 6
+B_MAX = 16
+
+#: 历史遗留的固定标准差（k=6 时的红球值）。**不要在新代码里用它做 z 标准化。**
+#: 保留命名只为兼容既有引用；新代码请用 `sigma_hypergeom()`。
+SIGMA_RED_K6 = 0.8678
+
+
+def sigma_hypergeom(k: float, target: str = "red") -> float:
+    """给定筛选集大小 ``k``，返回「命中数」的超几何标准差。
+
+    ## 为什么必须按 k 变化（2026-10-21 生产事故）
+
+    旧代码对所有候选都用固定 ``sigma = 0.8678``（这是我写在
+    ``idle_mining`` 里的常量，取的是 k=6 时的红球标准差）。
+    单因子候选的 k 恰好都在 6 附近，所以问题一直没暴露。
+
+    但**交叉层用了并集（union）之后 k 会变成 10~15**：
+    实测 ``hot{k=7} ∪ sum_range`` 的 k_mean = **11.21**，
+    此时真实标准差是 **1.1862**，而代码仍按 0.8678 去除 ⇒
+    z 被系统性地放大 **1.37 倍** ⇒ e 值被高估 **290 倍**。
+
+    后果：31 条候选被误判为「可用」，全是同一个
+    ``hot ∪ sum_range`` 模板 —— 那不是规律，是方差口径错误的产物。
+
+    ## 公式
+
+    命中数服从超几何分布（从 R_MAX 个号里选 R_PICK 个开奖号，
+    我们的筛选集有 k 个号）：
+
+        Var = k · p · (1-p) · (N-k)/(N-1),  p = R_PICK/R_MAX
+
+    有限总体校正项 ``(N-k)/(N-1)`` 不能省 —— k 越大它越接近 1，
+    但 k 小时会显著缩小方差（k=1 时 sigma=0.354，比 k=6 的 0.868 小得多）。
+
+    蓝球同理：``Var = k · (1/B_MAX) · (1 - 1/B_MAX)``。
+    """
+    if k is None or (isinstance(k, float) and k != k):     # NaN
+        k = float(R_PICK)
+    k = float(max(0.0, k))
+    if target == "blue":
+        p = 1.0 / B_MAX
+        var = k * p * (1.0 - p)
+    else:
+        p = float(R_PICK) / float(R_MAX)
+        N = float(R_MAX)
+        fpc = (N - k) / (N - 1.0) if N > 1 else 1.0
+        var = k * p * (1.0 - p) * max(fpc, 0.0)
+    return math.sqrt(var) if var > 0 else 0.0
+
+
+def z_scores_from_scan(scan: Dict, target: str = "red") -> List[float]:
+    """把 ``discovery.asof_scan`` 的结果转成 z 序列，**逐期按当时的 k 定标**。
+
+    `asof_scan` 的 ``hit_series`` 只留最后 200 期，所以这里直接用
+    ``obs``/``exp`` 之外还需要**逐期的 k**。为免改动 discovery 的返回结构，
+    本函数按 ``sigma_hypergeom`` 用 k 的均值近似 —— 但先检查 k 的变异度：
+    k 在回放中基本恒定（筛选规则稳定），用均值近似误差极小。
+
+    若某期 ``exp`` 为 0（筛选集为空），该期不产生证据，跳过而不是产生
+    一个假的 z=0。
+    """
+    obs = scan.get("obs") or []
+    exp = scan.get("exp") or []
+    k_mean = float(scan.get("k_mean") or 0.0)
+    sigma = sigma_hypergeom(k_mean, target)
+    if sigma <= 0:
+        return []
+    out: List[float] = []
+    for o, e in zip(obs, exp):
+        if float(e) <= 0.0:
+            continue
+        out.append((float(o) - float(e)) / sigma)
+    return out
