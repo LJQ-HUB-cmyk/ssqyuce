@@ -39,10 +39,25 @@
 
   第三步：等模型就绪后跑探针
 
-      # popularity 冷启动要拟合 8~13s，未就绪时返回 503 属正常行为；
-      # 探针需要 200 才能验证档位渲染。轮询到 200 再跑：
-      until curl -sf -o /dev/null \
-        "http://127.0.0.1:18011/api/portfolio/popularity?reds=1,2,3,4,5,6"; do sleep 3; done
+      # popularity 冷启动要拟合 8~13s（重负载时更久），未就绪时返回 503 属正常行为；
+      # 探针需要 200 才能验证档位渲染。
+      #
+      # ⚠ 必须带**超时上限**。不要写成 `until curl ...; do sleep 3; done` ——
+      #   那个形态在服务起不来（端口占用 / 认证失败 / 模型永不就绪）时会**无限等待**，
+      #   在 CI 里表现为"卡住"。**卡住比变红更难查**：变红有栈、有断言，
+      #   卡住只有一个还在跑的进程。本项目今天已经因此踩过一次（"M3 挂起"）。
+      #
+      #   判据：任何等待基础设施都必须同时具备 ① 轮询间隔 ② 总时限 ③ 超时后**非零退出**。
+      URL="http://127.0.0.1:18011/api/portfolio/popularity?reds=1,2,3,4,5,6"
+      ok=0
+      for i in $(seq 1 40); do          # 40 × 3s = 120s 上限
+        if curl -sf -o /dev/null "$URL"; then ok=1; break; fi
+        sleep 3
+      done
+      if [ "$ok" != "1" ]; then
+        echo "✗ 模型 120s 未就绪，中止（不是测试失败，是环境没准备好）" >&2
+        exit 1
+      fi
 
       QA_BASE=http://127.0.0.1:18011 QA_USER=qa_ui QA_PASS='<口令>' \
         python3 tests/frontend/v14_honest_bounds_ui_probe.py

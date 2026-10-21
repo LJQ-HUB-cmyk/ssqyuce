@@ -464,18 +464,34 @@ store['#popTag'] = { textContent: '' };
 renderBlueCoverage(fixture.bc);
 renderPopularity(fixture.pop);
 // 额外：注入 degraded_items 场景，验证降级提示真的渲染出来
+// 用 **5 条** 而不是 1 条：齐交付 2026-10-21 指出的攻击场景
+// 「有人为了首屏简洁写 `degraded_items.slice(0, 3)`」——
+// 只有 1 条时，截断前后渲染结果相同，**测不出来**。
+// 5 条 > 3，任何 `slice(0,3)` 类截断都会让「渲染条数 ≠ 后端条数」暴露。
+const degradedStub = Array.from({ length: 5 }, (_, i) => ({
+  id: 'stub_' + i,
+  reason: '第 ' + (i + 1) + ' 项不可用（测试桩）',
+  how_to_restore: '检查第 ' + (i + 1) + ' 项',
+}));
 const bcDegraded = Object.assign({}, fixture.bc, {
+  degraded_items: degradedStub,
+});
+const bcDegradedOne = Object.assign({}, fixture.bc, {
   degraded_items: [{
     id: 'ev_ratio_full',
     reason: '整注返奖比（含一/二等奖浮动奖）本次不可用：RuntimeError: boom。六等奖口径不受影响。',
     how_to_restore: '检查 lottery/engine.py 的 _single_ticket_ev',
   }],
 });
-delete bcDegraded.ev_ratio_full;
-delete bcDegraded.ev_full_yuan;
+delete bcDegradedOne.ev_ratio_full;
+delete bcDegradedOne.ev_full_yuan;
 store['#blueCovBody'].innerHTML = '';
 renderBlueCoverage(bcDegraded);
 const bcDegradedHtml = store['#blueCovBody'].innerHTML;
+const degCountExpected = degradedStub.length;
+store['#blueCovBody'].innerHTML = '';
+renderBlueCoverage(bcDegradedOne);
+const bcDegradedOneHtml = store['#blueCovBody'].innerHTML;
 renderBlueCoverage(fixture.bc);
 const bcNormalHtml = store['#blueCovBody'].innerHTML;
 // ---- 行为矩阵：粗/细两级 reason 的各种组合，看渲染出哪句文案 ----
@@ -540,6 +556,8 @@ process.stdout.write(JSON.stringify({
   degrade: degradeOut,
   degradeDynamic: dynamicOut,
   bcDegraded: bcDegradedHtml,
+  bcDegradedOne: bcDegradedOneHtml,
+  degCountExpected: degCountExpected,
   bcNormal: bcNormalHtml,
 }));
 """
@@ -788,7 +806,23 @@ def probe_render() -> int:
           "degraded_items 非空时渲染出降级块")
     check("部分口径降级" in deg_html, "降级块标题说明「部分口径降级」而非「整卡失败」")
     check("整注返奖比" in deg_html, "降级块包含后端给的 reason 原文")
-    check("_single_ticket_ev" in deg_html, "降级块包含 how_to_restore（给运维）")
+    # ---- 断言总数：渲染条数必须 == 后端条数（防截断）----
+    # 齐交付 2026-10-21 的细化：不能只测「少的时候红」，要测**被截断时红**。
+    # 攻击场景：有人为了首屏简洁写 `degraded_items.slice(0, 3)` ——
+    # 前几项断言（有降级块、含 reason、含 how_to_restore）**全部会通过**，
+    # 因为截断后仍有内容。只有「条数相等」能抓住。
+    import re as _re2
+    rendered_ids = _re2.findall(r'data-degraded-id="([^"]*)"', deg_html)
+    expected_n = out.get("degCountExpected")
+    check(expected_n is not None and len(rendered_ids) == expected_n,
+          f"降级项**全部**渲染（后端 {expected_n} 条 → 页面 {len(rendered_ids)} 条，无截断）",
+          f"渲染出 {len(rendered_ids)} 条，后端给了 {expected_n} 条 —— 有截断")
+    check(len(rendered_ids) == len(set(rendered_ids)),
+          "渲染出的降级项 id 无重复（不是同一项渲染多次）",
+          str(rendered_ids))
+
+    one_html = out.get("bcDegradedOne") or ""
+    check("_single_ticket_ev" in one_html, "单条降级场景包含 how_to_restore（给运维）")
     check("给运维" in deg_html, "how_to_restore 标注了受众（不让普通用户去读函数名）")
     # 判据 4：正常路径（空数组）不得出现降级提示
     check("blueCovDegraded" not in nor_html and "部分口径降级" not in nor_html,
