@@ -178,3 +178,78 @@ def portfolio_distribution(issues: int = Query(1, ge=1, le=20),
         },
         "note_zh": "分布统计是组合结构事实，不是中奖预测；双色球为独立随机事件。",
     })
+
+
+# ---------------------------------------------------------------------------
+# V14-B2 / B3：大众偏好度 + 蓝球覆盖（两个新端点）
+#
+# 这两个端点是「A+B」方向的产品落点：
+#   · popularity：预测「多少人会选这种号」（人群行为可预测，号码不可预测）
+#   · blue-coverage：蓝球去重覆盖（组合恒等式的真实概率增益）
+#
+# 两者都**强制**携带披露，且都不出现在出号门控里 —— 它们是"看懂自己的票"，
+# 不是"预测下一期"。
+# ---------------------------------------------------------------------------
+
+@router.get("/api/portfolio/popularity")
+def portfolio_popularity(
+    reds: str = Query(..., description="逗号分隔的 6 个红球，如 1,2,3,4,5,6"),
+    sales: float = Query(0.0, description="预计本期销量（元），可选；不影响档位"),
+) -> Dict:
+    """查询该号码形态的「大众程度」档位。
+
+    ## 它说的和它不说的话
+
+    **说**：这种形态在历史上被多少彩民选中（低/中/高三档）。
+    **不说**：下期会开什么号；会不会中奖。
+
+    实测效应量：形态对头奖注数（`p1`）的增量 R² ≈ 0.008（0.8%），
+    置换 p ≈ 0.005 —— 真实但极小，**只能排序，不能定值**。
+    """
+    try:
+        parts = [int(x) for x in str(reds).replace("，", ",").split(",") if x.strip()]
+    except ValueError:
+        return JSONResponse({"ok": False, "error": "reds 必须是逗号分隔的整数"}, status_code=400)
+    if len(parts) != 6:
+        return JSONResponse({"ok": False, "error": f"需要 6 个红球，收到 {len(parts)} 个"},
+                            status_code=400)
+    if len(set(parts)) != 6 or not all(1 <= x <= 33 for x in parts):
+        return JSONResponse({"ok": False, "error": "红球必须是 1~33 内互不相同的 6 个数"},
+                            status_code=400)
+
+    from . import popularity as POP
+    model = POP.get_model()
+    out = model.describe(parts, sales if sales else None)
+    if not out.get("ok"):
+        return JSONResponse({"ok": False, "error": "模型未就绪（数据不足或尚未拟合）"},
+                            status_code=503)
+    out["reds"] = sorted(parts)
+    return _jsonable(out)
+
+
+@router.get("/api/portfolio/blue-coverage")
+def portfolio_blue_coverage(
+    n_tickets: int = Query(10, ge=1, le=100, description="打算买几注"),
+    full_ev: bool = Query(True, description="是否附带整注返奖比（含浮动奖估算）"),
+) -> Dict:
+    """蓝球去重覆盖计划 + **三个必须同屏的数字**。
+
+    ## 为什么这个端点要求「三个数字必须一起看」
+
+    单看「中奖概率从 47.6% 提到 62.5%」是激励性的，但配上
+    「成本 20 元、六等奖期望回收 3.13 元、返奖比恒为 15.625%」才是完整的真相。
+
+    所以本端点**永远**同时返回概率、成本、期望回收与 `disclosure` 文本，
+    不存在只取概率的路径。
+    """
+    from . import blue_coverage as BC
+    full_ratio = None
+    if full_ev:
+        try:
+            from . import engine
+            full_ratio = float(engine._single_ticket_ev(5000000, sixth="published")["ev_ratio"])
+        except Exception:        # noqa: BLE001 —— 取不到就只给六等奖口径
+            full_ratio = None
+    out = BC.optimize(n_tickets, full_ev_ratio=full_ratio)
+    out["ok"] = True
+    return _jsonable(out)

@@ -864,7 +864,11 @@ function renderRuleUsage(res) {
   const counts = snap.counts || {};
   if (tag) tag.textContent = r.mode === "active" ? "规律已生效" : (r.mode === "shadow" ? "影子模式" : "未使用规律");
   let h = '<div class="track-metrics">' +
-    metricItem("可用规律", Number(r.usable || 0), "阶段持续有效 + A/B 通过") +
+    // V14-A4：口径改名。这里统计的是「生产快照里可回放且可用的规律」，
+    // 与「闲时挖掘的证据项(rule_evidence)」是两件不同的事，不能都叫"可用规律"。
+    // 后端 routes_predict.py 明令：不得把 L2 结构约束叫成「可用规律」。
+    metricItem("可用规律（可回放）", Number(r.usable_replayable || r.usable || 0),
+               "阶段持续有效 + A/B 通过 + 可回放") +
     metricItem("本轮受规律影响的候选", Number(r.n_resorted || 0), r.mode === "active" ? "已按规律重排" : "影子模式：仅记录") +
     // V12-04（裁决 R-2）：**禁止跨层相加**。usable 只显示长期可用，
     // 阶段可用单独列出并标注「未获支持」，避免出现「N 条可用其中大部分没预测力」。

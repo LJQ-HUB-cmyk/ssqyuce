@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import random
 import time
-from typing import Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 import numpy as np
 
@@ -762,8 +762,52 @@ def apply_rules_to_candidates(candidates: List[Dict], history: List[Dict],
     return out
 
 
-def _parse_tickets_response(res: Optional[dict], method_name: str) -> List[Dict]:
-    """校验并规范化 LLM 返回的 tickets（含 evidence / counter_evidence / structure_scores）。"""
+def _sanitize_patterns_used(raw, known: Optional[Iterable[str]] = None) -> Dict[str, Any]:
+    """把 LLM 返回的 ``patterns_used`` 过一遍白名单（V14-A4）。
+
+    ## 为什么必须校验（产品审查员实测的���一幻觉通道）
+
+    原实现是 ``"patterns_used": [str(x) for x in t.get("patterns_used", [])]`` ——
+    **纯透传、无任何校验**，而 ``web/static/app.js:771`` 会把它原样渲染成
+    「规律引用：…」。于是 LLM 随口写出一个根本不存在的规律名，
+    前端就当成"系统真的用了这条规律"展示出来。
+
+    当前 ``patterns_runtime.usable = 0``，这意味着**任何非空引用都是幻觉** ——
+    系统此刻没有任何已证实的规律可用，LLM 却可以声称用了。
+
+    ## 白名单口径
+
+    `known` 为当前**真实存在且可用**的规律名集合（由调用方从快照传入）。
+    未在集合内的一律丢弃，并记录被丢弃的原文，供审计而不是静默忽略。
+    若 `known` 为空（当前生产正是这种情况），则**任何引用都会被丢弃** ——
+    这是正确行为：没有可用规律时，"我用了规律"必然是假的。
+
+    返回值包含 ``dropped``，让上层可以把"LLM 说了什么但被拒"留痕。
+    """
+    items: List[str] = []
+    if isinstance(raw, (list, tuple)):
+        for x in raw:
+            s = str(x).strip()
+            if s:
+                items.append(s)
+    elif isinstance(raw, str) and raw.strip():
+        # 少数模型会把数组写成逗号分隔字符串
+        items = [p.strip() for p in raw.replace("，", ",").split(",") if p.strip()]
+
+    allowed = {str(x).strip() for x in (known or []) if str(x).strip()}
+    kept = [s for s in items if s in allowed]
+    dropped = [s for s in items if s not in allowed]
+    return {"kept": kept, "dropped": dropped, "had_any": bool(items)}
+
+
+def _parse_tickets_response(res: Optional[dict], method_name: str,
+                            known_patterns: Optional[Iterable[str]] = None) -> List[Dict]:
+    """校验并规范化 LLM 返回的 tickets（含 evidence / counter_evidence / structure_scores）。
+
+    `known_patterns`（V14-A4）是当前真实可用的规律名白名单；
+    ``patterns_used`` 里不在白名单内的引用会被丢弃并记入
+    ``patterns_used_dropped``，不再原样透传到前端当作"证据"。
+    """
     out: List[Dict] = []
     if not res or not isinstance(res.get("tickets"), list):
         return out
@@ -776,11 +820,13 @@ def _parse_tickets_response(res: Optional[dict], method_name: str) -> List[Dict]
                 continue
             if not 1 <= blue <= B_MAX:
                 continue
+            pat = _sanitize_patterns_used(t.get("patterns_used"), known_patterns)
             out.append({
                 "reds": reds, "blue": blue, "method": f"llm:{method_name}",
                 "confidence": conf,
                 "reasoning": str(t.get("reasoning", ""))[:300],
-                "patterns_used": [str(x) for x in t.get("patterns_used", [])],
+                "patterns_used": pat["kept"],
+                "patterns_used_dropped": pat["dropped"],
                 "evidence": t.get("evidence") if isinstance(t.get("evidence"), dict) else {},
                 "counter_evidence": (t.get("counter_evidence")
                                      if isinstance(t.get("counter_evidence"), list) else []),
@@ -883,6 +929,22 @@ def llm_tickets(draws: List[Dict], stats: Dict, patterns: List[Dict],
     n_models = len(model_cfgs)
     tickets: List[Dict] = []
 
+    # V14-A4：**LLM 规律引用的白名单**。
+    #
+    # 只允许引用「真正传给 LLM 的那批规律」（ctx["patterns"]，A/B 级且已过回测）。
+    # 不在此集合内的一律丢弃 —— 因为 LLM 不受约束时会把不存在的规律名写进
+    # patterns_used，而前端会把它当"系统真的用了这条规律"渲染出来。
+    # 当前生产 usable=0 时，ctx["patterns"] 可能为空，那时**任何引用都会被丢弃**，
+    # 这正是正确行为：没有可用规律时，"我用了规律"必然是幻觉。
+    _known_patterns = {
+        str(p.get("key")) for p in (ctx.get("patterns") or [])
+        if p and p.get("key")
+    }
+    _known_patterns |= {
+        str(p.get("name_zh")) for p in (ctx.get("patterns") or [])
+        if p and p.get("name_zh")
+    }
+
     def _ticket_call(cfg: Dict) -> List[Dict]:
         res = llm_client.chat_json(
             llm_client.SYSTEM_BASE,
@@ -895,7 +957,7 @@ def llm_tickets(draws: List[Dict], stats: Dict, patterns: List[Dict],
             max_tokens=2000, temperature=0.9, model_cfg=cfg,
             deadline=deadline, strict=strict,
         )
-        return _parse_tickets_response(res, cfg["name"])
+        return _parse_tickets_response(res, cfg["name"], _known_patterns)
 
     n_samples = int(llm_samples) if llm_samples else config.LLM_SAMPLES
     calls = [model_cfgs[i % n_models] for i in range(n_samples)]
@@ -952,7 +1014,8 @@ def llm_tickets(draws: List[Dict], stats: Dict, patterns: List[Dict],
                             feedback=ctx.get("feedback")),
                         max_tokens=2000, temperature=0.2, model_cfg=vcfg,
                         deadline=deadline, strict=False)
-                    parsed = _parse_tickets_response(refined, vcfg.get("model", "verify"))
+                    parsed = _parse_tickets_response(refined, vcfg.get("model", "verify"),
+                                                    _known_patterns)
                     if parsed:
                         tickets = parsed
                         print(f"[llm] 第三轮校验已修正选号（{len(parsed)} 注，校验模型 {vcfg.get('model')}）")

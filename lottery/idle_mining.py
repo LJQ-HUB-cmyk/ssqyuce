@@ -394,14 +394,30 @@ def run_once(*, budget_candidates: int = 200,
     if processed >= budget_candidates:
         interrupted = True
 
-    # 轮末统一做族级校正：把「候选」里经 e-BH 仍成立的升级为「可用」。
-    usable = _recompute_usable(candidates, n_checked)
+    # 轮末统一做族级校正：把「候选」里经 e-BH 仍成立的升级为「证据项」。
+    #
+    # **V14-A4 命名改造**：这个内部变量原来叫 `usable`，与 `patterns_runtime`
+    # 的生产快照字段 `counts.usable`（= 长期可用规律数）**同名不同义**：
+    #
+    #   idle_mining  的 usable = 通过本层 e-BH 的「挖掘证据项」，**不进快照、不影响出号**
+    #   patterns_runtime 的 usable = 生产快照里"可回放且可用"的规律，是出号门控依据
+    #
+    # 实测两边同时为 0 纯属巧合：本轮修复前 idle_mining 曾有 19~20 条过阈候选
+    # （`by_decision.usable=20`）而 `patterns_runtime.usable=0`。
+    # 用户若看到「20 条可用」与「0 条可用」并存，会直接认定系统造假 ——
+    # 哪怕每个数字单独看都对。这是"同一系统两个 usable"的真实风险。
+    #
+    # 现改名为 `rule_evidence`（证据项），并在契约里保留 `usable` 作为**弃用别名**
+    # 只是为了让旧调用方不报错；新代码一律读 `rule_evidence`。
+    rule_evidence = _recompute_usable(candidates, n_checked)
 
     state.update({
         "cursors": cursors,
         "by_decision": by_decision,
         "candidates": candidates,
-        "usable": usable,
+        "rule_evidence": rule_evidence,
+        # 兼容旧断点读取方（前端/脚本）—— 值相同但语义已由新字段承载
+        "usable": rule_evidence,
         "monitor_top": monitor_top,
         "n_checked": n_checked,
     })
@@ -417,7 +433,11 @@ def run_once(*, budget_candidates: int = 200,
         "ok": True,
         "processed": processed,
         "completed_total": n_checked,
-        "usable": len(usable),
+        # 权威字段（新）
+        "rule_evidence": len(rule_evidence),
+        # 弃用别名：仅兼容旧日志/脚本，**不得**与 patterns_runtime.usable 并列展示
+        "usable": len(rule_evidence),
+        "usable_deprecated": True,
         "candidates": len(candidates),
         "interrupted": interrupted,
         "layers_done": layers_done,
@@ -425,8 +445,10 @@ def run_once(*, budget_candidates: int = 200,
         "cursors": dict(cursors),
         "note_zh": (f"本轮判定 {processed} 个**此前未检验过**的候选"
                     f"（累计 {n_checked}）；单候选过阈 {len(candidates)} 条，"
-                    f"经 e-BH 族级校正后可用 {len(usable)} 条。"
-                    f"剩余：单因子 {remain_single} + 跨族交叉 {remain_cross}。"),
+                    f"经 e-BH 族级校正后得到证据项 {len(rule_evidence)} 条。"
+                    f"剩余：单因子 {remain_single} + 跨族交叉 {remain_cross}。"
+                    f"（证据项是「挖掘层的统计结论」，不是出号依据 —— "
+                    f"出号门控看 patterns_runtime.usable_replayable。）"),
     }
 
 
@@ -640,10 +662,14 @@ def status() -> Dict[str, Any]:
         "runs": int(state.get("runs") or 0),
         "total_candidates": checked,
         "by_decision": dict(state.get("by_decision") or {}),
-        # **区分「候选」与「可用」**：前者只是单候选过了 α 阈（数万级搜索里
+        # **区分「候选」与「证据项」**：前者只是单候选过了 α 阈（数万级搜索里
         # 纯随机也会跑出一批），后者才通过 e-BH 族级校正。两者混为一谈就是骗自己。
         "candidate_count": len(state.get("candidates") or {}),
-        "usable_count": len(state.get("usable") or {}),
+        # V14-A4：权威字段。旧名 `usable_count` 与 patterns_runtime.usable 撞词，
+        # 已弃用（保留只为不打断旧脚本），并列展示会让人以为系统自相矛盾。
+        "rule_evidence_count": len(state.get("rule_evidence")
+                                  or state.get("usable") or {}),
+        "usable_count_deprecated": len(state.get("usable") or {}),
         "progress": {
             "single_done": single_done,
             "single_total": space["single_total"],
