@@ -103,7 +103,13 @@ def test_api_key_input_never_prefilled():
     seg = js[js.index("async function loadLlmConfig()"):]
     seg = seg[:seg.index("function renderLlmScope")]
     assert '$("#cfgApiKey").value = ""' in seg, "必须显式清空 Key 输入框"
-    assert "$("#cfgApiKey").placeholder" in seg, "脱敏值应走 placeholder"
+    # ⚠ D-15 抓到的真实缺陷（2026-10-22）：原写法是
+    #     assert "$("#cfgApiKey").placeholder" in seg, "..."
+    #   双引号冲突 —— Python 把它解析成 `assert "$("`（`#` 后全被当注释），
+    #   **实际断言的是 `'$('` 这个非空字符串恒为真**，等于没测。
+    #   而且不报语法错误，因为它"看起来"是合法表达式。
+    # 脱敏值必须写到 `.placeholder`（左值），而不是 `.value`
+    assert '$("#cfgApiKey").placeholder =' in seg, "脱敏值应走到 .placeholder 赋值"
     assert '$("#cfgApiKey").value = cfg' not in seg, "禁止把配置值回填进 Key 输入框"
 
 
