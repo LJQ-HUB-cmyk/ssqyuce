@@ -2753,54 +2753,6 @@ function renderBlueCoverage(d) {
     "</div>";
 }
 
-// 首屏「诚实收益边界」卡的实时填充（D3）。
-//
-// 只做一件事：把**同一个响应对象**里的 6 个数字写进带 `data-hb` 的 span。
-// 不自己算、不自己四舍五入第二遍 —— 格式必须与蓝球覆盖卡完全一致，
-// 否则同页两处会出现「3.12 vs 3.125」这种自打脸。
-function fillHonestBounds(d) {
-  const card = $("#honestBounds");
-  if (!card || !d || d.ok === false) return false;
-  const set = (key, text) => {
-    const el = card.querySelector('[data-hb="' + key + '"]');
-    if (el) el.textContent = text;
-  };
-  const n = d.n_tickets ?? 10;
-  // 概率：与 renderBlueCoverage 同用 `_pct(v, 2)`，保证两卡逐字一致
-  set("p_repeat", _pct(d.p_any_blue_random_repeat, 2));
-  set("p_cover", _pct(d.p_any_blue_covered, 2));
-  // 文案改版后，第一格里同一对数字出现两次（左「随便买」右「不重复买」），
-  // 用独立 key 复用同一份值 —— **不重复取值**，避免两处各算一遍。
-  set("p_repeat2", _pct(d.p_any_blue_random_repeat, 2));
-  set("p_cover2", _pct(d.p_any_blue_covered, 2));
-  set("n_tickets", String(n));
-  set("n_tickets2", String(n));
-  // 金额：成本取整（"20 元"），期望回收与净亏保留 3 位
-  // —— 3 位是六等奖 EV 的精度需求：n 不是 16 的倍数时 (n/16)×5 会是 1.25/3.125 这类值，
-  //    用 2 位会把 3.125 砍成 3.13，与后端 disclosure 的「3.125 元」对不上。
-  set("cost", _yuan(d.cost_yuan, 0));
-  set("ev_sixth", _yuan(d.ev_sixth_yuan, 3));
-  set("net_sixth", _yuan(Math.abs(Number(d.net_sixth_yuan)), 3));
-  set("ratio_sixth", _pct(d.ev_ratio_sixth, 3));
-  const src = $("#hbSource");
-  if (src) {
-    src.textContent = "实时值 · n=" + n + " 注 · 与下方「蓝球去重覆盖」卡同源";
-    src.classList.remove("hb-stale");
-  }
-  return true;
-}
-
-/** 实时值取不到时的降级：**保留静态数字**，但必须把来源标注切成「示例值」。
- *
- * 为什么不像其他卡那样显示"加载失败"：这是首屏最显眼的位置，空白比静态值更糟；
- * 但留着静态值又不说来源，就是在**冒充实时**。所以唯一正确的做法是
- * 值保留、标注改口 ——「示例值」三个字是这条降级的全部意义。 */
-function markHonestBoundsStale(why) {
-  const src = $("#hbSource");
-  if (!src) return;
-  src.textContent = "示例值 · 实时数据不可用" + (why ? "（" + why + "）" : "");
-  src.classList.add("hb-stale");
-}
 
 async function loadBlueCoverage() {
   const body = $("#blueCovBody"), tag = $("#blueCovTag");
@@ -2812,19 +2764,14 @@ async function loadBlueCoverage() {
   if (inp && String(inp.value) !== String(n)) inp.value = String(n);
   if (tag) tag.textContent = "计算中…";
   try {
-    // 一次请求，两个消费者：蓝球覆盖卡 + 首屏诚实边界卡。
-    // 分开各请求一次会出现"两卡数字对不上"的窗口（一次 200、一次 503）。
     const d = await api("/api/portfolio/blue-coverage?n_tickets=" + n);
     renderBlueCoverage(d);
-    fillHonestBounds(d);
   } catch (e) {
     // 降级：只让本卡失效，不往外抛（见本段开头第 3 条）
     if (tag) tag.textContent = "不可用";
     if (body) {
       body.innerHTML = '<div class="note">' + escHtml(_degradeNote("蓝球覆盖计划", e)) + "</div>";
     }
-    // 首屏卡：值保留，标注改口为「示例值」—— 绝不静默假装实时
-    markHonestBoundsStale(e && e.status ? "HTTP " + e.status : "网络异常");
   }
 }
 

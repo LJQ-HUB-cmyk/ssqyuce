@@ -402,22 +402,21 @@ def probe_static() -> None:
                 "warmup_disabled", "warming_disabled"):
         check(key in degrade, f"_degradeNote 识别原因 {key}")
 
-    print("[10] D3 首屏卡契约：实时拉取 + 同响应 + 算术闭合")
-    check("fillHonestBounds" in src, "app.js 存在 fillHonestBounds")
-    check("markHonestBoundsStale" in src, "app.js 存在 markHonestBoundsStale 降级标记")
-    # 两卡同源：loadBlueCoverage 必须同时调 renderBlueCoverage 与 fillHonestBounds
-    lbc = _strip_js_comments(_function_source(src, "loadBlueCoverage"))
-    check("renderBlueCoverage(d)" in lbc and "fillHonestBounds(d)" in lbc,
-          "两卡共用同一个响应对象 d（非各发一次请求）")
-    check("markHonestBoundsStale(" in lbc, "降级时调用 markHonestBoundsStale")
-    # 首屏加载时即触发
+    print("[10] 首屏「诚实收益边界」卡：**已按用户要求移除**")
+    # 2026-10-22 用户要求：「以上一段话不要在首页显示」。
+    # 该卡（标题「买之前先看这几个数」+ 4 格 + 脚注）已从 index.html 删除，
+    # 对应的 fillHonestBounds / markHonestBoundsStale 也一并删除。
+    #
+    # 这里做**反向守卫**：防止它被无意中加回来（例如恢复旧 commit、或有人
+    # 以为"删错了"）。若确实要恢复，请同时恢复本节的 7 条正向断言并说明原因。
+    check("honestBounds" not in html_raw, "首屏卡已从 index.html 移除")
+    check("fillHonestBounds" not in src, "app.js 不再引用 fillHonestBounds")
+    check("markHonestBoundsStale" not in src, "app.js 不再引用 markHonestBoundsStale")
+    # 蓝球覆盖卡（卡 7）必须**仍然存在** —— 删除的是首屏卡，不是它
+    check("renderBlueCoverage" in src, "蓝球覆盖卡 renderBlueCoverage 仍在")
+    check("loadBlueCoverage" in src, "蓝球覆盖卡 loadBlueCoverage 仍在")
     la = _strip_js_comments(_function_source(src, "loadAll"))
-    check("loadBlueCoverage();" in la, "loadAll() 初始化时调用 loadBlueCoverage()")
-    # 算术闭合：净亏必须是 16.875（20 - 3.125 = 16.875，3 位精度）
-    check("16.875" in html_raw, "index.html 净亏兜底值为 16.875（3 位算术闭合）")
-    check('set("net_sixth", _yuan(Math.abs(Number(d.net_sixth_yuan)), 3))' in src,
-          "fillHonestBounds 动态填充保留 3 位精度")
-    check('data-hb="net_sixth"' in html_raw, "首屏卡拥有 data-hb 契约属性")
+    check("loadBlueCoverage();" in la, "loadAll() 初始化时仍调用 loadBlueCoverage()")
 
     print("[6] 端点契约（鉴权方式与既有 portfolio 调用一致）")
     for fn in ("loadBlueCoverage", "loadPopularity"):

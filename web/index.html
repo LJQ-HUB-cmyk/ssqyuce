@@ -77,68 +77,7 @@
             <button class="btn-follow" onclick="followMyPick()">📋 复制这组</button>
           </div>
         </div>
-        <!-- ===== 诚实收益边界（首屏常驻、不可折叠）=====
-             存在理由：本系统的每一个"看起来变好了"的功能（蓝球去重、结构门控、偏好度排序），
-             都在改变**中奖分布**，而**不改变期望收益**。用户最容易在首屏产生
-             "这系统能帮我赚"的错觉，所以这四项必须在首屏、常驻、不可折叠地摆着。
-
-             四个数字取 n=10 的实测值（/api/portfolio/blue-coverage）：
-               47.55%（随机重复）→ 62.50%（去重覆盖）：概率确实提高了
-               20 元成本
-               3.125 元六等奖期望回收
-               15.625% 返奖比恒定 —— 这才是结论：提高的是频率，不是收益率
-             ⚠ 不得只显示前两项，那正是误解的来源。 -->
-        <div class="honest-bounds" id="honestBounds">
-          <div class="hb-head">
-            <b>买之前先看这几个数</b>
-            <span class="hb-sub">用「蓝球去重买 10 注」举例，把话说清楚</span>
-          </div>
-          <!-- 四组数字的取值口径（D3）：
-               默认是写死的 **n=10 示例快照**，页面加载后由 `fillHonestBounds()` 用
-               `/api/portfolio/blue-coverage?n_tickets=10` 的**同一个响应对象**覆盖，
-               与「蓝球覆盖卡」共用一次请求、一套口径（不许两处各算一遍）。
-               若端点不可用（401/503/超时），**保留静态值**但把卡角小字切成
-               「示例值（n=10）· 实时数据不可用」—— 静态数字绝不能冒充实时。
-               `data-hb` 属性是对外契约：探针按它逐个核对渲染值与端点返回值一致。 -->
-          <div class="hb-grid">
-            <div class="hb-item">
-              <div class="hb-k">买 <span data-hb="n_tickets">10</span> 注，至少中一次蓝球的概率</div>
-              <div class="hb-v"><span data-hb="p_repeat">47.55%</span>
-                <span class="hb-arrow">→</span>
-                <span data-hb="p_cover">62.50%</span></div>
-              <div class="hb-sub2">随便买重复号 <span data-hb="p_repeat2">47.55%</span>
-                → 蓝球不重复买 <b><span data-hb="p_cover2">62.50%</span></b>
-                <br><b>这一项确实变好了。</b>记住它，因为下面三项不会变。</div>
-            </div>
-            <div class="hb-item">
-              <div class="hb-k">要花多少钱</div>
-              <div class="hb-v"><span data-hb="cost">20</span> 元</div>
-              <div class="hb-sub2"><span data-hb="n_tickets2">10</span> 注 × 2 元/注</div>
-            </div>
-            <div class="hb-item">
-              <div class="hb-k">长期平均能收回多少（只算六等奖）</div>
-              <div class="hb-v"><span data-hb="ev_sixth">3.125</span> 元</div>
-              <div class="hb-sub2">花 20 元，平均拿回 3.125 元，
-                <b>每次都亏 <span data-hb="net_sixth">16.875</span> 元</b></div>
-            </div>
-            <div class="hb-item">
-              <div class="hb-k">每花 100 元，长期能拿回</div>
-              <div class="hb-v"><span data-hb="ratio_sixth">15.625</span> 元</div>
-              <div class="hb-sub2"><b>买多少注都是这个数，一分不多。</b>
-                上面概率变好了，但这里 <b>不变</b>。</div>
-            </div>
-          </div>
-          <div class="hb-foot">
-            <b>一句话：换着花样买，能让「偶尔中一次」的机会变多，但不能让亏的钱变少。</b><br>
-            不管怎么选号、怎么去重、买几注，长期都是<b>花 100 元拿回十几元</b>。
-            头奖命中率永远是 <b>1/1772 万</b>，与任何策略无关。
-            <span class="hb-src" id="hbSource">数值为 n=10 示例快照</span>
-            <span class="hb-links">
-              <a href="javascript:void(0)" onclick="jumpToCard('blueCoverageCard')">→ 蓝球去重覆盖（完整披露）</a>
-              <a href="javascript:void(0)" onclick="jumpToCard('popularityCard')">→ 大众偏好度（只给排序）</a>
-            </span>
-          </div>
-        </div>
+        
         <div class="pred-meta" id="predMeta"></div>
         <div class="pred-status" id="predStatus"></div>
         <div class="strict-banner hidden" id="strictBanner"></div>
