@@ -219,11 +219,18 @@ def main() -> None:
     ap.add_argument("--full", action="store_true", help="完整版：200 次重复")
     ap.add_argument("--quick", action="store_true", help="快速版（默认）")
     ap.add_argument("--json", default=None, help="把结果写入该 JSON 文件")
+    ap.add_argument("--reps", type=int, default=None,
+                    help="自定义重复次数的基数：null=reps、注入=reps/2、S1=reps/4（覆盖 --full/--quick）")
     args = ap.parse_args()
 
-    reps_null = 200 if args.full else 20
-    reps_inj = 60 if args.full else 12
-    reps_s1 = 40 if args.full else 10
+    if args.reps is not None:
+        reps_null = int(args.reps)
+        reps_inj = max(4, int(args.reps) // 2)
+        reps_s1 = max(2, int(args.reps) // 4)
+    else:
+        reps_null = 200 if args.full else 20
+        reps_inj = 60 if args.full else 12
+        reps_s1 = 40 if args.full else 10
     report: Dict = {"mode": "full" if args.full else "quick",
                     "reps_null": reps_null, "reps_inject": reps_inj, "reps_s1": reps_s1}
     t0 = time.time()

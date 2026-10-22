@@ -97,14 +97,35 @@ discover: top=20, fast_window=300, min_window_start=200, n_draws=550
 | **注入必检出·number_bias** | 6 号各 +10% 被检出 | **0.0 / 12 次**，mean best z **1.56** | **正确**：单号 +10% 需 3.7 万期，550 期远不够 |
 | **S1 去重有效性** | top-20 画像里的不同族数 | 旧 13 → **新 20** | 名额不再被同族多档挤占 |
 
-### 完整版（`--full`：null 200 · 注入 60 · S1 40）
+### 加大样本量的独立复现（Lead 复核，2026-10-23）
 
-> 完整版数字见本节末「FULL 结果」占位，跑完后回填（脚本后台运行）。
-> 若完整版 `persistent_effect_any_rate` 明显 >0.05，则应修实现（选择偏差），而非调判据 —— 当前 quick 为 0.0。
+> 下面这组数字是 **Lead 在实现之后独立重跑**的，不是实现者自报；两者一致即视为已复现。
+> 用 `--reps` 指定基数（null=reps、注入=reps/2、S1=reps/4），按实测耗时挑规模。
 
-```
-FULL 结果（跑完回填）：见 /tmp/v15_acc_full.json
-```
+| 检验 | 实现者 quick（20/12/10） | **Lead 复核** | 判定 |
+|---|---|---|---|
+| 纯随机 `persistent_effect` 族级误报 | 0.0 | **0.0 / 60 次** | 一致，远低于理论 FWER 0.05 |
+| 纯随机 `persistent` 误报 | 0.0 | **0.0 / 60 次** | 一致 |
+| `order_pos` · 位置 +35% 检出 | 0.75 / 12（mean z 3.48） | **0.80 / 20**（mean z **3.61**，max 5.01） | 一致（样本更大略高） |
+| `number_bias` · 6 号各 +10% | 0.0 / 12（mean z 1.56） | **0.0 / 30**（mean z **1.38**） | 一致 —— **正确的无效结论** |
+| S1 画像内不同族数（旧 → 新） | 13 → 20 | **13.1 → 20.0**（8 次均值） | 一致 |
+
+### 完整版单次跑（`--full`：null 200 · 注入 60 · S1 40，单进程满 CPU）
+
+> 本机单进程满 CPU 下 `--full` **~997 秒（约 17 分钟）**即可跑完（此前"数小时"的观察是多进程串跑互相抢 CPU 所致，非脚本本身慢）。
+> 结果写入 `/tmp/v15_acc_full.json`。
+
+| 检验 | **full 实测** | 与 quick / Lead 复核 |
+|---|---|---|
+| 纯随机 `persistent_effect` 族级误报 | **0.03 / 200 次**（max 1 条/次扫描） | 一致，**< 理论 FWER 0.05** |
+| 纯随机 `persistent` 误报 | **0.0 / 200 次** | 一致 |
+| `order_pos` · 位置 +35% 检出 | **0.783 / 60 次**（mean z **3.63**，max 5.42） | 与 quick 0.75 一致 |
+| `number_bias` · 6 号各 +10% | **0.017 / 60 次**（mean z 1.37） | 与 quick 0.0 一致 —— **正确的无效结论** |
+| S1 画像内不同族数（旧 → 新） | **12.6 → 20.0 / 40 次** | 与 quick 13→20 一致 |
+
+**复核结论**：两侧结论全部复现，无一处与实现者自报冲突。尤其两条关键的安全性质（请以 `--full` 200 次为准）：
+① 纯随机下新档 200 次里仅 **3%** 出现、每次扫描至多 1 条 —— **远低于理论 FWER 0.05**，未被改成"随便就能找到规律"；
+② 单号 +10% 在 550 期样本下检出 **0.017（60 次里 1 次，且靠 |z|≥3 阈值擦边）**，与 P2「需 3.7 万期」的数学结论完全吻合。
 
 ---
 
@@ -139,10 +160,10 @@ FULL 结果（跑完回填）：见 /tmp/v15_acc_full.json
 
 ## 5. 测试（全部现有 + 新增，变异实证非恒真）
 
-- 全量：`1679 passed, 24 skipped, 1 xfailed`，**1 failed** 为 `test_v14_engine_split::...byte_identical...`
-  —— **实测为既有失败，与 V15 无关**：把我的全部改动 `git stash` 后单跑该用例，哈希仍是同一个
-  `3165f786…`（不变），说明我的改动对 `predict_next` 输出零影响；失败根因是磁盘上 `patterns_runtime`
-  快照与硬编码指纹基线因历史数据刷新而漂移（`data/` 本轮未触碰）。
+- 全量（Lead 复核，`pytest tests/ --ignore=tests/test_v14_engine_split.py`）：**1659 passed, 24 skipped, 1 xfailed, 0 failed**。
+  唯一失败项 `test_v14_engine_split::...byte_identical...` —— **实测为既有失败，与 V15 无关**：在原始基线
+  （`git stash` 掉全部 V15 改动）上单跑该用例**同样 FAILED**，改动前后一致。失败根因是磁盘上的
+  `patterns_runtime` 快照与硬编码指纹基线因历史数据刷新而漂移（`data/` 本轮未触碰）。
 - 新增 `tests/test_v15_assumption_space.py`（14 例），每条都做过**变异实证**（故意改坏实现一行，测试必须变红）：
 
 | 测试 | 变异点（使其变红） | 结果 |
@@ -175,7 +196,7 @@ FULL 结果（跑完回填）：见 /tmp/v15_acc_full.json
 
 ## 附录：脚本、种子、复现
 
-- 验收脚本：`qa-tools/v15_acceptance.py`（`PYTHONPATH=. .venv/bin/python qa-tools/v15_acceptance.py --quick|--full --json out.json`）
+- 验收脚本：`qa-tools/v15_acceptance.py`（`PYTHONPATH=. .venv/bin/python qa-tools/v15_acceptance.py --quick|--full|--reps N --json out.json`）
 - 种子：null `10000+s`；注入 `20000+s`；S1 `30000+s`；脚本内 `make_case` 用独立 `orng = seed ^ 0x9E3779B9` 打乱 order，**不扰动主 RNG 流**（保护 engine 指纹测试）。
 - 测试：`tests/test_v15_assumption_space.py`；`.venv/bin/python -m pytest tests/ -q`
 - 关键实现：`lottery/discovery.py`（S1 去重循环、`_stat_scan`、`_stat_order_pos/_number_bias/_sum_dist`、三 FAMILIES）、
