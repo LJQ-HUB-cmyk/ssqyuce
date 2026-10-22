@@ -57,6 +57,16 @@ MIN_DRAWS_FOR_SNAPSHOT = 500
 # 看起来像"全被判死"的误导性计数（用户反馈第 3 条）。
 USABLE_STATUSES = ("persistent",)
 
+# 「长期效应」档（V15，依据 P2 §7.1 S2）：**新增**，不是替换 persistent，也不放宽它。
+#
+# 现行 ``persistent`` 要求「最近段显著 ∧ 另有段显著」，H0 下 P≈3e-5、真实 +3% 也仅≈3e-4，
+# 是断崖。``persistent_effect`` 把「长期平均有显著效应」的候选从"完全不可达"变成"部分可达"，
+# 代价是它说的是**长期效应、当前不一定在生效**。
+#
+# 它**必须**照样过 ``validated`` + ``prereg_ok`` + 可回放 + ``source!="llm"``（N1–N4 不动）；
+# 只是把状态机的最后一关从「最近段显著」换成「长期档整体显著 + 近 K 段方向一致」。
+PERSISTENT_EFFECT_STATUSES = ("persistent_effect",)
+
 # V11「阶段可用」档（默认关闭，见 config.LOTT_PHASE_USABLE）：
 # 「长期持续」之外的**阶段类**状态。用户明确要求"阶段性规律只要当前可用就应该能指导预测"，
 # 而 docs/reviews/PHASE_USABLE_STUDY.md 的四组检验显示该假设未获数据支持
@@ -141,6 +151,19 @@ def build_snapshot(draws: Sequence[Dict], scan: Optional[Dict] = None,
             and h.get("prereg_ok") is True
             and _is_replayable
         )
+        # 长期效应档：同样要 validated + prereg_ok + 可回放（源检查在 _replay_ok 里），
+        # 只是状态机给的是 persistent_effect 而不是 persistent。它独立成一档，
+        # **不并入** _long_term_ok —— 二者证据强度不同，界面上必须分开展示。
+        _effect_ok = (
+            (status in PERSISTENT_EFFECT_STATUSES)
+            and h.get("status") == "validated"
+            and h.get("prereg_ok") is True
+            and _is_replayable
+        )
+        # 长期效应档的方向一致性（几个数字：K 段里几个同号），供前端并列展示。
+        _pe = ((rep.get("persistent_effect") or {})
+               if isinstance(rep.get("persistent_effect"), dict) else {})
+        _pe_sign = _pe.get("sign_agreement") or {}
         # V11 阶段可用档：默认关闭；打开后 emerging/fading 也进候选，
         # 但必须过前置注册、且 A/B 未被判负（status 不是 rejected）。
         _phase_ok = False
@@ -151,7 +174,7 @@ def build_snapshot(draws: Sequence[Dict], scan: Optional[Dict] = None,
                 and h.get("prereg_ok") is True
                 and _is_replayable
             )
-        usable = bool(_long_term_ok or _phase_ok)
+        usable = bool(_long_term_ok or _effect_ok or _phase_ok)
         # P3：单独统计「可回放且可用」的条数 —— 这是严格模式门控的正确依据。
         # 与 `usable` 的区别：usable 已经把不可回放的 LLM 规律排除了，
         # 但历史上 usable 的语义被「L1 检出/未检出」与「阶段可用」多次混用，
@@ -184,21 +207,30 @@ def build_snapshot(draws: Sequence[Dict], scan: Optional[Dict] = None,
                 "reason": h.get("prereg_reason"),
             },
             "usable": bool(usable),
-            # V11：usable_kind 让前端/统计能区分「长期规律」与「阶段规律」，
-            # 二者必须分开度量效果 —— 混在一起算就再也说不清是哪类在起作用。
+            # V11：usable_kind 让前端/统计能区分「长期规律」「长期效应」「阶段规律」，
+            # 三者必须分开度量效果 —— 混在一起算就再也说不清是哪类在起作用。
             "usable_kind": ("long_term" if _long_term_ok
-                            else ("phase" if _phase_ok else None)),
+                            else ("persistent_effect" if _effect_ok
+                                  else ("phase" if _phase_ok else None))),
+            # 长期效应档的方向一致性：K 段里几个同号（供界面并列展示，非"可用"承诺）。
+            "sign_agreement": ({"k": _pe_sign.get("k"), "n_used": _pe_sign.get("n_used"),
+                                "n_pos": _pe_sign.get("n_pos"), "n_neg": _pe_sign.get("n_neg"),
+                                "agree": _pe_sign.get("agree"), "sign": _pe_sign.get("sign")}
+                               if _effect_ok else None),
+            "long_term": (_pe.get("long_term") if _effect_ok else None),
             "tier": ("usable_long_term" if _long_term_ok
-                     else ("usable_phase" if _phase_ok
-                           else ("rejected" if (status in REJECTED_STATUSES
-                                                or h.get("status") == "rejected")
-                                 else "monitor"))),
+                     else ("usable_persistent_effect" if _effect_ok
+                           else ("usable_phase" if _phase_ok
+                                 else ("rejected" if (status in REJECTED_STATUSES
+                                                      or h.get("status") == "rejected")
+                                       else "monitor")))),
             "evidence_text": _evidence_text(h, rep),
         })
     # 2) 维度扫描里**任何**有阶段证据的线索（含 noise）都进快照，只是分层不同。
     #    之前只收 persistent/emerging/fading，一旦假说库为空（重启后被清空），
     #    快照就是 0 条 —— 界面便退化成"系统什么都没分析"，等于白做一轮扫描。
-    tier_of_scan = {"persistent": "monitor", "emerging": "monitor", "fading": "monitor",
+    tier_of_scan = {"persistent": "monitor", "persistent_effect": "monitor",
+                    "emerging": "monitor", "fading": "monitor",
                     "stale": "monitor", "flipped": "rejected", "reversed": "monitor",
                     "noise": "monitor"}
     for it in (scan.get("items") or []):
@@ -222,6 +254,7 @@ def build_snapshot(draws: Sequence[Dict], scan: Optional[Dict] = None,
                              f"近窗效应 {q.get('delta')}，BH p={q.get('p_adjusted')}",
         })
     _n_long = sum(1 for r in rules if r.get("tier") == "usable_long_term")
+    _n_effect = sum(1 for r in rules if r.get("tier") == "usable_persistent_effect")
     _n_phase = sum(1 for r in rules if r.get("tier") == "usable_phase")
     # V12-04：按 `layer` 分列（**三层不共享同一个计数**，见方案 §0 第 4 条）。
     #   L1 计数语义 = 检出 / 未检出（统计假说的 tier 分布）
@@ -257,22 +290,28 @@ def build_snapshot(draws: Sequence[Dict], scan: Optional[Dict] = None,
         # 按 tier 计数（V11 起的既有契约，语义不变）
         "by_layer": {
             "usable_long_term": _n_long,
+            "usable_persistent_effect": _n_effect,
             "usable_phase": _n_phase,
             "monitor": sum(1 for r in rules if r["tier"] == "monitor"),
             "rejected": sum(1 for r in rules if r["tier"] == "rejected"),
         },
-        # 兼容字段：等于 usable_long_term，**不是**两类之和
+        # 兼容字段：等于 usable_long_term，**不是**各类之和
         "usable": _n_long,
         # V11：必须分开计数 —— 混在一起就说不清"当前在用的是什么"
         "usable_long_term": _n_long,
+        # V15：长期效应档单独计数（语义：长期平均显著，当前不一定生效）
+        "usable_persistent_effect": _n_effect,
         "usable_phase": _n_phase,
         # 跨层合计单独给出，字段名自带警告，供需要总量的人显式取用
-        "all_tiers_sum": _n_long + _n_phase,
+        "all_tiers_sum": _n_long + _n_effect + _n_phase,
         "monitor": sum(1 for r in rules if r["tier"] == "monitor"),
         "rejected": sum(1 for r in rules if r["tier"] == "rejected"),
         "phase_usable_enabled": bool(getattr(config, "LOTT_PHASE_USABLE", False)),
         "tier_legend": {
             "usable_long_term": "可用（长期）：阶段持续有效 + A/B 验证 + 前置注册通过",
+            "usable_persistent_effect": "长期效应：长期平均显著 + 近 K 段方向一致 —— "
+                                        "**不是「当前有效」**；它只说明长期平均有效应，"
+                                        "当前阶段可能并不在生效，需结合近 K 段方向一致性判读",
             "usable_phase": "可用（阶段）：仅当前阶段有效 —— 该档默认关闭；"
                             "3515 期研究未支持其可预测性，请以实测 Δ 为准",
             "usable": "兼容字段 = 长期可用条数；**不含阶段可用**（禁止跨层相加）",

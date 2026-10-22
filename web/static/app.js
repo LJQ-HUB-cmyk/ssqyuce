@@ -919,6 +919,11 @@ function renderRuleUsage(res) {
       counts.usable_phase
         ? "另：阶段可用 " + counts.usable_phase + " 条（3515 期未获支持，仅观察）"
         : (snap.generated_at ? "快照 " + snap.generated_at : "未生成快照")) +
+    // S2（V15）：长期效应档单独一行——语义是「长期平均显著，当前不一定生效」，
+    // 绝不能并进「长期可用」里冒充当前有效。
+    metricItem("长期效应（长期平均显著·当前不一定生效）",
+      Number(counts.usable_persistent_effect || 0),
+      "近 K 段方向一致 + 长期 Bonferroni 显著；与「长期可用（持续有效）」不是一回事") +
     '</div>';
   h += '<div class="rule-shadow">' + escHtml(r.note_zh || "") + '</div>';
   const rules = r.usable_rules || [];
@@ -4863,10 +4868,14 @@ function openRegimeTab() {
   if (!_rgOverview) loadRegimeOverview(false);
 }
 
-const RG_STATUS_ORDER = ["persistent", "emerging", "fading", "stale", "flipped",
+const RG_STATUS_ORDER = ["persistent", "persistent_effect", "emerging", "fading", "stale", "flipped",
   "reversed", "noise", "no_dimension", "insufficient", "error", "unannotated"];
 const RG_STATUS_COLOR = {
-  persistent: "var(--green)", emerging: "var(--gold)", fading: "var(--yellow, #d29922)",
+  persistent: "var(--green)",
+  // S2：长期效应档用青蓝色，**刻意不像 persistent 的绿色**——它描述长期平均效应，
+  // 不代表「当前正在生效」，颜色与文案都必须让用户一眼看出区别。
+  persistent_effect: "var(--cyan, #4cc9f0)",
+  emerging: "var(--gold)", fading: "var(--yellow, #d29922)",
   stale: "var(--red)", flipped: "var(--red)", reversed: "var(--muted)",
   noise: "var(--muted)", no_dimension: "var(--muted)", insufficient: "var(--muted)",
   error: "var(--red)", unannotated: "var(--muted)",
@@ -5020,16 +5029,36 @@ function renderDiscovery(res) {
     (res.best_quick_p_adjusted === null || res.best_quick_p_adjusted === undefined ? "—" :
       Number(res.best_quick_p_adjusted).toFixed(3));
   const sc = res.scan_summary || res;
-  let h = '<div class="multi-correct-banner' + ((res.status_count && (res.status_count.persistent || res.status_count.emerging)) ? ' warn' : '') + '">' +
+  const _sc = res.status_count || {};
+  const _pe = (_sc.persistent_effect || 0);
+  let h = '<div class="multi-correct-banner' + ((_sc.persistent || _sc.emerging) ? ' warn' : '') + '">' +
     '<div class="mcb-main">扫描 <b>' + (res.n_tested || 0) + '</b> 组维度×参数 · 纯随机预期假阳性约 <b>' +
-    Number(res.expected_false_positives || 0).toFixed(1) + '</b> 个 · 结论：' + escHtml(res.verdict || "") + '</div>' +
-    '<div class="mcb-sub">' + escHtml(res.note_zh || "") + '『阶段状态』是该维度在全历史上的阶段画像，不是出号建议。</div></div>';
+    Number(res.expected_false_positives || 0).toFixed(1) + '</b> 个 · 结论：' + escHtml(res.verdict || "") +
+    (_pe ? ' · <span style="color:' + RG_STATUS_COLOR.persistent_effect + '">长期效应 ' + _pe + ' 条</span>' : "") +
+    '</div>' +
+    '<div class="mcb-sub">' + escHtml(res.note_zh || "") +
+    '『阶段状态』是该维度在全历史上的阶段画像，不是出号建议。' +
+    '（n_tested=' + (res.n_tested || 0) + ' 为本轮维度×参数检验总数，S7 新增位置/逐号/和值三维度后分母随之增大；' +
+    '『长期效应』= 长期平均显著 + 近 K 段方向一致，<b>当前不一定在生效</b>，与『持续有效』不是一回事。）</div></div>';
   h += '<div class="scroll"><table class="battle-table"><thead><tr>' +
     '<th>维度</th><th>参数</th><th>n</th><th>均值</th><th>期望</th><th>差值</th><th>z</th>' +
     '<th>p</th><th>BH校正p</th><th>阶段状态</th></tr></thead><tbody>';
   for (const it of (res.items || [])) {
     const q = it.quick || {};
     const f = it.filter || {};
+    const rg = it.regime || {};
+    // S2：长期效应档在「阶段状态」格里并列显示方向一致性（K 段里几段同号）与
+    // 长期口 Bonferroni p —— 让用户看到它靠的是什么，而不是一个孤立状态词。
+    let peSub = "";
+    if (it.status === "persistent_effect") {
+      const pe = rg.persistent_effect || {};
+      const lt = pe.long_term || {};
+      const sa = pe.sign_agreement || rg.sign_agreement || {};
+      const parts = [];
+      if (sa.n_used !== undefined) parts.push("方向一致 " + (sa.agree || 0) + "/" + (sa.n_used || 0) + (sa.sign === "neg" ? "（负向）" : "（正向）"));
+      if (lt.p_adj !== undefined) parts.push("长期p校正=" + Number(lt.p_adj).toFixed(3) + (lt.m ? "（m=" + lt.m + "）" : ""));
+      if (parts.length) peSub = '<div class="rg-cell-sub" style="color:' + (RG_STATUS_COLOR.persistent_effect) + '">' + escHtml(parts.join(" · ")) + '</div>';
+    }
     h += '<tr><td>' + escHtml(f.name_zh || f.key) + '<div class="rg-cell-sub">' + escHtml(f.target || "") + '</div></td>' +
       '<td class="flat" style="text-align:left">' + escHtml(JSON.stringify(f.params || {})) + '</td>' +
       '<td>' + (q.n || 0) + '</td><td>' + Number(q.mean || 0).toFixed(4) + '</td>' +
@@ -5040,6 +5069,7 @@ function renderDiscovery(res) {
       '<td>' + (q.p_adjusted === undefined || q.p_adjusted === null ? "—" : "<b>" + Number(q.p_adjusted).toFixed(3) + "</b>") + '</td>' +
       '<td style="text-align:left"><span class="rg-badge" style="border-color:' + (RG_STATUS_COLOR[it.status] || "var(--border)") +
       ';color:' + (RG_STATUS_COLOR[it.status] || "inherit") + '">' + escHtml(it.status_zh || it.status || "") + '</span>' +
+      peSub +
       '<div class="rg-cell-sub">' + escHtml((it.reason_zh || "").slice(0, 80)) + '</div></td></tr>';
   }
   h += '</tbody></table></div>';

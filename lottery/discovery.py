@@ -1352,8 +1352,15 @@ def pad_series(obs: Sequence[float], draws: Sequence[Dict], start: int,
 
 
 def regime_of_filter(draws: Sequence[Dict], flt: Dict, start: int = 200,
-                     end: Optional[int] = None, min_era_n: int = regime.MIN_ERA_N) -> Dict:
-    """一个筛选条件的完整阶段画像（as-of 回放 → 阶段检验 → 状态机）。"""
+                     end: Optional[int] = None, min_era_n: int = regime.MIN_ERA_N,
+                     n_tested: Optional[int] = None, long_term_exclude: int = 0) -> Dict:
+    """一个筛选条件的完整阶段画像（as-of 回放 → 阶段检验 → 状态机）。
+
+    ``n_tested``：本次扫描的假设总数，透传给 ``regime_report`` 供「长期效应」档
+    （``persistent_effect``）做整体校正；缺省 None（不校正，安全默认）。
+    ``long_term_exclude``：长期档检验要排除的末尾期数（= discover 快速筛选窗口），
+    避免「用哪段选它、又拿那段验它」的选择性推断（见 ``regime.long_term_effect``）。
+    """
     scan = asof_scan(draws, flt, start=start, end=end)
     pad = float(np.mean(scan["exp"])) if scan["exp"] else 0.0
     series = pad_series(scan["obs"], draws, scan["start"], fill=pad)
@@ -1365,7 +1372,8 @@ def regime_of_filter(draws: Sequence[Dict], flt: Dict, start: int = 200,
     p0 = pad_series(scan["exp"], draws, scan["start"], fill=pad)
     delta_series = [float(o) - float(e) for o, e in zip(obs_node, p0)]
     rep = regime.regime_report(delta_series, draws, p0=None, label=flt["label"],
-                               min_era_n=min_era_n, pad=int(scan["start"]))
+                               min_era_n=min_era_n, pad=int(scan["start"]),
+                               n_tested=n_tested, long_term_exclude=long_term_exclude)
     rep["scan"] = {k: scan[k] for k in ("target", "n", "k_mean", "start", "end")}
     rep["filter"] = {"key": flt["key"], "name_zh": flt["name_zh"],
                      "target": flt["target"], "params": flt.get("params", {})}

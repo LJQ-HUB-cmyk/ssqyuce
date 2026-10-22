@@ -539,6 +539,98 @@ def family_adjust_locked(p_values: Sequence[Optional[float]],
     return out
 
 
+# 「长期效应」档（P2 §7.1 S2）—— 把「断崖」改成「斜坡」。
+#
+# 背景：现行 ``USABLE_STATUSES`` 只认 ``persistent``，要求「最近段显著 ∧ 另有段显著」。
+# H0 下 P(persistent)≈3e-5；即便真实 +3% 效应也只有约 3e-4 —— 等于**完全不可达**。
+# 于是系统在「真有效应」时也长期报 0 条可用规律，用户看到的是"系统什么都没找到"，
+# 而不是"证据还不够硬"。
+#
+# ``persistent_effect`` 档的判据（**不要求每段都显著**，这是它与 persistent 的核心区别）：
+#   1) **长期档 Δ 显著**：对整条历史配对差值做单样本 t 检验 → p_raw，
+#      再按扫描规模 Bonferroni：``p_adj = min(1, p_raw * m)``，m 取真实 n_tested。
+#      （这一步用「扫描了多少个假设」作分母，与 discovery 的族校正同一口径，
+#        **不是** ERA_FAMILY_M 的段级口径 —— 二者含义不同，勿混。）
+#   2) **最近 K 段方向一致**（符号检验）：最近 K 个**被判定过的**阶段 delta 同号
+#      （即 ``agree == k`` 且 ``n_used >= k``）。注意：不能用 "≥ K-1 段" —— 当三段都
+#      有号时，多数方向必然 ≥2，那等于恒真、只剩 "至少 3 段" 这一条，起不到方向一致性
+#      的作用。要求 "全部同号" 才是真的 "方向一致"；末期不足段（n_used<k）则不达标
+#      （宁可保守地不给本档，也不靠凑数）。K 默认 3。
+#
+# K 的取值来源：与 ``regime_status`` 里 ``recent_deltas[-3:]``（近三期平均效应）
+# 保持一致的 3；可选 4~5 会更严（更难达标）。**写成常量、带注释锁死**，不做
+# "事后挑 K 去凑显著"。若要调整，必须走独立验证集（V15 文档 §附录）。
+PERSISTENT_EFFECT_K = 3
+
+
+def long_term_effect(series: Sequence[float], n_tested: int = 1,
+                     alpha: float = ALPHA, pad: int = 0, exclude_recent: int = 0) -> Dict:
+    """长期档整体效应检验：整条（跳过 pad 占位期）配对差值的单样本 t 检验。
+
+    ``exclude_recent``：**丢弃末尾这么多期**再检验。为什么需要它（防「选择性推断」）：
+    ``discover`` 的两阶段设计先用最近 ``fast_window`` 期的 z 做快速筛选，只有入选的
+    候选才会跑完整画像。若长期档 t 检验把这段**用来选它的窗口**也算进去，末段的极端
+    值会把全期均值拉偏 → 纯随机数据上也会系统性地判显著（实测未排除时族误报率
+    ≈0.2，远超 α=0.05）。排除被用于选择的近期窗口后，长期档在**与选择无关的**历史段上
+    检验，FWER 才能贴住名义 α。
+
+    返回 ``{n, delta, t, p_raw, p_adj, m, significant}``；``p_adj = min(1, p_raw*m)``，
+    ``m=max(1, n_tested)``。样本不足或无方差时 ``p_raw=None``、``significant=False``。
+    **不抛异常**（与 ``era_significance`` 一致的降级纪律）。
+    """
+    eff = list(series[int(pad):] if pad and int(pad) < len(series) else series)
+    if exclude_recent and int(exclude_recent) > 0:
+        eff = eff[:max(0, len(eff) - int(exclude_recent))]
+    arr = np.asarray([float(x) for x in eff if x is not None], dtype=float)
+    n = int(arr.size)
+    out: Dict = {"n": n, "delta": None, "t": None, "p_raw": None,
+                 "p_adj": None, "m": int(max(1, n_tested)), "significant": False}
+    if n < 3:
+        return out
+    mean = float(arr.mean())
+    sd = float(arr.std(ddof=1))
+    out["delta"] = mean
+    if sd <= 0:
+        return out
+    t, p = stats.ttest_1samp(arr, 0.0)
+    out["t"] = float(t)
+    out["p_raw"] = float(p)
+    out["p_adj"] = float(min(1.0, p * out["m"]))
+    out["significant"] = bool(out["p_adj"] < alpha)
+    return out
+
+
+def sign_agreement(deltas: Sequence[Optional[float]], k: int = PERSISTENT_EFFECT_K) -> Dict:
+    """最近 K 段方向一致性（符号检验的极简版）。
+
+    返回 ``{k, n_used, n_pos, n_neg, agree, sign}``：取最近 k 个非 None 的 delta，
+    统计正/负号各几个；``agree`` = 占多数方向的符号数，``sign`` = 该方向（"pos"/"neg"/None）。
+    判定用的门槛是 ``agree >= k-1``（允许 1 段例外）。
+    """
+    ds = [d for d in (deltas or []) if d is not None][-int(k):]
+    n_pos = sum(1 for d in ds if d > 0)
+    n_neg = sum(1 for d in ds if d < 0)
+    n_used = len(ds)
+    if n_pos >= n_neg and n_pos:
+        sign, agree = "pos", n_pos
+    elif n_neg:
+        sign, agree = "neg", n_neg
+    else:
+        sign, agree = None, 0
+    return {"k": int(k), "n_used": n_used, "n_pos": n_pos, "n_neg": n_neg,
+            "agree": int(agree), "sign": sign}
+
+
+def _persistent_effect_sign_ok(sign_agree: Dict) -> bool:
+    """「长期效应」档的方向一致性门槛：最近 K 个被判定阶段**全部同号**且数量够 K。
+
+    抽成独立函数是为了让它可被单测直接覆盖（否则这条门槛内联在 ``regime_report`` 里，
+    改坏了也难有测试变红）。规则细节见 ``PERSISTENT_EFFECT_K`` 上方注释的 (2)。
+    """
+    return bool(sign_agree.get("agree", 0) >= PERSISTENT_EFFECT_K
+                and sign_agree.get("n_used", 0) >= PERSISTENT_EFFECT_K)
+
+
 def regime_status(eras: Sequence[Dict], p_adjusted: Sequence[Optional[float]],
                   deltas: Sequence[Optional[float]], last_significant_index: Optional[int],
                   n_total: int, min_n: int = MIN_ERA_N) -> Dict:
@@ -667,7 +759,9 @@ def regime_report(series: Sequence[float], draws: Sequence[Dict],
                   block: Optional[int] = None,
                   n_dims: int = 1,
                   adj_mode: Optional[str] = None,
-                  anchor_mode: Optional[str] = None) -> Dict:
+                  anchor_mode: Optional[str] = None,
+                  n_tested: Optional[int] = None,
+                  long_term_exclude: int = 0) -> Dict:
     """一个候选规律的完整阶段画像 → 状态机判决。
 
     ``series`` 与 ``draws`` 等长，每期一个观测：
@@ -704,6 +798,11 @@ def regime_report(series: Sequence[float], draws: Sequence[Dict],
 
     ``pad``：序列前 ``pad`` 期是占位值（as-of 回放无法评估的最早期），
     这些期**整段跳过**——既不进任何阶段检验，也不进近期窗口。
+
+    ``n_tested``：本次扫描的**真实**假设总数（discovery 传的是去重前的 ``len(records)``）。
+    仅用于新增的「长期效应」档（``persistent_effect``）的整体检验校正 —— 与
+    ``ERA_FAMILY_M``（段级固定分母）、``n_dims``（展示用）都**不是同一个东西**。
+    缺省 1（即不校正），此时 ``persistent_effect`` 几乎不会达标，安全默认。
     """
     draws = list(draws or [])
     series = list(series or [])
@@ -749,6 +848,27 @@ def regime_report(series: Sequence[float], draws: Sequence[Dict],
         if a is not None and a < ALPHA:
             last_sig = i
     st = regime_status(eras, adj, deltas, last_sig, len(draws), min_n=min_era_n)
+    # ---- 「长期效应」档（persistent_effect，P2 §7.1 S2）----
+    # 只在**不是** persistent（即现行严格档没达标）的候选上考虑升级到本档，
+    # 绝不覆盖/放宽 persistent。本档语义明确是「长期平均有效应」，**不保证当前生效**。
+    _m = int(n_tested) if n_tested is not None else 1
+    long_term = long_term_effect(series, n_tested=_m, alpha=ALPHA, pad=int(pad),
+                                 exclude_recent=int(long_term_exclude or 0))
+    sign_agree = sign_agreement(deltas, k=PERSISTENT_EFFECT_K)
+    _sign_ok = _persistent_effect_sign_ok(sign_agree)
+    if (st.get("status") not in ("persistent", "flipped")
+            and long_term["significant"] and _sign_ok):
+        st = {
+            "status": "persistent_effect", "label_zh": "长期效应（长期平均显著，当前不一定在生效）",
+            "recent_delta": st.get("recent_delta"), "direction": st.get("direction"),
+            "reason_zh": (
+                f"长期档整体 Δ={long_term['delta']:+.4f}（p_adj={long_term['p_adj']:.3g}，"
+                f"m={long_term['m']}）；最近 {sign_agree['n_used']} 段中 "
+                f"{sign_agree['agree']} 段同号 —— 长期有平均效应，但**不要求每段都显著**，"
+                "当前阶段可能并不在生效；与「持续有效（persistent）」不是一回事"),
+            "earliest_era": st.get("earliest_era"), "latest_era": st.get("latest_era"),
+            "persistent_effect": {"long_term": long_term, "sign_agreement": sign_agree},
+        }
     eff_series = series[int(pad):] if pad and int(pad) < len(series) else series
     eff_p0 = (p0[int(pad):] if (p0 is not None and pad and int(pad) < len(p0)) else p0)
     recent = weighted_recent(eff_series, eff_p0, window=recent_window, alpha=ALPHA)
@@ -778,6 +898,8 @@ def regime_report(series: Sequence[float], draws: Sequence[Dict],
         "m_adj_locked": (adj_m != "bh"),
         "m_adj_overflow": bool(adj_m != "bh" and m_tested > ERA_FAMILY_M),
         "n_sig_eras": n_sig,
+        "long_term": long_term,
+        "sign_agreement": sign_agree,
         "eras": raw,
         "recent": recent,
         "last_significant_era": eras[last_sig]["name"] if last_sig is not None else None,

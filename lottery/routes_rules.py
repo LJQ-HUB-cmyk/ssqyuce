@@ -136,13 +136,16 @@ def regime_overview(limit: int = Query(0, ge=0, le=3490),
     }
 
 
-REGIME_STATUS_ORDER = ["persistent", "emerging", "fading", "stale", "flipped",
+REGIME_STATUS_ORDER = ["persistent", "persistent_effect", "emerging", "fading", "stale", "flipped",
                        "reversed", "noise", "no_dimension", "insufficient", "error"]
 
 
 def regime_status_label(status: str) -> str:
     return {
         "persistent": "持续有效（最近阶段仍显著）",
+        # S2：长期效应档。**措辞必须与 persistent 明确区分**——它描述的是「长期平均
+        # 有显著效应」，当前这一段不一定在生效；绝不能写成「当前有效」。
+        "persistent_effect": "长期效应（长期平均显著，当前不一定在生效）",
         "emerging": "新兴线索（只有最近阶段显著，未确认）",
         "fading": "正在衰减（上一阶段有效，最近失效）",
         "stale": "陈旧（曾显著，已被新数据推翻）",
