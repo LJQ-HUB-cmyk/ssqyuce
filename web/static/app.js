@@ -5108,11 +5108,13 @@ async function loadDiscoveryFamilies() {
 }
 
 function renderFamilies(r) {
-  let h = '<div class="track-note">共 ' + (r.n_families || 0) + ' 个维度族、' + (r.n_combos || 0) + ' 组参数（这就是「可搜索的规律空间」）。</div>' +
-    '<div class="scroll"><table class="battle-table"><thead><tr><th>族</th><th>维度</th><th>定义</th><th>参数组数</th></tr></thead><tbody>';
+  let h = '<div class="track-note">共 ' + (r.n_families || 0) + ' 个维度族、' + (r.n_combos || 0) + ' 组参数（这就是「可搜索的规律空间」）。' +
+    '『诚实结论』列说明该维度当前能做到什么、不能做到什么——能搜到维度 ≠ 立刻有规律。</div>' +
+    '<div class="scroll"><table class="battle-table"><thead><tr><th>族</th><th>维度</th><th>定义</th><th>参数组数</th><th>诚实结论</th></tr></thead><tbody>';
   for (const f of (r.families || [])) {
     h += '<tr><td>' + escHtml(f.name_zh) + '</td><td class="flat" style="text-align:left">' + escHtml(f.dim_zh) +
-      '</td><td class="flat" style="text-align:left">' + escHtml(f.ratio) + '</td><td>' + f.n_param_sets + '</td></tr>';
+      '</td><td class="flat" style="text-align:left">' + escHtml(f.ratio) + '</td><td>' + f.n_param_sets +
+      '</td><td class="flat" style="text-align:left">' + escHtml(f.note_zh || "—") + '</td></tr>';
   }
   return h + '</tbody></table></div>';
 }

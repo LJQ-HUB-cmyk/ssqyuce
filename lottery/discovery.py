@@ -1008,7 +1008,150 @@ def _sel_same_tail_group(params: Dict) -> Callable[[Sequence[Dict]], set]:
     return fn
 
 
+# ==========================================================================
+# S7 分布类维度的逐期统计量（stat_fn(history, actual) -> (obs, exp)）
+#
+# 约定：``obs - exp`` 的长期均值为 0 即「该维度无效应」。逐期只用 history（严格 as-of），
+# 未来期不会进入。任何缺失/异常都返回 (0.0, 0.0) 而不是抛错 —— 单期失败不该中断回放。
+# ==========================================================================
+
+def _stat_order_pos(params: Dict):
+    """位置-号码独立性（as-of 选号 + 下一期命中，零假设下严格零均值）。
+
+    对每个开奖位置 p（第 1..6 位），用近 ``window`` 期历史统计「该位置各号码出现次数」，
+    取该位置出现最多的 ``k`` 个号码作为「该位置偏爱集」。
+    * ``obs`` = 本期 6 个位置上，实际号码落在**各自位置**偏爱集内的个数（0..6）。
+    * ``exp`` = 零假设（位置与号码独立、号码均匀）下的期望 = ``6·k/33``。
+
+    独立时每个位置的偏爱集与本期号码无关，故 ``P(命中)=k/33``、``E[obs]=6k/33`` ——
+    ``obs-exp`` 的**长期均值严格为 0**（不会像互信息那样因有限历史 / 稀疏列联表
+    产生系统偏置，实测插值 PMI 在纯随机数据上 z 高达数十，是假阳性）。
+    存在**位置偏置**（某位置的号码分布明显偏离均匀）时，该位置的偏爱集集中到少数号，
+    本期命中率随之升高 → ``obs>exp``，可检出。
+
+    ``order`` 缺失/长度异常返回 (0,0) 优雅降级；历史 < 30 期也返回 (0,0)。
+    """
+    w = int(params.get("window", 300))
+    k = int(params.get("k", 6))
+    exp0 = PICK * k / R_MAX
+    def fn(history, actual):
+        order = actual.get("order")
+        if not order or len(order) != PICK:
+            return 0.0, 0.0
+        hist = history[-w:]
+        if len(hist) < 30:
+            return 0.0, 0.0
+        pos_cnt = np.zeros((PICK, R_MAX + 1))
+        n_hist = 0
+        for d in hist:
+            o = d.get("order")
+            if not o or len(o) != PICK:
+                continue
+            n_hist += 1
+            for p in range(PICK):
+                num = int(o[p])
+                if 1 <= num <= R_MAX:
+                    pos_cnt[p, num] += 1
+        if n_hist < 30:
+            return 0.0, 0.0
+        hits = 0
+        for p in range(PICK):
+            num = int(order[p])
+            if not (1 <= num <= R_MAX):
+                continue
+            fav = set((np.argsort(-pos_cnt[p, 1:])[:k] + 1).tolist())
+            if num in fav:
+                hits += 1
+        return float(hits), float(exp0)
+    return fn
+
+
+def _stat_number_bias(params: Dict):
+    """逐号偏置：近 W 期最超配的单个号码（二项 z 最大）下一期是否开出。
+
+    以 ``PICK/33≈0.1818`` 为单号每期基线概率。按近 W 期的超配 z 选出一个号码，
+    若它在本期开出观测为 1、否则 0；期望为它在近 W 期的基线概率（与基线一致时
+    效应为 0）。多重性：本族本身即「对 33 个号取最强者」，Bonferroni 按 33 计
+    （见 note_zh 与现实期数门槛）。历史不足 W/2 或号码数异常时返回 (0, 0)。
+    """
+    w = int(params.get("window", 300))
+    p_base = PICK / R_MAX
+    def fn(history, actual):
+        hist = history[-w:]
+        if len(hist) < max(30, w // 2):
+            return 0.0, 0.0
+        cnt = red_count(hist, len(hist))
+        n = len(hist)
+        # 二项 z（相对 p_base）：(obs - n*p) / sqrt(n*p*(1-p))
+        sd = math.sqrt(max(n * p_base * (1 - p_base), 1e-9))
+        z = (cnt - n * p_base) / sd
+        pick = int(np.argmax(z)) + 1                    # 最超配的号（下标 0..32 → 1..33）
+        reds = set(int(x) for x in (actual.get("reds") or []))
+        obs = 1.0 if pick in reds else 0.0
+        # 期望：**无条件基线** PICK/R_MAX（而非该号的近窗频率）。
+        # 若用近窗频率作期望，等于把"超配"本身当成了零假设目标 —— 最超配号的近窗
+        # 频率必然 > 基线，下一期回归到基线时会产生系统性负偏差（实测 z≈-5 的假阳）。
+        # 正确口径：检验"最超配的号下一期是否仍高于无条件基线" —— 零假设下 E[obs]=基线。
+        exp = p_base
+        return obs, exp
+    return fn
+
+
+def _stat_sum_dist(params: Dict):
+    """和值分布：逐期取和值在 C(33,6) 精确零分布下的 -log p，与期望熵之差。
+
+    ``obs = -log P(sum_t)``，``exp = E[-log P(S)] = 熵``（由精确分布算出，缓存）。
+    和值分布与理论一致时，``E[obs] = exp``（都等于熵），故长期均值 0。
+    系统性偏离（某些和值段过多/过少）会抬高/降低 ``obs``。
+    """
+    def fn(history, actual):
+        from . import rigor
+        sums, counts, total = rigor.sum_distribution()
+        reds = actual.get("reds")
+        if not reds or len(reds) != PICK:
+            return 0.0, 0.0
+        s = int(sum(int(x) for x in reds))
+        idx = int(np.searchsorted(sums, s))
+        if idx >= len(sums) or int(sums[idx]) != s:
+            return 0.0, 0.0
+        probs = counts.astype(float) / float(total)
+        p = float(probs[idx])
+        if p <= 0:
+            return 0.0, 0.0
+        entropy = float(-(probs * np.log(probs)).sum())   # E[-log P(S)] 精确值
+        return float(-math.log(p)), entropy
+    return fn
+
+
 FAMILIES: List[Dict] = [
+    # ---- S7 新增：discover 此前未覆盖的维度（P2 §7.1 S7）----
+    # 这三个维度**不是**「选号集 ∩ 开奖」型，而是分布检验型：用 ``stat_fn`` 逐期产出
+    # 一对 ``(obs, exp)``，交给同一套 ``delta_series → regime_report`` 阶段机。
+    # 它们的价值是「换一个正确的提问方式」，不是「立刻出规律」——见各条 note_zh。
+    {"key": "order_pos", "name_zh": "位置-号码独立性", "dim_zh": "开奖位置 × 号码（6×33 列联）",
+     "ratio": ("每个开奖位置（第1..6位）的号码分布是否独立于位置；"
+               "逐期用位置-号码互信息（PMI），独立时长期均值为 0"),
+     "target": "red", "stat": _stat_order_pos,
+     "note_zh": ("P2 §2.2 核心缺口：`order` 字段此前 0 处被 discover 读取。"
+                 "这是检验「号码出现的位置是否携带信息」，df=(6-1)(33-1)=160。"
+                 "缺失 order 的期次按 0 效应处理（优雅降级）。"),
+     "params": [{"window": w, "k": k} for w in (100, 300, 600) for k in (6, 10)]},
+    {"key": "number_bias", "name_zh": "逐号偏置", "dim_zh": "单号二项检验（Bonferroni 33）",
+     "ratio": ("近 W 期最超配的单个号码（按二项 z 最大）下一期是否开出；"
+               "等价于对 33 个单号各做一次二项检验再取最强者，多重性按 33 计"),
+     "target": "red", "stat": _stat_number_bias,
+     "note_zh": ("诚实结论（P2）：单号 σ=0.4536，+3% 需约 40.7 万期、+10% 需约 3.7 万期"
+                 "才可能检出。这条的价值是「换一个正确的提问方式」，"
+                 "不是「立刻就出规律」——历史再长也不够。"),
+     "params": [{"window": w} for w in (100, 300, 600)]},
+    {"key": "sum_dist", "name_zh": "和值分布", "dim_zh": "红球和值分箱 χ²",
+     "ratio": ("开奖和值是否偏离 C(33,6) 精确分布；逐期取和值在精确零分布下的"
+               "-log p 与期望熵的差，长期均值为 0 表示和值分布与理论一致"),
+     "target": "red", "stat": _stat_sum_dist,
+     "note_zh": ("零分布用 rigor.sum_distribution() 的 C(33,6)=1_107_568 全枚举精确分布，"
+                 "不自行拍参数。这是「和值整体分布是否偏移」的检验，"
+                 "不是「某期和值落在哪」的预测。"),
+     "params": [{}]},
     # ---- 红球：频率维度（时间尺度） ----
     {"key": "hot", "name_zh": "热度延续", "dim_zh": "红球频率(热)",
      "ratio": "近 W 期出现最多的 k 个红球，下一期是否延续",
@@ -1148,6 +1291,9 @@ def family_catalog() -> List[Dict]:
         {"key": f["key"], "name_zh": f["name_zh"], "dim_zh": f["dim_zh"],
          "ratio": f["ratio"], "target": f["target"],
          "n_param_sets": len(f["params"]),
+         # note_zh：诚实结论（如 number_bias 的「+3% 需 40.7 万期」）。前端维度表
+         # 必须把它显示出来，避免「能搜到维度」被误读成「立刻有规律」。
+         "note_zh": f.get("note_zh"),
          "params": f["params"]}
         for f in FAMILIES
     ]
@@ -1168,12 +1314,20 @@ def make_filter(key: str, params: Optional[Dict] = None) -> Dict:
     if not fam:
         raise KeyError(f"未知维度族: {key}")
     params = dict(params or (fam["params"][0] if fam["params"] else {}))
-    return {
+    out = {
         "key": key, "name_zh": fam["name_zh"], "dim_zh": fam["dim_zh"],
         "target": fam["target"], "params": params,
-        "selector": fam["selector"](params),
         "label": f"{fam['name_zh']}{params or ''}",
     }
+    if fam.get("stat") is not None:
+        # S7 分布类维度：没有「选号集」，用一个逐期统计量代替 selector。
+        # asof_scan 检测到 stat_fn 会切到 _stat_scan（见该函数 docstring）。
+        out["stat_fn"] = fam["stat"](params)
+        out["ratio"] = fam.get("ratio")
+        out["note_zh"] = fam.get("note_zh")
+    else:
+        out["selector"] = fam["selector"](params)
+    return out
 
 
 def complement_filter(flt: Dict) -> Dict:
@@ -1267,6 +1421,49 @@ def combine(filters: Sequence[Dict], mode: str = "union") -> Dict:
 # 严格 as-of 回放
 # --------------------------------------------------------------------------
 
+def _stat_scan(draws: Sequence[Dict], flt: Dict, start: int, end: int,
+               ctx: Optional["ScanContext"] = None) -> Dict:
+    """**分布类维度的 as-of 回放**（S7）：不走「选号集 ∩ 开奖」，而是逐期算一个
+    ``(obs, exp)`` 配对统计量，仍然交给同一套 ``delta_series → regime_report`` 阶段机。
+
+    ``flt["stat_fn"](ctx, actual) -> (obs, exp)``：``ctx`` 是**只看��� start 期之前**
+    历史（严格 as-of，不许泄漏未来），``actual`` 是第 t 期开奖。返回 ``(obs, exp)``
+    两个实数，``obs-exp`` 的长期均值就是该维度的效应量。
+
+    返回结构与 ``asof_scan`` 对齐（``obs``/``exp``/``k_series``/``n``/``start``/``end``），
+    下游 ``pad_series`` / ``regime_of_filter`` 无需区分两种来源。
+    """
+    draws = list(draws or [])
+    end = len(draws) if end is None else min(int(end), len(draws))
+    start = max(0, int(start))
+    stat_fn = flt["stat_fn"]
+    obs: List[float] = []
+    exp: List[float] = []
+    ks: List[int] = []
+    series: List[Dict] = []
+    # 严格 as-of：stat_fn 只拿到 draws[:t] 这段历史（`hist`）与当期开奖 `actual`，
+    # 未来期绝不会进入 hist —— 与 selector 的 CTX 语义一致（N6：不泄漏未来）。
+    hist: List[Dict] = list(draws[:start])
+    for t in range(start, end):
+        actual = draws[t]
+        try:
+            o, e = stat_fn(hist, actual)
+            o = float(o) if o is not None else 0.0
+            e = float(e) if e is not None else 0.0
+        except Exception:  # noqa: BLE001
+            o, e = 1.0, 0.0
+        obs.append(o)
+        exp.append(e)
+        ks.append(1)
+        series.append({"issue": actual.get("issue"), "obs": round(o, 4),
+                       "expected": round(e, 4)})
+        hist.append(actual)
+    return {"target": flt.get("target", "red"), "n": len(obs), "obs": obs, "exp": exp,
+            "k_series": ks, "k_mean": 1.0, "k_active_mean": 1.0,
+            "k_active_ratio": 1.0 if ks else 0.0,
+            "hit_series": series[-200:], "start": start, "end": end}
+
+
 def asof_scan(draws: Sequence[Dict], flt: Dict, start: int = 200,
               end: Optional[int] = None, ctx: Optional[ScanContext] = None) -> Dict:
     """逐期 as-of 回放一个筛选条件，返回「每期观测序列」。
@@ -1298,6 +1495,8 @@ def asof_scan(draws: Sequence[Dict], flt: Dict, start: int = 200,
     draws = list(draws or [])
     end = len(draws) if end is None else min(int(end), len(draws))
     start = max(0, int(start))
+    if flt.get("stat_fn") is not None:
+        return _stat_scan(draws, flt, start=start, end=end, ctx=ctx)
     red_sel = flt["target"] == "red"
     obs: List[float] = []
     exp: List[float] = []
@@ -1437,8 +1636,26 @@ def discover(draws: Sequence[Dict], start: int = 200, families: Optional[Sequenc
         obs = np.asarray(scan["obs"], float)
         exp = float(np.mean(scan["exp"])) if scan["exp"] else 0.0
         mean = float(obs.mean())
+        if scan["n"] < 50:
+            continue
+        if flt.get("stat_fn") is not None:
+            # 分布类维度：用 (obs-exp) 的经验标准差做配对 t 的标准误（与 regime 同口径）。
+            dser = obs - np.asarray(scan["exp"], float)
+            dsd = float(dser.std(ddof=1)) if dser.size >= 2 else 0.0
+            if dsd <= 0:
+                continue
+            se = dsd / math.sqrt(scan["n"])
+            z = float(dser.mean()) / se
+            p = float(2 * math.erfc(abs(z) / math.sqrt(2)))
+            records.append({"filter": {"key": flt["key"], "name_zh": flt["name_zh"],
+                                       "target": flt["target"], "params": flt.get("params", {})},
+                            "quick": {"n": scan["n"], "mean": round(float(dser.mean()), 4),
+                                      "expected": round(exp, 4), "delta": round(float(dser.mean()), 4),
+                                      "z": round(z, 3), "p": p},
+                            "_flt": flt})
+            continue
         sd = math.sqrt(max(exp * (1 - exp / max(PICK, 1)) if flt["target"] == "red" else exp * (1 - exp), 0.0))
-        if sd <= 0 or scan["n"] < 50:
+        if sd <= 0:
             continue
         k_eff = max(1.0, scan["k_mean"])
         # red：命中数的每期方差（超几何近似）→ 标准误

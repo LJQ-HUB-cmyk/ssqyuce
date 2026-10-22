@@ -43,6 +43,12 @@ def test_all_declared_dimensions_execute_on_scan_context(make_draws):
             total += 1
             flt = DIS.make_filter(key, params)
             try:
+                if flt.get("stat_fn") is not None:
+                    # S7 分布类维度没有 selector，逐期统计量走 asof_scan 的 stat_fn 路径；
+                    # 这里同样要求它「可执行且不抛异常」，标准不降低。
+                    res = DIS.asof_scan(draws, flt, start=200, end=len(draws))
+                    assert res["n"] > 0, f"{key}{params} asof_scan 无可评估期"
+                    continue
                 chosen = flt["selector"](ctx)
             except Exception as exc:  # noqa: BLE001
                 failures.append(f"{key}{params}: {type(exc).__name__}: {exc}")

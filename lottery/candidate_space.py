@@ -154,6 +154,11 @@ def _single_index() -> List[Tuple[str, Dict]]:
     if _SINGLE_CACHE is None:
         items: List[Tuple[str, Dict]] = []
         for key, fam in discovery.FAMILY_BY_KEY.items():
+            # S7 分布类维度（order_pos/number_bias/sum_dist）没有选号集 selector，
+            # 无法做「选号 ∩ 开奖」的候选、更无法与别的族交叉 —— 它们只走 discovery
+            # 的 stat_fn 通道。此处跳过，保持闲时挖掘的候选语义不变（只挖可交叉的选号族）。
+            if fam.get("stat") is not None or "selector" not in fam:
+                continue
             for params in _family_grid(fam):
                 items.append((key, params))
         _SINGLE_CACHE = items

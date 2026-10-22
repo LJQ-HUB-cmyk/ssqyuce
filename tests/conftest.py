@@ -167,15 +167,25 @@ def make_draws():
 
     def _factory(n: int = 600, seed: int = 42, start_year: int = 2013):
         rng = random.Random(seed)
+        # 单独一条 RNG 专门打乱 order，**不消耗主 rng 流** —— 否则会改变后续期次的
+        # reds/blue 抽样序列（连带 test_v14_engine_split 等指纹锁全变）。
+        orng = random.Random(seed ^ 0x5A5A5A)
         start = _dt.date(start_year, 1, 1)
         draws = []
         for i in range(n):
             reds = sorted(rng.sample(range(1, 34), 6))
+            # ``order`` 是**开奖顺序**（第 1..6 位），真实数据里它并非升序 —— 升序只是
+            # ``reds`` 的排序结果。V15 的 order_pos 维度会真实检验「位置是否携带号码信息」，
+            # 若这里仍填 sorted(reds)，等于人造了「位置 1 恒为最小值」的强位置偏置，
+            # order_pos 会正确地把这个 fixture 假象当成显著效应检出（实测 z≈23）。
+            # 故这里给 order 一个随机排列（与真实开奖一致：位置与号码大小无关）。
+            order = list(reds)
+            orng.shuffle(order)
             draws.append({
                 "issue": f"{start_year + i // 150}{i % 150 + 1:03d}",
                 "date": (start + _dt.timedelta(days=3 * i)).isoformat(),
                 "reds": reds,
-                "order": list(reds),
+                "order": order,
                 "blue": rng.randint(1, 16),
             })
         return draws
