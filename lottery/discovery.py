@@ -1056,10 +1056,10 @@ def _stat_order_pos(params: Dict):
         return sign
 
     def fn(history, actual):
+        nonlocal _n_hist, _buf, _last_len
         order = actual.get("order")
         if not order or len(order) != PICK:
             return 0.0, 0.0
-        nonlocal _n_hist
         # **O(1) 滑窗**：as-of 回放每期把上一期 actual 追加进 history，故
         # ``history[-1]`` 就是「上一次调用时的本期」。用「上次见到的期末位置」判断
         # 这一期该滑进哪一条、该滑出哪一条，全程不重建窗口列表。
