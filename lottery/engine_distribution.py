@@ -402,6 +402,10 @@ def ticket_distribution(tickets: List[Dict], *,
     ``p_at_least_r_method``  ``"exact_enum"``（C(33,6) 全枚举）或 ``"iid_approx"``
     ``p_at_least_r_iid``     泊松二项（独立假设）近似值，与上面并排以便看见相关性误差
     ``p_any_blue``      P(≥1 注命中蓝球) = 不同蓝球数/16（blue_coverage_plan 闭式最优）
+                        ⚠ 这是**概率**（n>16 封顶 1.0），不是期望注数。
+    ``expected_blue_hits``  **期望命中注数** = n/16（与是否去重无关，是恒等式）
+                        ⚠ 与 `p_any_blue` 是两个量，永远不要混用。
+                        n=20 时：p_any_blue=1.0 而 expected_blue_hits=1.25。
     ``ev_ratio_sixth``  仅六等奖的返奖比 = (5/16)/2 = **0.15625**（与 n 无关）
     ``ev_ratio_full``   整注（一~六等奖全计）返奖比 ≈ **0.45673**，**必须连
                         ``prize_assumption`` 一起展示**
@@ -443,7 +447,20 @@ def ticket_distribution(tickets: List[Dict], *,
 
     blues = [int(t["blue"]) for t in ts if 1 <= int(t["blue"]) <= B_MAX]
     distinct_blue = len(set(blues))
+    # `p_any_blue` 是**概率**（≥1 注命中），n>16 封顶 1.0。
     p_any_blue = min(distinct_blue, B_MAX) / float(B_MAX)
+    # `expected_blue_hits` 是**期望注数** = n/16，**与是否去重无关**，不封顶。
+    #
+    # ## 为什么必须两个都给（D-13）
+    #
+    # `blue_coverage.optimize()` 早就区分了这两个量（`p_any_blue_covered` /
+    # `expected_blue_hits`），但本模块首版只给了前者。
+    # 下游若拿 `p_any_blue` 当期望用（如 n=20 时算成 1.0 而非 1.25），
+    # 会把六等奖期望回收低估 20% —— 这正是 `blue_coverage` 修复前那个
+    # 「概率当注数」缺陷（n=100 低估 6.25 倍）的同族形态。
+    #
+    # 两个量并列给出，让调用方无法「不小心」混用。
+    expected_blue_hits = n / float(B_MAX)
 
     ev_pub = _single_ticket_ev(jackpot, sixth="published")
     ev_strict = _single_ticket_ev(jackpot, sixth="strict")
@@ -467,6 +484,7 @@ def ticket_distribution(tickets: List[Dict], *,
         "p_at_least_r_method": method,
         "p_at_least_r_iid": {str(r): float(v) for r, v in iid_tail.items()},
         "p_any_blue": float(p_any_blue),
+        "expected_blue_hits": float(expected_blue_hits),
         "blue_coverage_count": int(distinct_blue),
         "ev_ratio_sixth": float(EV_RATIO_SIXTH),
         "ev_ratio_full": float(ev_pub["ev_ratio"]),
