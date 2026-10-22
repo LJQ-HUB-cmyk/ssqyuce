@@ -6,8 +6,7 @@
 拆出的理由：这是「覆盖优化」的目标函数，是被独立引用最多的一块
 （`routes_portfolio` / `blue_coverage` / `evaluate` 都直接用）。
 
-## 为什么用 `from . import engine as E` 而不是 `from .engine import xxx`
-
+## 为什么用 `
 `engine` 薄壳用 `__getattr__` 转发，**每次访问都查模块属性**。
 若这里写 `from .engine import predict_next`，引用会在 import 时**绑死**，
 `monkeypatch.setattr(engine, "predict_next", ...)` 就打不穿 ——
@@ -24,22 +23,21 @@ from __future__ import annotations
 from typing import Dict, List, Optional
 
 from . import config      # noqa: F401  `.` = lottery，与拆前的 engine.py 完全相同
+from .engine_base import R_MAX, B_MAX, TICKET_COST  # noqa: F401  纯常量，无循环
 
 # 拆前这些常量是 engine.py 的**模块级全局**，函数里直接裸用（如 `B_MAX`）。
 # 迁出后本文件是独立命名空间，裸名会 NameError —— 必须显式从 engine 取。
-# 用 `from . import engine as E` + 延迟属性访问，**不要** `from .engine import B_MAX`：
-# 后者会在 import 期绑死值，`monkeypatch.setattr(engine, "B_MAX", 8)` 就打不穿。
-from . import engine as E
+# 用 `# 后者会在 import 期绑死值，`monkeypatch.setattr(engine, "B_MAX", 8)` 就打不穿。
 
 
 def _b_max() -> int:
     """取 engine 的 _b_max()。每次现取，保证打桩穿透（见 test_v14_engine_split）。"""
-    return E.B_MAX
+    return B_MAX
 
 
 def _ticket_cost() -> float:
     """取 engine 的 _ticket_cost()（每注 2 元）。每次现取，理由同上。"""
-    return E.TICKET_COST
+    return TICKET_COST
 
 PRIZE_CASH_FIXED = {3: 3000.0, 4: 200.0, 5: 10.0, 6: 5.0}   # 固定奖级（元）
 JACKPOT_ASSUMPTION = {

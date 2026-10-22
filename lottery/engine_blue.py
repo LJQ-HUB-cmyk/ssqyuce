@@ -19,13 +19,10 @@ from typing import Dict, List, Optional
 import numpy as np
 
 from . import config        # noqa: F401
+from .engine_base import R_MAX, B_MAX, TICKET_COST  # noqa: F401  纯常量，无循环
 from . import methods as METH  # noqa: F401  与拆前 engine.py 相同的别名
-from . import engine as E
 
 
-def _c(name: str):
-    """现取 engine 的模块级常量 —— 保证 monkeypatch 打桩穿透。"""
-    return getattr(E, name)
 
 
 def _min_significant_blue_sample(base_rate: Optional[float] = None,
@@ -46,7 +43,7 @@ def _min_significant_blue_sample(base_rate: Optional[float] = None,
     「4.5% 与 6.25% 谁更好」——一个标准误就覆盖了整个 1.75% 的差额。
     """
     if base_rate is None:
-        base_rate = getattr(config, "BLUE_RANDOM_RATE", 1.0 / _c("B_MAX"))
+        base_rate = getattr(config, "BLUE_RANDOM_RATE", 1.0 / B_MAX)
     if target_rate is None:
         target_rate = config.BLUE_FALLBACK_MIN_RATE
     delta = abs(float(base_rate) - float(target_rate))
@@ -92,7 +89,7 @@ def _apply_blue_mode(blue_blend: np.ndarray) -> np.ndarray:
     覆盖（设 0 走统计反推，不支持放松到低于 window）。
     """
     if config.BLUE_MODE == "uniform":
-        return np.full(_c("B_MAX"), 1.0 / _c("B_MAX"))
+        return np.full(B_MAX, 1.0 / B_MAX)
     window = max(int(getattr(config, "BLUE_FALLBACK_WINDOW", 30)), 1)
     rate = METH._blue_running_rate(window)
     if rate is None:
@@ -112,7 +109,7 @@ def _apply_blue_mode(blue_blend: np.ndarray) -> np.ndarray:
         print(f"[engine] 蓝球模型近 {observed} 期命中率 {rate:.3f} < "
               f"{config.BLUE_FALLBACK_MIN_RATE}（已达最小显著样本量 {min_n}），"
               f"本周期回退均匀 16")
-        return np.full(_c("B_MAX"), 1.0 / _c("B_MAX"))
+        return np.full(B_MAX, 1.0 / B_MAX)
     return blue_blend
 
 
@@ -172,20 +169,20 @@ def blue_coverage_plan(n_tickets: int,
         probs = np.asarray(blue_probs, dtype=float) if blue_probs is not None else None
     except (TypeError, ValueError):
         probs = None
-    if probs is None or probs.shape != (_c("B_MAX"),) or not np.all(np.isfinite(probs)) \
+    if probs is None or probs.shape != (B_MAX,) or not np.all(np.isfinite(probs)) \
             or float(probs.sum()) <= 0:
-        probs = np.full(_c("B_MAX"), 1.0 / _c("B_MAX"))
+        probs = np.full(B_MAX, 1.0 / B_MAX)
     else:
         probs = np.clip(probs, 0.0, None)
         if float(probs.sum()) <= 0:
-            probs = np.full(_c("B_MAX"), 1.0 / _c("B_MAX"))
+            probs = np.full(B_MAX, 1.0 / B_MAX)
     # 降序排号：概率最高的号先上；n <= 16 时天然互不相同
     order = [int(i) + 1 for i in np.argsort(-probs, kind="stable")]
-    plan = order[:min(k, _c("B_MAX"))]
-    if k > _c("B_MAX"):
+    plan = order[:min(k, B_MAX)]
+    if k > B_MAX:
         # 超出 16 注：按概率加权重复，优先补齐当前出现次数最少的号
         counts: Dict[int, int] = {b: 1 for b in plan}
-        for _ in range(k - _c("B_MAX")):
+        for _ in range(k - B_MAX):
             b = min(order, key=lambda x: (counts.get(x, 0), -float(probs[x - 1]), x))
             counts[b] = counts.get(b, 0) + 1
             plan.append(b)

@@ -22,8 +22,8 @@ from typing import Dict, List, Optional
 import numpy as np
 
 from . import config      # noqa: F401
+from .engine_base import R_MAX, B_MAX, TICKET_COST  # noqa: F401  纯常量，无循环
 from . import features as F  # noqa: E741  与拆前 engine.py 相同的别名
-from . import engine as E
 
 
 class _InsufficientDataError(ValueError):
@@ -35,9 +35,6 @@ class _InsufficientDataError(ValueError):
     """
 
 
-def _c(name: str):
-    """现取 engine 的模块级常量 —— 保证 monkeypatch 打桩穿透。"""
-    return getattr(E, name)
 
 
 def _last_sums(draws: List[Dict], n: int = 500) -> np.ndarray:
@@ -128,8 +125,8 @@ def sample_stat_ticket(red_blend: np.ndarray, blue_blend: np.ndarray,
     """按混合概率加权不放回抽样，硬约束不过则重试。"""
     for _ in range(60):
         if uniform:
-            reds = sorted(rng.sample(range(1, _c("R_MAX") + 1), 6))
-            blue = rng.randint(1, _c("B_MAX"))
+            reds = sorted(rng.sample(range(1, R_MAX + 1), 6))
+            blue = rng.randint(1, B_MAX)
         else:
             reds = _weighted_sample(red_blend, 6, rng)
             blue = _weighted_sample(blue_blend, 1, rng)[0]

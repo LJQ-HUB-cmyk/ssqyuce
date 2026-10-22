@@ -22,12 +22,9 @@ from typing import Dict, Iterable, List, Optional
 import numpy as np
 
 from . import config      # noqa: F401
-from . import engine as E
+from .engine_base import R_MAX, B_MAX, TICKET_COST  # noqa: F401  纯常量，无循环
 
 
-def _c(name: str):
-    """现取 engine 的模块级常量 —— 保证 monkeypatch 打桩穿透。"""
-    return getattr(E, name)
 
 
 

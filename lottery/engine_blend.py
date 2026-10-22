@@ -26,17 +26,24 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from . import config      # noqa: F401
+from .engine_base import R_MAX, B_MAX, TICKET_COST  # noqa: F401  纯常量，无循环
+
+# ---- 融合权重超参（原在 engine.py，随 S3 一起迁出）----
+# 设计理由见原 engine.py 注释：严格 walk-forward 样本外 Brier →
+# softmax(-brier/T) → 权重上限 → 收缩。旧逻辑用样本内 1/brier 无上界，
+# 实测 brier=0.001 时权重达 149x，是追噪声而非贝叶斯融合。
+BLEND_EVAL_WINDOW = 50
+BLEND_MIN_TRAIN = 300
+BLEND_MIN_EVAL = 10
+BLEND_SOFTMAX_TEMP_RED = 0.05
+BLEND_SOFTMAX_TEMP_BLUE = 0.02
+MAX_MODEL_WEIGHT = 0.6
+BLEND_BRIER_FLOOR = 0.001
+WEIGHT_SHRINKAGE = 0.5
+
 from . import models as M  # noqa: E741  与拆前的 engine.py 完全一致的别名
-from . import engine as E  # noqa: F401  薄壳，见下 _c
 
 
-def _c(name: str):
-    """现取 engine 的模块级常量 —— 保证打桩穿透。
-
-    每次调用都走 `getattr(E, name)`，而薄壳的 `__getattr__` 又转发到真源，
-    所以 `monkeypatch.setattr(engine, name, val)` 一定生效。
-    """
-    return getattr(E, name)
 
 
 class _BlendArray(np.ndarray):
@@ -71,7 +78,7 @@ def _softmax_weights(briers: Dict[str, float], temp: float) -> Dict[str, float]:
 
     相比旧的 1/brier 倒数放大：
     - 指数形式天然有界（任一权重 ≤ 1，且差异由温度 T 控制）；
-    - 再经 _c("MAX_MODEL_WEIGHT") 截断 + (1-λ) 均匀收缩，杜绝单一方法独裁；
+    - 再经 MAX_MODEL_WEIGHT 截断 + (1-λ) 均匀收缩，杜绝单一方法独裁；
     - 全为 nan/inf 或空池时回退等权。
     """
     if not briers:
@@ -79,7 +86,7 @@ def _softmax_weights(briers: Dict[str, float], temp: float) -> Dict[str, float]:
     names = list(briers)
     vals = np.array([briers[n] for n in names], dtype=float)
     vals = np.where(np.isfinite(vals), vals, np.nanmax(vals[np.isfinite(vals)]) if np.isfinite(vals).any() else 1.0)
-    logits = -np.maximum(vals, _c("BLEND_BRIER_FLOOR")) / max(temp, 1e-9)
+    logits = -np.maximum(vals, BLEND_BRIER_FLOOR) / max(temp, 1e-9)
     logits = logits - logits.max()          # 数值稳定
     w = np.exp(logits)
     s = w.sum()
@@ -87,11 +94,11 @@ def _softmax_weights(briers: Dict[str, float], temp: float) -> Dict[str, float]:
 
     # 权重收缩：向均匀权重靠拢，防小样本抖动
     n = len(names)
-    lam = float(min(max(_c("WEIGHT_SHRINKAGE"), 0.0), 1.0))
+    lam = float(min(max(WEIGHT_SHRINKAGE, 0.0), 1.0))
     weights = (1.0 - lam) * (1.0 / n) + lam * weights
 
     # 权重上限（迭代截断：被截的部分按比例回补给未达上限的方法）
-    weights = _cap_weights(weights, _c("MAX_MODEL_WEIGHT"))
+    weights = _cap_weights(weights, MAX_MODEL_WEIGHT)
     return {name: float(v) for name, v in zip(names, weights)}
 
 
@@ -194,10 +201,10 @@ def _walk_forward_brier(pool: Dict[str, Dict], draws: List[Dict],
         if len(hist) < 2:
             continue
         cur = draws[t]
-        tr = np.zeros(_c("R_MAX"))
+        tr = np.zeros(R_MAX)
         for r in cur["reds"]:
             tr[r - 1] = 1.0
-        tb = np.zeros(_c("B_MAX"))
+        tb = np.zeros(B_MAX)
         tb[cur["blue"] - 1] = 1.0
 
         for name, m in pool.items():
@@ -232,8 +239,8 @@ def _brier_blend(models_dict: Dict, draws: List[Dict], adaptive: Optional[Dict] 
     1. 严格 walk-forward：只用第 t 期之前的历史重建每个方法的概率，再与第 t
        期真实结果算 Brier（默认窗口 50 期，且截断到 len(draws)-300 之内）。
     2. softmax(-brier/T) 取代旧的 1/brier 倒数放大。
-    3. 权重上限 _c("MAX_MODEL_WEIGHT")=0.6，防止单一方法独裁。
-    4. 权重收缩 _c("WEIGHT_SHRINKAGE")=0.5：final = 0.5·uniform + 0.5·data。
+    3. 权重上限 MAX_MODEL_WEIGHT=0.6，防止单一方法独裁。
+    4. 权重收缩 WEIGHT_SHRINKAGE=0.5：final = 0.5·uniform + 0.5·data。
     无法用历史重建的方法（ml / 外部注入）**不参与**定权，以预设等权参与融合，
     并在返回值中标注 weight_source="fixed-fallback"。
 
@@ -248,26 +255,26 @@ def _brier_blend(models_dict: Dict, draws: List[Dict], adaptive: Optional[Dict] 
     # U2：蓝球专用模型恒在混合里（红球仅按调用方给定的模型池）
     blue_spec = {"blue_specialist": {
         "red": None, "blue": M.blue_specialist(draws), "name": "blue_specialist"}}
-    n_eval = min(_c("BLEND_EVAL_WINDOW"), len(draws) - _c("BLEND_MIN_TRAIN"))
+    n_eval = min(BLEND_EVAL_WINDOW, len(draws) - BLEND_MIN_TRAIN)
     # 融合用模型池：red 用 models_dict，blue 用 models_dict + blue_specialist
     red_pool = {k: m["red"] for k, m in models_dict.items() if m.get("red") is not None}
     blue_pool = {k: m["blue"] for k, m in models_dict.items() if m.get("blue") is not None}
     blue_pool["blue_specialist"] = blue_spec["blue_specialist"]["blue"]
 
-    if n_eval < _c("BLEND_MIN_EVAL"):
+    if n_eval < BLEND_MIN_EVAL:
         # 数据不足：等权（blue_specialist 权重与统计模型对等），不假装有信息
         n = len(red_pool) or 1
-        red_blend = sum(red_pool.values()) / n if red_pool else np.full(_c("R_MAX"), 1.0 / _c("R_MAX"))
-        blue_blend = sum(blue_pool.values()) / len(blue_pool) if blue_pool else np.full(_c("B_MAX"), 1.0 / _c("B_MAX"))
+        red_blend = sum(red_pool.values()) / n if red_pool else np.full(R_MAX, 1.0 / R_MAX)
+        blue_blend = sum(blue_pool.values()) / len(blue_pool) if blue_pool else np.full(B_MAX, 1.0 / B_MAX)
         red_blend = _apply_adaptive_red(red_blend, adaptive, red_pool)
         red_blend = np.asarray(red_blend, dtype=float)
         if red_blend.sum() <= 0:
-            red_blend = np.full(_c("R_MAX"), 1.0 / _c("R_MAX"))
+            red_blend = np.full(R_MAX, 1.0 / R_MAX)
         else:
             red_blend = red_blend / red_blend.sum() * 6
         blue_blend = np.asarray(blue_blend, dtype=float)
         blue_blend = (blue_blend / blue_blend.sum() if blue_blend.sum() > 0
-                      else np.full(_c("B_MAX"), 1.0 / _c("B_MAX")))
+                      else np.full(B_MAX, 1.0 / B_MAX))
         meta = {
             "weight_source": "fixed-fallback",
             "reason": "insufficient_history",
@@ -309,8 +316,8 @@ def _brier_blend(models_dict: Dict, draws: List[Dict], adaptive: Optional[Dict] 
     for k in fallback_blue:
         raw_briers["blue"][k] = None
 
-    weights_red = _softmax_weights(red_briers, _c("BLEND_SOFTMAX_TEMP_RED")) if red_briers else {}
-    weights_blue = _softmax_weights(blue_briers, _c("BLEND_SOFTMAX_TEMP_BLUE")) if blue_briers else {}
+    weights_red = _softmax_weights(red_briers, BLEND_SOFTMAX_TEMP_RED) if red_briers else {}
+    weights_blue = _softmax_weights(blue_briers, BLEND_SOFTMAX_TEMP_BLUE) if blue_briers else {}
     # 回退方法：给「可评估方法」的最大权重（即对等参与，而非靠样本内 Brier 抢权）
     for k in fallback_red:
         weights_red[k] = (max(weights_red.values()) if weights_red
@@ -330,18 +337,18 @@ def _brier_blend(models_dict: Dict, draws: List[Dict], adaptive: Optional[Dict] 
         weights_red = _renormalize(weights_red)
 
     def _norm_red_blend(d: Dict[str, float]) -> np.ndarray:
-        out = np.zeros(_c("R_MAX"))
+        out = np.zeros(R_MAX)
         for name, m in red_pool.items():
             out += d.get(name, 0.0) * np.asarray(m, dtype=float)
         return out
 
     red_blend = _apply_adaptive_red(
-        _norm_red_blend(weights_red) if weights_red else np.zeros(_c("R_MAX")),
+        _norm_red_blend(weights_red) if weights_red else np.zeros(R_MAX),
         adaptive, red_pool)
     red_blend = np.asarray(red_blend, dtype=float)
     norm_b = sum(weights_blue.values()) or 1.0
     weights_blue_pct = {k: v / norm_b for k, v in weights_blue.items()}
-    blue_blend = np.zeros(_c("B_MAX"))
+    blue_blend = np.zeros(B_MAX)
     for name, m in blue_pool.items():
         blue_blend += weights_blue_pct.get(name, 0.0) * np.asarray(m, dtype=float)
 
@@ -351,19 +358,19 @@ def _brier_blend(models_dict: Dict, draws: List[Dict], adaptive: Optional[Dict] 
           f"蓝球权重: { {k: round(v, 4) for k, v in weights_blue_pct.items()} }")
 
     if red_blend.sum() <= 0:
-        red_blend = np.full(_c("R_MAX"), 1.0 / _c("R_MAX"))
+        red_blend = np.full(R_MAX, 1.0 / R_MAX)
     else:
         red_blend = red_blend / red_blend.sum() * 6
     blue_blend = (blue_blend / blue_blend.sum() if blue_blend.sum() > 0
-                  else np.full(_c("B_MAX"), 1.0 / _c("B_MAX")))
+                  else np.full(B_MAX, 1.0 / B_MAX))
     meta = {
         "weight_source": weight_source,
         "n_eval": int(n_eval),
         "raw_briers": raw_briers,
         "weights": {"red": {k: round(float(v), 6) for k, v in weights_red.items()},
                     "blue": {k: round(float(v), 6) for k, v in weights_blue_pct.items()}},
-        "max_model_weight": _c("MAX_MODEL_WEIGHT"),
-        "shrinkage": _c("WEIGHT_SHRINKAGE"),
+        "max_model_weight": MAX_MODEL_WEIGHT,
+        "shrinkage": WEIGHT_SHRINKAGE,
         "fallback_methods": {"red": fallback_red, "blue": fallback_blue},
     }
     return _with_meta(red_blend, meta), blue_blend

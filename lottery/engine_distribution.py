@@ -28,8 +28,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from . import config        # noqa: F401
-from . import engine as E
-from . import evaluate as EV  # noqa: F401  与拆前 engine.py 相同的别名
+from .engine_base import R_MAX, B_MAX, TICKET_COST  # noqa: F401  纯常量，无循环
 
 # 这两个常量已随 S7 迁到 `engine_prize.py`（真源）。
 # **从真源直接取，不经薄壳 `E.`** —— 它们是常量不是函数，薄壳只做转发，
@@ -45,9 +44,6 @@ from .engine_constraints import (  # noqa: F401
 )
 
 
-def _c(name: str):
-    """现取 engine 的模块级常量 —— 保证 monkeypatch 打桩穿透。"""
-    return getattr(E, name)
 
 
 # ===========================================================================
@@ -80,11 +76,11 @@ def _c(name: str):
 
 RED_PER_TICKET = 6
 SIGMA1_SQ = 729.0 / 968.0                       # 单注红球命中数方差
-E_HITS_PER_TICKET = RED_PER_TICKET * RED_PER_TICKET / float(_c("R_MAX"))   # 12/11
+E_HITS_PER_TICKET = RED_PER_TICKET * RED_PER_TICKET / float(R_MAX)   # 12/11
 VAR_RATIO_SLOPE = 11.0 / 54.0                   # 闭式斜率 (n-1)*(11/54)
 REDUNDANCY_NEUTRAL = 12.0 / 11.0                # Ā 中性值：var_ratio == 1
 REDUNDANCY_MAX = float(RED_PER_TICKET)          # Ā 的上界（两注完全相同）
-EV_RATIO_SIXTH = (5.0 / _c("B_MAX")) / _c("TICKET_COST")    # 0.15625（仅六等奖，与 n 无关）
+EV_RATIO_SIXTH = (5.0 / B_MAX) / TICKET_COST    # 0.15625（仅六等奖，与 n 无关）
 
 # 奖金假设表（一/二等奖为浮动奖，只能给"假设常量"，必须随结果一起展示）
 PRIZE_ASSUMPTION_TABLE_A = {
@@ -131,7 +127,7 @@ def _all_red_masks() -> np.ndarray:
     global _ALL_RED_MASKS
     if _ALL_RED_MASKS is None:
         import itertools
-        combos = np.array(list(itertools.combinations(range(_c("R_MAX")), RED_PER_TICKET)), dtype=np.int64)
+        combos = np.array(list(itertools.combinations(range(R_MAX), RED_PER_TICKET)), dtype=np.int64)
         masks = np.bitwise_or.reduce(np.left_shift(np.int64(1), combos), axis=1)
         _ALL_RED_MASKS = masks.astype(np.uint64)
     return _ALL_RED_MASKS
@@ -150,8 +146,8 @@ def _validate_tickets(tickets) -> List[Dict]:
             raise ValueError(f"第 {idx} 注 reds 含非整数：{reds!r}") from exc
         if len(set(rs)) != RED_PER_TICKET:
             raise ValueError(f"第 {idx} 注红号有重复：{rs}")
-        if rs[0] < 1 or rs[-1] > _c("R_MAX"):
-            raise ValueError(f"第 {idx} 注红号越界（应在 1..{_c("R_MAX")}）：{rs}")
+        if rs[0] < 1 or rs[-1] > R_MAX:
+            raise ValueError(f"第 {idx} 注红号越界（应在 1..{R_MAX}）：{rs}")
         blue = t.get("blue") if isinstance(t, dict) else None
         try:
             b = int(blue) if blue is not None else 0
@@ -230,8 +226,8 @@ def _variance_stats(n: int, sum_a: int) -> Dict[str, float]:
 def _prob_at_least_r_single(r: int) -> float:
     """单注命中 ≥r 红球的超几何概率。"""
     from math import comb
-    total = comb(_c("R_MAX"), RED_PER_TICKET)
-    return sum(comb(RED_PER_TICKET, k) * comb(_c("R_MAX") - RED_PER_TICKET, RED_PER_TICKET - k)
+    total = comb(R_MAX, RED_PER_TICKET)
+    return sum(comb(RED_PER_TICKET, k) * comb(R_MAX - RED_PER_TICKET, RED_PER_TICKET - k)
                for k in range(int(r), RED_PER_TICKET + 1)) / total
 
 
@@ -313,7 +309,7 @@ def p_at_least_r_mc(tickets: List[Dict], r: int = 4, n_draws: int = 200_000,
     while done < n_draws:
         c = min(chunk, n_draws - done)
         # 均匀随机取 6 个不同红号：对 33 个均匀 key 取最小的 6 个 ⇒ 均匀 6-子集
-        keys = rng.random((c, _c("R_MAX")))
+        keys = rng.random((c, R_MAX))
         picks = np.argpartition(keys, RED_PER_TICKET, axis=1)[:, :RED_PER_TICKET]
         draw_masks = np.bitwise_or.reduce(
             np.left_shift(np.int64(1), picks.astype(np.int64)), axis=1).astype(np.uint64)
@@ -347,12 +343,12 @@ def _single_ticket_ev(jackpot: Optional[Dict] = None, *, sixth: str = "published
                 jp[k] = float(jackpot[k])
         if jackpot.get("label"):
             jp["label"] = str(jackpot["label"])
-    total = comb(_c("R_MAX"), RED_PER_TICKET)
+    total = comb(R_MAX, RED_PER_TICKET)
 
     def p_r(r: int) -> float:
-        return comb(RED_PER_TICKET, r) * comb(_c("R_MAX") - RED_PER_TICKET, RED_PER_TICKET - r) / total
+        return comb(RED_PER_TICKET, r) * comb(R_MAX - RED_PER_TICKET, RED_PER_TICKET - r) / total
 
-    pb = 1.0 / _c("B_MAX")
+    pb = 1.0 / B_MAX
     cash = dict(PRIZE_CASH_FIXED)
     cash[1] = float(jp["first"])
     cash[2] = float(jp["second"])
@@ -371,7 +367,7 @@ def _single_ticket_ev(jackpot: Optional[Dict] = None, *, sixth: str = "published
     ev = float(sum(contrib.values()))
     return {
         "ev_yuan": ev,
-        "ev_ratio": ev / _c("TICKET_COST"),
+        "ev_ratio": ev / TICKET_COST,
         "by_level_prob": {k: float(v) for k, v in by_level.items()},
         "by_level_contrib_yuan": {k: float(v) for k, v in contrib.items()},
         "prize_cash": {int(k): float(v) for k, v in cash.items()},
@@ -445,9 +441,9 @@ def ticket_distribution(tickets: List[Dict], *,
         method = "iid_approx"
         enum_var_t = None
 
-    blues = [int(t["blue"]) for t in ts if 1 <= int(t["blue"]) <= _c("B_MAX")]
+    blues = [int(t["blue"]) for t in ts if 1 <= int(t["blue"]) <= B_MAX]
     distinct_blue = len(set(blues))
-    p_any_blue = min(distinct_blue, _c("B_MAX")) / float(_c("B_MAX"))
+    p_any_blue = min(distinct_blue, B_MAX) / float(B_MAX)
 
     ev_pub = _single_ticket_ev(jackpot, sixth="published")
     ev_strict = _single_ticket_ev(jackpot, sixth="strict")
@@ -502,7 +498,7 @@ def _expand_blue_compound(base_reds: List[int], blue_probs: np.ndarray,
 
     蓝球按 blue_probs 加权不放回抽样（蓝球覆盖 k 个不同号）。
     """
-    k = max(1, min(k, _c("B_MAX")))
+    k = max(1, min(k, B_MAX))
     blues = _weighted_sample(blue_probs, k, rng)
     out: List[Dict] = []
     for b in blues:
@@ -531,7 +527,7 @@ def _expand_dan_tuo(dan: List[int], blue: int, n_tickets: int,
         return [t]
     need = 6 - n_dan
     # 剩余红池：除胆外按 red_blend 加权（仅对 remaining 建立权重，长度一致）
-    remaining = [x for x in range(1, _c("R_MAX") + 1) if x not in dan]
+    remaining = [x for x in range(1, R_MAX + 1) if x not in dan]
     base_w = red_blend.astype(float).copy()
     for d in dan:
         base_w[d - 1] = 0.0
