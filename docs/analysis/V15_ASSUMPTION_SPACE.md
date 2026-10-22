@@ -212,11 +212,16 @@ discover: top=20, fast_window=300, min_window_start=200, n_draws=550
 | 2 | `aac787a` feat(discovery): S1 | 阶段画像按族去重，n_tested 不变 |
 | 3 | `e14d2f4` feat(discovery): S7 | order_pos/number_bias/sum_dist 三族 + 验收脚本 + 测试 + 本 doc |
 | 4 | `39e0f9c` perf(disc)+docs | sum_dist 零分布预计算 + 验收 `--reps` + full 双侧数字回填 |
-| 5 | `6389922` fix(discovery) | 修复提交 4 引入的 order_pos 滑窗 `UnboundLocalError` 回归（`_buf` 未 nonlocal），撤回滑窗优化、恢复 S7 的逐期重扫实现（口径不变，正确性优先）；`_stat_sum_dist` 预计算保留 |
+| 5 | `6389922` fix(discovery) | 修复提交 4 引入的 order_pos 滑窗 `UnboundLocalError` 回归（`_buf` 未 nonlocal），先撤回滑窗优化、恢复 S7 的逐期重扫实现；`_stat_sum_dist` 预计算保留 |
+| 6 | `73d5eb2` perf(discovery) | 重新以**正确的** `deque` 滑窗重做 S7 三族（`nonlocal` 声明齐备，首次/非顺序调用退化重建），discover 20.1s→15.8s；统计口径逐位不变（number_bias 0.1772/0.186/0.1851，order_pos 纯随机 mean obs 1.088≈exp 1.091） |
+| 7 | `8e2a97b` docs(V15) | 本「提交与修复记录」+ 全量测试结果 |
 
-> 说明：提交 4 里对 `_stat_order_pos` 的闭包滑窗改写有一个 `UnboundLocalError`（`_buf` 赋值未声明 `nonlocal`），
-> 会让 order_pos 每期返回 (0,0)、整族失效；被提交 5 发现并修复（恢复逐期重扫）。修复后：
+> 说明：这批改动经历了一次「滑窗优化引入 `UnboundLocalError` → 修复」的过程（提交 4/5/6）。
+> 首版滑窗漏声明 `nonlocal _buf/_last_len`，闭包内重新赋值触发 `UnboundLocalError`，被 `_stat_scan`
+> 的 except 兜底成 `(obs=1.0, exp=0.0)` —— order_pos 纯随机下恒为 1.0、整族实际失效；正是
+> `test_s7_order_pos_null_is_centered`（断言 `all_quick` 非空且 z 不系统偏移）抓住的。
+> 提交 5 先恢复逐期重扫止血，提交 6 用正确的 deque 滑窗重做并逐位对齐统计结论。最终 HEAD：
 > 全量 `pytest tests/ -q` = **1679 passed, 24 skipped, 1 xfailed, 1 failed**，唯一 failed 为
 > `test_v14_engine_split::...byte_identical...`，**实测为既有失败**（`git stash` 全部 V15 改动后同哈希同失败，
 > 根因是磁盘 `patterns_runtime` 快照与硬编码指纹基线因历史数据刷新漂移，`data/` 本轮未触碰）。
-> 修复后重跑 `--quick` 双侧与此前一致（null 0.0、order_35pct 0.75、number_10pct 0.0、S1 13→20），`--full` 见 §2。
+> 最终 HEAD 重跑 `--quick` 双侧与此前一致（null 0.0、order_35pct 0.75、number_10pct 0.0、S1 13→20），`--full` 见 §2。
