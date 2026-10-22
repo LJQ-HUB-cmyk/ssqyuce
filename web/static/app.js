@@ -2769,6 +2769,10 @@ function fillHonestBounds(d) {
   // 概率：与 renderBlueCoverage 同用 `_pct(v, 2)`，保证两卡逐字一致
   set("p_repeat", _pct(d.p_any_blue_random_repeat, 2));
   set("p_cover", _pct(d.p_any_blue_covered, 2));
+  // 文案改版后，第一格里同一对数字出现两次（左「随便买」右「不重复买」），
+  // 用独立 key 复用同一份值 —— **不重复取值**，避免两处各算一遍。
+  set("p_repeat2", _pct(d.p_any_blue_random_repeat, 2));
+  set("p_cover2", _pct(d.p_any_blue_covered, 2));
   set("n_tickets", String(n));
   set("n_tickets2", String(n));
   // 金额：成本取整（"20 元"），期望回收与净亏保留 3 位
