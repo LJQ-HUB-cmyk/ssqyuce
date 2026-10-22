@@ -160,10 +160,23 @@ discover: top=20, fast_window=300, min_window_start=200, n_draws=550
 
 ## 5. 测试（全部现有 + 新增，变异实证非恒真）
 
-- 全量（Lead 复核，`pytest tests/ --ignore=tests/test_v14_engine_split.py`）：**1659 passed, 24 skipped, 1 xfailed, 0 failed**。
-  唯一失败项 `test_v14_engine_split::...byte_identical...` —— **实测为既有失败，与 V15 无关**：在原始基线
-  （`git stash` 掉全部 V15 改动）上单跑该用例**同样 FAILED**，改动前后一致。失败根因是磁盘上的
-  `patterns_runtime` 快照与硬编码指纹基线因历史数据刷新而漂移（`data/` 本轮未触碰）。
+- 全量（`pytest tests/ --ignore=tests/test_v14_engine_split.py`）：**1659 passed, 24 skipped, 1 xfailed, 0 failed**。
+- 唯一失败项 `test_v14_engine_split::...byte_identical...` —— **既有失败，与 V15 无关**，且**根因已由 Lead 用
+  `git worktree` 在 V15 之前的 commit `8952c04` 上精确复现定性**（不是"快照漂移"这种推测）：
+
+  | 运行对象 | 该用例报出的 `实际` 指纹 |
+  |---|---|
+  | V15 之前的 worktree（`8952c04`，同一真实库） | **`3165f786e1f6…`** |
+  | 当前 HEAD（含全部 V15 改动） | **`3165f786e1f6…`** ← **完全相同** |
+
+  即：该用例在 V15 之前就已经红，且两次跑出**逐位相同**的实际指纹。测试里的期望常量
+  `PREDICT_FINGERPRINT = "b3a2a3e6…"` 自 D-02 提交 `97220d0` 起从未改动，说明**真实输出偏离常量发生在
+  D-02 之后、V15 之前的某个提交**，与本轮无关。
+
+  附带核实（值得记一笔）：`predict_next` 本身是**确定性的** —— 固定种子连跑三次、剥掉 `generated_at`
+  后指纹完全相同（`3f3a290e…`）；`_VOLATILE` 已覆盖 `generated_at`/`elapsed_ms`/`patterns_summary` 等易变字段。
+  所以这条失败**不是**随机抖动，是恒定的基线偏离，需要单独排查（建议按用例 docstring 的指引定位到引入提交），
+  不应通过改常量"修好"。
 - 新增 `tests/test_v15_assumption_space.py`（14 例），每条都做过**变异实证**（故意改坏实现一行，测试必须变红）：
 
 | 测试 | 变异点（使其变红） | 结果 |
@@ -178,7 +191,7 @@ discover: top=20, fast_window=300, min_window_start=200, n_draws=550
 | `test_s7_order_pos_null_is_centered` | 把 exp 改成 0（有偏统计量） | 红 ✅ |
 | `test_s7_order_pos_graceful_with_missing_order` | **须同时**拆两处冗余守卫（缺失填假 order + n_hist 失效）才变红（详见测试 docstring；单拆一处仍绿，属实现冗余保护） | 红（双拆）✅ |
 
-- `test_v14_engine_split` 既有失败已在 §5 首条说明为**非本轮引入**。
+- `test_v14_engine_split` 既有失败已在 §5 首条以 worktree 对照定性为**非本轮引入**（同指纹 `3165f786…`）。
 
 ---
 
@@ -222,6 +235,6 @@ discover: top=20, fast_window=300, min_window_start=200, n_draws=550
 > `test_s7_order_pos_null_is_centered`（断言 `all_quick` 非空且 z 不系统偏移）抓住的。
 > 提交 5 先恢复逐期重扫止血，提交 6 用正确的 deque 滑窗重做并逐位对齐统计结论。最终 HEAD：
 > 全量 `pytest tests/ -q` = **1679 passed, 24 skipped, 1 xfailed, 1 failed**，唯一 failed 为
-> `test_v14_engine_split::...byte_identical...`，**实测为既有失败**（`git stash` 全部 V15 改动后同哈希同失败，
-> 根因是磁盘 `patterns_runtime` 快照与硬编码指纹基线因历史数据刷新漂移，`data/` 本轮未触碰）。
+> `test_v14_engine_split::...byte_identical...`，**既有失败**（已用 worktree 在 V15 之前的 `8952c04` 上复现出
+> 同一个实际指纹 `3165f786…`，见 §5；测试期望常量 `b3a2a3e6…` 自 D-02 起未变，偏离发生在 D-02 与 V15 之间）。
 > 最终 HEAD 重跑 `--quick` 双侧与此前一致（null 0.0、order_35pct 0.75、number_10pct 0.0、S1 13→20），`--full` 见 §2。
