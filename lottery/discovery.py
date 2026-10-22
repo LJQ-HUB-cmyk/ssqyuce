@@ -39,7 +39,7 @@ import heapq
 import itertools
 import math
 import random
-from collections import Counter
+from collections import Counter, deque as _deque
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -1041,8 +1041,9 @@ def _stat_order_pos(params: Dict):
     exp0 = PICK * k / R_MAX
     # 滑动窗口状态（闭包内，单次扫描独占一个 selector 实例）
     _pos_cnt = np.zeros((PICK, R_MAX + 1))
-    _buf: List[Optional[tuple]] = []      # 已进窗的 order（None = 该期无有效 order）
+    _buf: "deque[Optional[tuple]]" = _deque()   # 已进窗的 order（None = 该期无有效 order）
     _n_hist = 0
+    _last_len: Optional[int] = None       # 上次调用时 history 的长度（滑窗连续性判据）
 
     def _add(order: Optional[tuple], sign: int) -> int:
         """把一期的 order 计入/移出窗口计数，返回对 ``_n_hist`` 的增量。"""
@@ -1058,21 +1059,33 @@ def _stat_order_pos(params: Dict):
         order = actual.get("order")
         if not order or len(order) != PICK:
             return 0.0, 0.0
-        # 用 history 的**长度变化**推进窗口：契约上 as-of 回放每期把 actual 追加进 history，
-        # 故 history[-1] 是本期的上一期。这里以 history 为准重建窗口状态，保证与
-        # 「每期重扫 history[-w:]」严格等价（不依赖调用顺序的隐式假设）。
-        hist = history[-w:]
         nonlocal _n_hist
-        # 环境一致性检查：若窗口内容与缓存不符（首次、或非顺序调用），全量重建
-        _cur = [tuple(int(x) for x in d["order"]) if (d.get("order") and len(d["order"]) == PICK)
-                else None for d in hist]
-        if _cur != _buf:
+        # **O(1) 滑窗**：as-of 回放每期把上一期 actual 追加进 history，故
+        # ``history[-1]`` 就是「上一次调用时的本期」。用「上次见到的期末位置」判断
+        # 这一期该滑进哪一条、该滑出哪一条，全程不重建窗口列表。
+        # 首次/非顺序调用（长度不连续）时退化为一次性重建，保证与「每期重扫
+        # history[-w:]」严格等价。
+        hl = len(history)
+        if _last_len is None or hl != _last_len + 1:
             _pos_cnt[:] = 0.0
-            _buf = []
+            _buf = _deque()
             _n_hist = 0
-            for o in _cur:
-                _buf.append(o)
-                _n_hist += _add(o, +1)
+            for d in history[-w:]:
+                o = d.get("order")
+                tu = (tuple(int(x) for x in o) if (o and len(o) == PICK) else None)
+                _buf.append(tu)
+                _n_hist += _add(tu, +1)
+        else:
+            # 滑进一条：上一次的本期 = history[-1]
+            d = history[-1]
+            o = d.get("order")
+            tu = (tuple(int(x) for x in o) if (o and len(o) == PICK) else None)
+            _buf.append(tu)
+            _n_hist += _add(tu, +1)
+            # 滑出一条：窗口超过 w 时丢掉最老的一条
+            while len(_buf) > w:
+                _n_hist += _add(_buf.popleft(), -1)
+        _last_len = hl
         if _n_hist < 30:
             return 0.0, 0.0
         hits = 0
@@ -1094,18 +1107,49 @@ def _stat_number_bias(params: Dict):
     若它在本期开出观测为 1、否则 0；期望为它在近 W 期的基线概率（与基线一致时
     效应为 0）。多重性：本族本身即「对 33 个号取最强者」，Bonferroni 按 33 计
     （见 note_zh 与现实期数门槛）。历史不足 W/2 或号码数异常时返回 (0, 0)。
+
+    **性能**（V15-b）：窗口内的逐号计数用**滑动窗口**维护（进窗 +1、出窗 -1），
+    不再每期调 ``red_count(hist, len(hist))`` 全量重扫。原实现单族占 ``discover()``
+    约 5.7s。与逐期重扫数值严格等价（同一窗口、同一计数）。
     """
     w = int(params.get("window", 300))
     p_base = PICK / R_MAX
+    _min_n = max(30, w // 2)
+    _cnt = np.zeros(R_MAX + 1)
+    _buf: "deque[tuple]" = _deque()
+    _last_len: Optional[int] = None
+
     def fn(history, actual):
-        hist = history[-w:]
-        if len(hist) < max(30, w // 2):
+        nonlocal _last_len, _buf
+        # **O(1) 滑窗**（与 ``_stat_order_pos`` 同一套机制）：as-of 回放每期追加一条，
+        # ``history[-1]`` 即「上次调用时的本期」。用长度连续性判断滑窗，不重建窗口。
+        hl = len(history)
+        if _last_len is None or hl != _last_len + 1:
+            _cnt[:] = 0.0
+            _buf = _deque()
+            for d in history[-w:]:
+                t = tuple(sorted(int(x) for x in (d.get("reds") or [])))
+                _buf.append(t)
+                for x in t:
+                    if 1 <= x <= R_MAX:
+                        _cnt[x] += 1
+        else:
+            t = tuple(sorted(int(x) for x in ((history[-1].get("reds")) or [])))
+            _buf.append(t)
+            for x in t:
+                if 1 <= x <= R_MAX:
+                    _cnt[x] += 1
+            while len(_buf) > w:
+                for x in _buf.popleft():
+                    if 1 <= x <= R_MAX:
+                        _cnt[x] -= 1
+        _last_len = hl
+        n = len(_buf)
+        if n < _min_n:
             return 0.0, 0.0
-        cnt = red_count(hist, len(hist))
-        n = len(hist)
         # 二项 z（相对 p_base）：(obs - n*p) / sqrt(n*p*(1-p))
         sd = math.sqrt(max(n * p_base * (1 - p_base), 1e-9))
-        z = (cnt - n * p_base) / sd
+        z = (_cnt[1:] - n * p_base) / sd
         pick = int(np.argmax(z)) + 1                    # 最超配的号（下标 0..32 → 1..33）
         reds = set(int(x) for x in (actual.get("reds") or []))
         obs = 1.0 if pick in reds else 0.0
