@@ -67,7 +67,7 @@ def shape_rules_endpoint():
     from . import shape_rules as SR
     draws = db.load_draws()
     if not draws:
-        return JSONResponse({"ok": False, "error": "本地暂无开奖数据"}, status_code=400)
+        return JSONResponse({"ok": False, "error": "本地还没有开奖数据。请先抓取或导入历史开奖（详见部署文档「数据准备」一节），完成后再试。"}, status_code=400)
     rep = SR.shape_rules_report(draws)
     rep["ok"] = True
     return _jsonable(rep)
@@ -79,7 +79,7 @@ def shape_constraints_endpoint():
     from . import shape_rules as SR
     draws = db.load_draws()
     if not draws:
-        return JSONResponse({"ok": False, "error": "本地暂无开奖数据"}, status_code=400)
+        return JSONResponse({"ok": False, "error": "本地还没有开奖数据。请先抓取或导入历史开奖（详见部署文档「数据准备」一节），完成后再试。"}, status_code=400)
     ctx = SR.shape_constraint_ctx(draws)
     ctx["ok"] = True
     return _jsonable(ctx)
@@ -135,7 +135,7 @@ def multiscale_scan(only_interesting: bool = Query(True),
 
     draws = db.load_draws()
     if not draws:
-        return JSONResponse({"ok": False, "error": "本地暂无开奖数据"}, status_code=400)
+        return JSONResponse({"ok": False, "error": "本地还没有开奖数据。请先抓取或导入历史开奖（详见部署文档「数据准备」一节），完成后再试。"}, status_code=400)
     scale_keys = None
     if scales:
         scale_keys = [x.strip() for x in str(scales).split(",") if x.strip()]

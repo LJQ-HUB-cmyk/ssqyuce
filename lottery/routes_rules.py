@@ -80,13 +80,13 @@ def regime_overview(limit: int = Query(0, ge=0, le=3490),
         from . import evolution, hypothesis, regime
     except ImportError as e:
         return JSONResponse({"ok": False, "available": False,
-                             "error": "阶段时效模块尚未就绪", "detail": str(e)},
+                             "error": "阶段时效模块尚未就绪。该功能在本部署中不可用；其他功能不受影响。若是部署方，请确认相关模块已随包安装。", "detail": str(e)},
                             status_code=503)
     draws = db.load_draws()
     if limit:
         draws = draws[-int(limit):]
     if not draws:
-        return JSONResponse({"ok": False, "error": "本地暂无开奖数据"}, status_code=400)
+        return JSONResponse({"ok": False, "error": "本地还没有开奖数据。请先抓取或导入历史开奖（详见部署文档「数据准备」一节），完成后再试。"}, status_code=400)
     hyps = evolution._as_hyp_list(hypothesis.load_registry())
     items = []
     for h in hyps:
@@ -151,7 +151,7 @@ def regime_status_label(status: str) -> str:
         "noise": "未检出（各阶段均不显著）",
         "no_dimension": "无可回放维度（结构类/权重类）",
         "insufficient": "样本不足",
-        "error": "阶段分析失败",
+        "error": "阶段分析暂时无法完成。稍后重试；若持续出现，请反馈维护者。",
         "unannotated": "尚未标注（点「重算阶段时效」）",
     }.get(status or "", status or "")
 
@@ -162,15 +162,15 @@ def regime_refresh(start: int = Query(200, ge=60, le=3000)):
     try:
         from . import evolution
     except ImportError as e:
-        return JSONResponse({"ok": False, "error": "阶段时效模块尚未就绪",
+        return JSONResponse({"ok": False, "error": "阶段时效模块尚未就绪。该功能在本部署中不可用；其他功能不受影响。若是部署方，请确认相关模块已随包安装。",
                              "detail": str(e)}, status_code=503)
     draws = db.load_draws()
     if not draws:
-        return JSONResponse({"ok": False, "error": "本地暂无开奖数据"}, status_code=400)
+        return JSONResponse({"ok": False, "error": "本地还没有开奖数据。请先抓取或导入历史开奖（详见部署文档「数据准备」一节），完成后再试。"}, status_code=400)
     try:
         r = evolution.annotate_hypotheses(draws, start=int(start))
     except Exception as e:  # noqa: BLE001
-        return JSONResponse({"ok": False, "error": "标注失败",
+        return JSONResponse({"ok": False, "error": "标注没能保存。请重试一次；若仍失败，请确认本地数据文件可写。",
                              "detail": f"{type(e).__name__}: {e}"}, status_code=503)
     return {"ok": True, **r}
 
@@ -181,7 +181,7 @@ def discovery_families():
     try:
         from . import discovery
     except ImportError as e:
-        return JSONResponse({"ok": False, "error": "维度模块尚未就绪",
+        return JSONResponse({"ok": False, "error": "维度模块尚未就绪。该功能在本部署中不可用；其他功能不受影响。若是部署方，请确认相关模块已随包安装。",
                              "detail": str(e)}, status_code=503)
     fams = discovery.family_catalog()
     dims: Dict[str, int] = {}
@@ -204,17 +204,17 @@ def discovery_scan(top: int = Query(12, ge=1, le=60),
     try:
         from . import discovery
     except ImportError as e:
-        return JSONResponse({"ok": False, "error": "维度模块尚未就绪",
+        return JSONResponse({"ok": False, "error": "维度模块尚未就绪。该功能在本部署中不可用；其他功能不受影响。若是部署方，请确认相关模块已随包安装。",
                              "detail": str(e)}, status_code=503)
     draws = db.load_draws()
     if not draws:
-        return JSONResponse({"ok": False, "error": "本地暂无开奖数据"}, status_code=400)
+        return JSONResponse({"ok": False, "error": "本地还没有开奖数据。请先抓取或导入历史开奖（详见部署文档「数据准备」一节），完成后再试。"}, status_code=400)
     flist = [x.strip() for x in families.split(",") if x.strip()] if families else None
     try:
         res = discovery.discover(draws, top=int(top), fast_window=int(fast_window),
                                  families=flist, use_cache=not bool(refresh))
     except Exception as e:  # noqa: BLE001
-        return JSONResponse({"ok": False, "error": "扫描失败",
+        return JSONResponse({"ok": False, "error": "扫描没能完成。请重试一次；若仍失败，请确认数据完整后反馈维护者。",
                              "detail": f"{type(e).__name__}: {e}"}, status_code=503)
     out = dict(res)
     out["ok"] = True
@@ -234,7 +234,7 @@ def llm_lab_latest(limit: int = Query(40, ge=1, le=200)):
         _, llm_lab = _llm_lab_modules()
     except ImportError as e:
         return JSONResponse({"ok": False, "available": False,
-                             "error": "LLM 规律工坊模块尚未就绪", "detail": str(e)},
+                             "error": "LLM 规律工坊模块尚未就绪。该功能在本部署中不可用；其他功能不受影响。若是部署方，请确认相关模块已随包安装。", "detail": str(e)},
                             status_code=503)
     data = llm_lab.load_claims()
     claims = (data.get("claims") or [])[:int(limit)]
@@ -253,15 +253,15 @@ def llm_lab_register():
     try:
         from . import evolution
     except ImportError as e:
-        return JSONResponse({"ok": False, "error": "进化模块尚未就绪",
+        return JSONResponse({"ok": False, "error": "进化模块尚未就绪。该功能在本部署中不可用；其他功能不受影响。若是部署方，请确认相关模块已随包安装。",
                              "detail": str(e)}, status_code=503)
     draws = db.load_draws()
     if not draws:
-        return JSONResponse({"ok": False, "error": "本地暂无开奖数据"}, status_code=400)
+        return JSONResponse({"ok": False, "error": "本地还没有开奖数据。请先抓取或导入历史开奖（详见部署文档「数据准备」一节），完成后再试。"}, status_code=400)
     try:
         r = evolution.register_llm_lab_claims(draws)
     except Exception as e:  # noqa: BLE001
-        return JSONResponse({"ok": False, "error": "注册失败",
+        return JSONResponse({"ok": False, "error": "注册没能完成。请检查必填项后重试；若仍失败，请把错误时间反馈维护者。",
                              "detail": f"{type(e).__name__}: {e}"}, status_code=503)
     return {"ok": True, **r}
 
@@ -277,11 +277,11 @@ def backtest_regime(key: str = Query(..., min_length=1),
     try:
         from . import discovery
     except ImportError as e:
-        return JSONResponse({"ok": False, "error": "维度模块尚未就绪",
+        return JSONResponse({"ok": False, "error": "维度模块尚未就绪。该功能在本部署中不可用；其他功能不受影响。若是部署方，请确认相关模块已随包安装。",
                              "detail": str(e)}, status_code=503)
     draws = db.load_draws()
     if not draws:
-        return JSONResponse({"ok": False, "error": "本地暂无开奖数据"}, status_code=400)
+        return JSONResponse({"ok": False, "error": "本地还没有开奖数据。请先抓取或导入历史开奖（详见部署文档「数据准备」一节），完成后再试。"}, status_code=400)
     try:
         p = json.loads(params) if params else (discovery.FAMILY_BY_KEY.get(key) or {}).get("params", [{}])[0]
     except (json.JSONDecodeError, TypeError):
@@ -293,7 +293,7 @@ def backtest_regime(key: str = Query(..., min_length=1),
     except KeyError as e:
         return JSONResponse({"ok": False, "error": f"未知维度：{e}"}, status_code=400)
     except Exception as e:  # noqa: BLE001
-        return JSONResponse({"ok": False, "error": "回放失败",
+        return JSONResponse({"ok": False, "error": "回放没能生成。请重试一次；若仍失败，请确认该期开奖数据已存在。",
                              "detail": f"{type(e).__name__}: {e}"}, status_code=503)
     return {"ok": True, "filter": {"key": key, "params": p, "label": flt["label"],
                                    "target": flt["target"]}, "regime": rep}
@@ -343,7 +343,7 @@ def rules_lifecycle_run(use_llm: bool = Query(False)):
 
     draws = db.load_draws()
     if not draws:
-        return JSONResponse({"ok": False, "error": "本地暂无开奖数据"}, status_code=400)
+        return JSONResponse({"ok": False, "error": "本地还没有开奖数据。请先抓取或导入历史开奖（详见部署文档「数据准备」一节），完成后再试。"}, status_code=400)
     snap = patterns_runtime.build_snapshot(draws)
     try:
         out = RL.run_cycle(draws, snapshot=snap, use_llm=bool(use_llm), persist=True)
@@ -371,7 +371,7 @@ def rules_runtime():
         from . import patterns_runtime
     except ImportError as e:
         return JSONResponse({"ok": False, "available": False,
-                             "error": "规律运行时模块尚未就绪", "detail": str(e)},
+                             "error": "规律运行时模块尚未就绪。该功能在本部署中不可用；其他功能不受影响。若是部署方，请确认相关模块已随包安装。", "detail": str(e)},
                             status_code=503)
     draws = db.load_draws()
     current = draws[-1]["issue"] if draws else None
@@ -393,15 +393,15 @@ def rules_refresh():
     try:
         from . import patterns_runtime
     except ImportError as e:
-        return JSONResponse({"ok": False, "error": "规律运行时模块尚未就绪",
+        return JSONResponse({"ok": False, "error": "规律运行时模块尚未就绪。该功能在本部署中不可用；其他功能不受影响。若是部署方，请确认相关模块已随包安装。",
                              "detail": str(e)}, status_code=503)
     draws = db.load_draws()
     if not draws:
-        return JSONResponse({"ok": False, "error": "本地暂无开奖数据"}, status_code=400)
+        return JSONResponse({"ok": False, "error": "本地还没有开奖数据。请先抓取或导入历史开奖（详见部署文档「数据准备」一节），完成后再试。"}, status_code=400)
     try:
         r = patterns_runtime.refresh(draws)
     except Exception as e:  # noqa: BLE001
-        return JSONResponse({"ok": False, "error": "刷新失败",
+        return JSONResponse({"ok": False, "error": "刷新没能完成。请重试一次；若仍失败，请确认数据源可用后反馈维护者。",
                              "detail": f"{type(e).__name__}: {e}"}, status_code=503)
     return {"ok": True, **r}
 @router.post("/api/rules/closed-loop/async")
@@ -415,11 +415,11 @@ def rules_closed_loop_async(rounds: int = Query(3, ge=1, le=3),
     try:
         from . import llm_lab
     except ImportError as e:
-        return JSONResponse({"ok": False, "error": "LLM 规律工坊模块尚未就绪",
+        return JSONResponse({"ok": False, "error": "LLM 规律工坊模块尚未就绪。该功能在本部署中不可用；其他功能不受影响。若是部署方，请确认相关模块已随包安装。",
                              "detail": str(e)}, status_code=503)
     draws = db.load_draws()
     if not draws:
-        return JSONResponse({"ok": False, "error": "本地暂无开奖数据"}, status_code=400)
+        return JSONResponse({"ok": False, "error": "本地还没有开奖数据。请先抓取或导入历史开奖（详见部署文档「数据准备」一节），完成后再试。"}, status_code=400)
     tid = bg_tasks._bg_run("closed_loop",
                   lambda p: llm_lab.run_closed_loop(draws, rounds=int(rounds),
                                                     use_llm=bool(use_llm), progress=p))
@@ -434,11 +434,11 @@ def llm_lab_run_async(rounds: int = Query(3, ge=1, le=3),
     try:
         from . import llm_lab
     except ImportError as e:
-        return JSONResponse({"ok": False, "error": "LLM 规律工坊模块尚未就绪",
+        return JSONResponse({"ok": False, "error": "LLM 规律工坊模块尚未就绪。该功能在本部署中不可用；其他功能不受影响。若是部署方，请确认相关模块已随包安装。",
                              "detail": str(e)}, status_code=503)
     draws = db.load_draws()
     if not draws:
-        return JSONResponse({"ok": False, "error": "本地暂无开奖数据"}, status_code=400)
+        return JSONResponse({"ok": False, "error": "本地还没有开奖数据。请先抓取或导入历史开奖（详见部署文档「数据准备」一节），完成后再试。"}, status_code=400)
     tid = bg_tasks._bg_run("llm_lab",
                   lambda p: llm_lab.run_lab(draws, rounds=int(rounds),
                                             use_llm=bool(use_llm), progress=p))
@@ -465,7 +465,7 @@ def battle_report(limit: int = Query(0, ge=0, le=3490),
     draws = db.load_draws()
     if not draws:
         return JSONResponse({"ok": False, "available": True,
-                             "error": "本地暂无开奖数据"}, status_code=400)
+                             "error": "本地还没有开奖数据。请先抓取或导入历史开奖（详见部署文档「数据准备」一节），完成后再试。"}, status_code=400)
     if limit:
         draws = draws[-int(limit):]
     if len(draws) <= start:
@@ -545,7 +545,7 @@ def evolution_run(limit: int = Query(0, ge=0, le=3490),
     draws = db.load_draws()
     if not draws:
         return JSONResponse({"ok": False, "available": True,
-                             "error": "本地暂无开奖数据"}, status_code=400)
+                             "error": "本地还没有开奖数据。请先抓取或导入历史开奖（详见部署文档「数据准备」一节），完成后再试。"}, status_code=400)
     try:
         # 手动触发**必须**绕过幂等闸门（用户的意图就是「现在再跑一轮」）。
         result = evolution_service._evolution_step(limit=int(limit), use_llm=bool(use_llm), force=True)

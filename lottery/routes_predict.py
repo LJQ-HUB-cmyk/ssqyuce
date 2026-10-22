@@ -193,7 +193,7 @@ def predict(use_llm: Optional[bool] = None,
     from .llm_client import LLMChannelError
     draws = db.load_draws()
     if not draws:
-        return JSONResponse({"ok": False, "error": "本地暂无开奖数据，请先刷新"}, status_code=400)
+        return JSONResponse({"ok": False, "error": "本地还没有开奖数据。请先抓取或导入历史开奖（详见部署文档「数据准备」一节），完成后再试。"}, status_code=400)
     # V7：期号按真实开奖日历推算（每周二/四/日），并在数据陈旧时明说，
     # 不再用「seq+1」硬猜（旧写法在期号越界时会显示成明年的 4xx 期号）。
     _exp = BT.expected_issue(draws)

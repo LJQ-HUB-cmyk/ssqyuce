@@ -56,7 +56,7 @@ def llm_audit_latest(post: Optional[str] = Query(None),
         from . import ai_audit
     except ImportError as e:
         return JSONResponse({"ok": False, "available": False,
-                             "error": "AI 核对模块尚未就绪",
+                             "error": "AI 核对功能在本部署中不可用（该模块未安装或未启用）。其他功能不受影响。",
                              "detail": str(e)}, status_code=503)
     if post is not None and post not in ai_audit.POSTS:
         return JSONResponse({"ok": False, "available": False,
@@ -66,7 +66,7 @@ def llm_audit_latest(post: Optional[str] = Query(None),
         out = ai_audit.latest_audit(post=post)
     except Exception as e:  # noqa: BLE001
         return JSONResponse({"ok": False, "available": False,
-                             "error": "读取审计记录失败",
+                             "error": "审计记录暂时读取不到。稍后重试；若持续出现，请检查数据目录权限或把时间为反馈给维护者。",
                              "detail": f"{type(e).__name__}: {e}"}, status_code=503)
     out = dict(out)
     out["ok"] = True
@@ -91,7 +91,7 @@ async def llm_audit_run(request: Request,
     try:
         from . import ai_audit
     except ImportError as e:
-        return JSONResponse({"ok": False, "error": "AI 核对模块尚未就绪",
+        return JSONResponse({"ok": False, "error": "AI 核对功能在本部署中不可用（该模块未安装或未启用）。其他功能不受影响。",
                              "detail": str(e)}, status_code=503)
     if post not in ai_audit.POSTS:
         return JSONResponse({"ok": False,
@@ -125,7 +125,7 @@ async def llm_audit_run(request: Request,
                                     status_code=400)
             audit_input = ai_audit.build_contract_input(items)
     except Exception as e:  # noqa: BLE001
-        return JSONResponse({"ok": False, "error": "构造核对输入失败",
+        return JSONResponse({"ok": False, "error": "无法组装核对输入（预测或开奖数据不完整）。请先确认已有已核对的预测记录，再重试。",
                              "detail": f"{type(e).__name__}: {e}"}, status_code=503)
 
     def _fn(_progress):
@@ -256,7 +256,7 @@ def experiments_randomness_selfcheck(
     try:
         draws = db.load_draws()
     except Exception as e:  # noqa: BLE001
-        return JSONResponse({"ok": False, "error": "读取开奖数据失败",
+        return JSONResponse({"ok": False, "error": "开奖数据暂时读取不到。稍后重试；若持续出现，请检查数据文件是否可读。",
                              "detail": f"{type(e).__name__}: {e}"}, status_code=503)
     if n_draws:
         draws = draws[-int(n_draws):]
@@ -272,7 +272,7 @@ def experiments_randomness_selfcheck(
             n_perm=(_sc.DEFAULT_N_PERM if n_perm is None else int(n_perm)),
             synthetic_bias=bias)
     except Exception as e:  # noqa: BLE001
-        return JSONResponse({"ok": False, "error": "自证实验执行失败",
+        return JSONResponse({"ok": False, "error": "自证实验执行中断。稍后重试；若持续出现，请把「接口/时间/操作」反馈给维护者。",
                              "detail": f"{type(e).__name__}: {e}"}, status_code=503)
     return _jsonable(payload)
 
@@ -288,7 +288,7 @@ def audit_anomaly_latest():
     try:
         payload = data_audit.latest_audit()
     except Exception as e:  # noqa: BLE001
-        return JSONResponse({"available": False, "error": "读取审计产物失败",
+        return JSONResponse({"available": False, "error": "审计产物暂时读取不到。若刚跑完实验，请稍等几秒再刷新。",
                              "detail": f"{type(e).__name__}: {e}"},
                             status_code=503)
     return _jsonable(payload)
@@ -309,7 +309,7 @@ def audit_anomaly_run(use_llm: int = Query(1, ge=0, le=1),
     draws = db.load_draws()
     if not draws:
         return JSONResponse({"ok": False, "available": True,
-                             "error": "本地暂无开奖数据"}, status_code=400)
+                             "error": "本地还没有开奖数据。请先抓取或导入历史开奖（详见部署文档「数据准备」一节），完成后再试。"}, status_code=400)
     from . import data_audit
 
     def _work(progress):

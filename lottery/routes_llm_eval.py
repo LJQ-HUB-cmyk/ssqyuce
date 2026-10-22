@@ -28,7 +28,7 @@ def llm_eval_run(issues: int = Query(60, ge=3, le=200),
     from . import llm_eval
     draws = db.load_draws()
     if not draws:
-        return JSONResponse({"ok": False, "error": "本地暂无开奖数据"}, status_code=400)
+        return JSONResponse({"ok": False, "error": "本地还没有开奖数据。请先抓取或导入历史开奖（详见部署文档「数据准备」一节），完成后再试。"}, status_code=400)
     if len(draws) < 305:
         return JSONResponse({"ok": False, "error": f"数据不足（需 ≥305 期，当前 {len(draws)}）"},
                             status_code=400)

@@ -174,7 +174,7 @@ def ml_diagnosis(max_issues: int = Query(800, ge=100, le=3500),
     colors_t = tuple(c for c in colors_t if c in ("red", "blue")) or ("red", "blue")
     draws = db.load_draws()
     if not draws:
-        return JSONResponse({"ok": False, "error": "本地暂无开奖数据"}, status_code=400)
+        return JSONResponse({"ok": False, "error": "本地还没有开奖数据。请先抓取或导入历史开奖（详见部署文档「数据准备」一节），完成后再试。"}, status_code=400)
     # 缓存键必须含**数据集指纹**：只按参数缓存的话，开奖数据更新后 10 分钟内
     # 仍会返回上一批数据算出的 trustworthy 结论（缓存把结论"钉死"在旧样本上）。
     dataset_fp = f"{len(draws)}:{db.max_issue()}"

@@ -32,6 +32,6 @@ def ml_eval(window: int = Query(30, ge=10, le=200),
     from . import ml_model
     draws = db.load_draws()
     if not draws:
-        return JSONResponse({"ok": False, "error": "本地暂无开奖数据"}, status_code=400)
+        return JSONResponse({"ok": False, "error": "本地还没有开奖数据。请先抓取或导入历史开奖（详见部署文档「数据准备」一节），完成后再试。"}, status_code=400)
     return ml_model.evaluate_ml_walkforward(
         draws, window=window, refit_every=refit_every, train_window=train_window)

@@ -66,7 +66,7 @@ def _rigor_call_or_503(fn_name: str, *args, **kwargs):
             {
                 "ok": False,
                 "available": False,
-                "error": "随机性检验的该项功能在本版本中不可用。",
+                "error": "随机性检验的该项功能在本版本中不可用。其他检验项不受影响。",
                 "detail": f"内部：lottery.rigor 未提供 {fn_name}()",
                 "hint": "模块接口与契约不一致，请检查版本。",
             },
@@ -99,7 +99,7 @@ def rigor_randomness(limit: int = Query(0, ge=0, le=3490)):
     draws = db.load_draws()
     if not draws:
         return JSONResponse({"ok": False, "available": True,
-                             "error": "本地暂无开奖数据"}, status_code=400)
+                             "error": "本地还没有开奖数据。请先抓取或导入历史开奖（详见部署文档「数据准备」一节），完成后再试。"}, status_code=400)
     if limit:
         draws = draws[-int(limit):]
     report, resp = _rigor_call_or_503("randomness_report", draws)
@@ -187,14 +187,14 @@ def rigor_signal(strategy: str = Query("hot"), window: int = Query(100, ge=5, le
     draws = db.load_draws()
     if not draws:
         return JSONResponse({"ok": False, "available": True,
-                             "error": "本地暂无开奖数据"}, status_code=400)
+                             "error": "本地还没有开奖数据。请先抓取或导入历史开奖（详见部署文档「数据准备」一节），完成后再试。"}, status_code=400)
 
     series = _strategy_hit_series(draws, strategy, window)
     if not series:
         return JSONResponse(
             {"ok": False, "available": True, "strategy": strategy, "window": window,
              "n_trials": 0,
-             "error": "样本不足：可对照期数少于窗口长度，无法做显著性检验",
+             "error": "样本不足：可对照期数少于窗口长度，无法做显著性检验。请先积累更多已开奖期次再试。",
              "hint": f"需要至少 window+1 = {window + 1} 期数据"}, status_code=400)
 
     # 基线：红球策略期望命中 6*6/33；蓝球策略期望命中 1/16

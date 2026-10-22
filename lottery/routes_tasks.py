@@ -53,7 +53,7 @@ def list_tasks(limit: int = Query(20, ge=1, le=100)):
 def get_task(task_id: str):
     t = db.load_task(task_id)
     if t is None or not _task_visible_to_current_user(t):
-        return JSONResponse({"ok": False, "error": "task not found"}, status_code=404)
+        return JSONResponse({"ok": False, "error": "找不到该任务。请确认任务编号是否正确，或刷新任务列表后重试。"}, status_code=404)
     return t
 
 
@@ -72,7 +72,7 @@ def diagnose_endpoint(
         return JSONResponse({"ok": False, "error": "必须恰好 6 个不重复红球"}, status_code=400)
     draws = db.load_draws()
     if not draws:
-        return JSONResponse({"ok": False, "error": "暂无数据"}, status_code=400)
+        return JSONResponse({"ok": False, "error": "本地还没有开奖数据。请先抓取或导入历史开奖（详见部署文档「数据准备」一节），完成后再试。"}, status_code=400)
     return D.diagnose(r_list, blue, draws)
 
 
@@ -87,7 +87,7 @@ def run_mining(min_start: int = Query(300, ge=120, le=1000),
     task_id = f"mine_{uuid.uuid4().hex[:8]}"
     draws = db.load_draws()
     if not draws:
-        return JSONResponse({"ok": False, "error": "暂无数据"}, status_code=400)
+        return JSONResponse({"ok": False, "error": "本地还没有开奖数据。请先抓取或导入历史开奖（详见部署文档「数据准备」一节），完成后再试。"}, status_code=400)
     db.create_task(task_id, "mine")
     # 同步执行（挖掘较快，通常 <10s）
     try:
