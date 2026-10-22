@@ -203,3 +203,20 @@ discover: top=20, fast_window=300, min_window_start=200, n_draws=550
   `lottery/regime.py`（`PERSISTENT_EFFECT_K`、`long_term_effect`、`sign_agreement`、`_persistent_effect_sign_ok`、`regime_report`）、
   `lottery/patterns_runtime.py`（`PERSISTENT_EFFECT_STATUSES`、`_effect_ok`、usable/tier/counts）。
 - P2 与代码的口径差异（已按代码为准）：P2 文字写 `discover` 默认 top=12，**代码实际默认 top=20**；本轮沿用代码值 20。
+
+## 提交与修复记录（提交顺序）
+
+| # | commit | 内容 |
+|---|---|---|
+| 1 | `18622e0` feat(runtime): S2 | persistent_effect 长期效应档（regime/patterns_runtime/routes_rules/前端） |
+| 2 | `aac787a` feat(discovery): S1 | 阶段画像按族去重，n_tested 不变 |
+| 3 | `e14d2f4` feat(discovery): S7 | order_pos/number_bias/sum_dist 三族 + 验收脚本 + 测试 + 本 doc |
+| 4 | `39e0f9c` perf(disc)+docs | sum_dist 零分布预计算 + 验收 `--reps` + full 双侧数字回填 |
+| 5 | `6389922` fix(discovery) | 修复提交 4 引入的 order_pos 滑窗 `UnboundLocalError` 回归（`_buf` 未 nonlocal），撤回滑窗优化、恢复 S7 的逐期重扫实现（口径不变，正确性优先）；`_stat_sum_dist` 预计算保留 |
+
+> 说明：提交 4 里对 `_stat_order_pos` 的闭包滑窗改写有一个 `UnboundLocalError`（`_buf` 赋值未声明 `nonlocal`），
+> 会让 order_pos 每期返回 (0,0)、整族失效；被提交 5 发现并修复（恢复逐期重扫）。修复后：
+> 全量 `pytest tests/ -q` = **1679 passed, 24 skipped, 1 xfailed, 1 failed**，唯一 failed 为
+> `test_v14_engine_split::...byte_identical...`，**实测为既有失败**（`git stash` 全部 V15 改动后同哈希同失败，
+> 根因是磁盘 `patterns_runtime` 快照与硬编码指纹基线因历史数据刷新漂移，`data/` 本轮未触碰）。
+> 修复后重跑 `--quick` 双侧与此前一致（null 0.0、order_35pct 0.75、number_10pct 0.0、S1 13→20），`--full` 见 §2。
