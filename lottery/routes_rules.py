@@ -59,7 +59,8 @@ def _battle_or_503():
     except ImportError as e:
         return None, JSONResponse(
             {"ok": False, "available": False,
-             "error": "战斗回放模块 lottery.battle 尚未就绪",
+             "error": "战斗回放功能在本部署中不可用（该模块未安装或未启用）。",
+            "detail": "内部：lottery.battle 导入失败",
              "detail": str(e), "hint": "该端点需 lottery/battle.py；其余功能不受影响。"},
             status_code=503)
     return battle, None
@@ -477,11 +478,13 @@ def battle_report(limit: int = Query(0, ge=0, le=3490),
                                       start=int(start), seed=int(seed))
     except Exception as e:  # noqa: BLE001
         return JSONResponse({"ok": False, "available": False,
-                             "error": "battle_report() 执行失败",
+                             "error": "战斗回放数据暂时无法生成。这不是你操作的问题，稍后重试即可。",
+            "detail": "内部：battle_report() 抛出异常",
                              "detail": f"{type(e).__name__}: {e}"}, status_code=503)
     if not isinstance(report, dict):
         return JSONResponse({"ok": False, "available": False,
-                             "error": "battle_report() 返回结构异常"}, status_code=503)
+                             "error": "战斗回放数据暂时无法生成。这不是你操作的问题，稍后重试即可。",
+             "detail": "内部：battle_report() 返回结构异常"}, status_code=503)
     out = dict(report)
     out.setdefault("ok", True)
     out["available"] = True
@@ -502,13 +505,15 @@ def evolution_status_endpoint():
         from . import evolution
     except ImportError as e:
         return JSONResponse({"ok": False, "available": False,
-                             "error": "自进化模块 lottery.evolution 尚未就绪",
+                             "error": "自进化功能在本部署中不可用（该模块未安装或未启用）。",
+            "detail": "内部：lottery.evolution 导入失败",
                              "detail": str(e)}, status_code=503)
     try:
         st = evolution.evolution_status()
     except Exception as e:  # noqa: BLE001
         return JSONResponse({"ok": False, "available": False,
-                             "error": "evolution_status() 执行失败",
+                             "error": "自进化状态暂时无法读取。这不是你操作的问题，稍后重试即可。",
+            "detail": "内部：evolution_status() 抛出异常",
                              "detail": f"{type(e).__name__}: {e}"}, status_code=503)
     st = dict(st or {})
     st.setdefault("ok", True)
@@ -546,7 +551,8 @@ def evolution_run(limit: int = Query(0, ge=0, le=3490),
         result = evolution_service._evolution_step(limit=int(limit), use_llm=bool(use_llm), force=True)
     except Exception as e:  # noqa: BLE001
         return JSONResponse({"ok": False, "available": False,
-                             "error": "_evolution_step() 执行失败",
+                             "error": "自进化单步执行失败。这不是你操作的问题，稍后重试即可。",
+            "detail": "内部：_evolution_step() 抛出异常",
                              "detail": f"{type(e).__name__}: {e}"}, status_code=503)
     result = dict(result or {})
     result.setdefault("ok", True)

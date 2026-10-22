@@ -41,7 +41,8 @@ def _rigor_or_503():
             {
                 "ok": False,
                 "available": False,
-                "error": "随机性检验模块 lottery.rigor 尚未就绪",
+                "error": "随机性检验功能在本部署中不可用（该模块未安装或未启用）。",
+                "detail": "内部：lottery.rigor 导入失败",
                 "detail": str(e),
                 "hint": "该端点需 lottery/rigor.py；其余功能不受影响。",
             },
@@ -65,7 +66,8 @@ def _rigor_call_or_503(fn_name: str, *args, **kwargs):
             {
                 "ok": False,
                 "available": False,
-                "error": f"lottery.rigor 未提供 {fn_name}()",
+                "error": "随机性检验的该项功能在本版本中不可用。",
+                "detail": f"内部：lottery.rigor 未提供 {fn_name}()",
                 "hint": "模块接口与契约不一致，请检查版本。",
             },
             status_code=503,
@@ -105,7 +107,8 @@ def rigor_randomness(limit: int = Query(0, ge=0, le=3490)):
         return resp
     if not isinstance(report, dict):
         return JSONResponse({"ok": False, "available": False,
-                             "error": "randomness_report() 返回结构异常",
+                             "error": "随机性检验数据暂时无法生成。这不是你操作的问题，稍后重试即可。",
+                "detail": "内部：randomness_report() 返回结构异常",
                              "detail": f"期望 dict，实际 {type(report).__name__}"},
                             status_code=503)
     out = dict(report)
