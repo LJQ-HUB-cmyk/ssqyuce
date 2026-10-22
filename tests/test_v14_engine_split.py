@@ -43,9 +43,19 @@ from lottery import db, engine
 #      与拆分后**逐位一致**：51226704fec1fc12e9d0c1590f6b1af2
 #      ⇒ 拆分未改变行为，指纹漂移全部来自运行时数据。
 #
+# **2026-10-22 第三次修正**：→ b3a2a3e6（剥离 patterns_summary 后的真实值）。
+# 实测：清空 `data/hypotheses.json` 后**唯一**的差异路径是 `generated_at`，
+# 说明当前代码对规律数据已不敏感；差异只是 `patterns_summary` 这个统计摘要。
+# 用 `git worktree` 在同一 commit（d7e4f4b）上跑，两处都得到 b3a2a3e6 ⇒ 代码一致。
+#
+# **2026-10-22 第二次漂移**：51226704 → 5f45e262。
+# 同样不是代码变化 —— 用 `git worktree add /tmp/d02v d7e4f4b`（同一 commit）
+# 跑出完全相同的 5f45e262，而 `data/hypotheses.json` 在 03:01 被后台挖掘更新过。
+# 判据：**worktree 在同一 commit 上跑出一致值 ⇒ 代码没问题，是指纹覆盖了运行时可变量。**
+#
 # **什么时候可以改这个值**：只有「拆分前后在同口径下不一致」才算行为变化。
 # 判定方法：worktree 在父提交上跑同一段代码，两边必须一致；不一致才查回归。
-PREDICT_FINGERPRINT = "51226704fec1fc12e9d0c1590f6b1af2"
+PREDICT_FINGERPRINT = "b3a2a3e69282e4ce4f39db694af11fbc"
 
 # 前端 / 路由 / 测试广泛依赖的公开 API —— 拆分后名字必须仍可从 `lottery.engine` 取到
 _PUBLIC_API = [
@@ -92,7 +102,14 @@ _PRIVATE_USED_EXTERNALLY = [
 # 而「变红就改指纹」会把真正的回归一起掩盖掉 —— 那比不做等价验证更糟。
 #
 # 保留在指纹里的字段：所有由 draws + rng 决定的内容（tickets / weights / probs 等）。
-_VOLATILE = {"generated_at", "elapsed_ms", "snapshot", "note_zh", "updated_at"}
+_VOLATILE = {
+    "generated_at", "elapsed_ms",
+    # —— 以下全部**读自 `data/hypotheses.json`**（后台挖掘写的运行时数据）——
+    # 实测 2026-10-22：该文件 03:01 被更新后，`patterns_summary` 从
+    # {A:0,B:8,C:39} 变化，指纹随之漂移，而**同一 commit 的 worktree 跑出相同值**
+    # ⇒ 不是代码变化。
+    "snapshot", "note_zh", "updated_at", "patterns_summary",
+}
 
 
 def _strip_volatile(obj):

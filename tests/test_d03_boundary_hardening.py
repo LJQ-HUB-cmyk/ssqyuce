@@ -160,6 +160,12 @@ def test_capabilities_degraded_lists_idle_mining_when_off():
 def test_capabilities_degraded_entries_all_have_restore_path():
     """每个降级项都必须给出恢复方式，不得只报「坏了」。"""
     body = _json(C.capabilities())
+    # 反空转：若降级项为空，下面的 for 不会执行 ⇒ 测试恒绿（假守卫）。
+    # 当前默认环境有 2 项（idle_mining / usable_replayable），所以必须非空。
+    # 若将来降级项合法地变成 0，请显式改成 monkeypatch 构造一条再验。
+    assert body["degraded_items"], (
+        "degraded_items 为空 —— 本测试会空转通过，等于没验。"
+        "若这是预期（系统全绿），请改为 monkeypatch 构造一条降级项再断言。")
     for item in body["degraded_items"]:
         assert item.get("how_to_restore"), f"{item['id']} 缺恢复路径"
 
