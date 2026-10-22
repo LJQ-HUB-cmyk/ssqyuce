@@ -63,6 +63,33 @@ def test_no_assert_or_true_in_test_suite():
           "若该断言确实无法验证，就删掉它并在注释里写明原因。")
 
 
+def test_no_assert_whose_condition_is_a_bare_string():
+    """`assert "某个字符串"` —— 恒真，且往往是**引号冲突后的残骸**。
+
+    ## 真实案例（2026-10-22 抓到）
+
+    ```python
+    assert "$("#cfgApiKey").placeholder" in seg   # ← 想断言子串包含
+    ```
+    双引号冲突，Python 解析成 `assert "$("`（`#` 后全是注释）。
+    **不报语法错误**，`pytest` 显示 PASSED，覆盖率也计入。
+
+    修法不是「删掉」，而是**改成正确的断言目标** —— 本例原本连断言的左值都选错了。
+    """
+    bad = []
+    for f in _test_files():
+        src = f.read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assert) and isinstance(node.test, ast.Constant):
+                if isinstance(node.test.value, str):
+                    bad.append(f"  {f.name}:{node.lineno}  assert {node.test.value!r}")
+    assert not bad, (
+        "以下 assert 的条件是裸字符串（恒真，通常是引号冲突残留）：\n"
+        + "\n".join(bad)
+        + "\n\n检查是不是把 `assert \"X\" in src` 写成了引号冲突形态。")
+
+
 def test_no_assert_with_constant_true_condition():
     """更宽的一种：`assert True` / `assert 1` 这类**字面量恒真**断言。"""
     bad = []
