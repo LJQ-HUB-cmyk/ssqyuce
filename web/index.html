@@ -420,6 +420,21 @@
               <div id="popBody"><div class="note">读取大众偏好度…</div></div>
             </div>
 
+            <!-- 卡 5.5：能力清单（D-19）——
+                 ⚠ 硬约束：`can` 与 `cannot` **必须同屏、同视觉权重、不可折叠**。
+                 若只展示 `can` 不展示 `cannot`，这张卡就从「让用户看到系统做不到什么」
+                 变成「吹牛工具」—— 比不接更糟，因为它有「官方认证」的外观。
+                 所以两栏用同一个容器、同样的高度策略，任何一侧都不加折叠开关。 -->
+            <div class="card" id="capabilitiesCard" style="margin-top:16px">
+              <h2>🧾 能力清单 <span class="tag" id="capTag">加载中…</span></h2>
+              <div class="note" style="margin-bottom:8px">
+                这张卡回答两个问题：<b>系统能做什么</b>、<b>系统做不到什么</b>。
+                右侧「做不到」与左侧「能做到」同样重要 —— 只列前者就是吹牛。
+                全部数值由后端实时读取，不是文案里写死的。
+              </div>
+              <div id="capBody"><div class="note">读取能力清单…</div></div>
+            </div>
+
             <!-- 卡 6：形态规律（组合恒等约束，V12）——
                  这些不是"预测下一期"的规律，而是组合数学恒等约束：
                  和值/跨度/三区/奇偶/连号几乎必然落在这些区间内。

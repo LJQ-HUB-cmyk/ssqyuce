@@ -4696,6 +4696,94 @@ function renderMyCopyReceipt(saved, item) {
 
 // ==================== 加载 ====================
 
+/**
+ * D-19：能力清单卡（`/api/capabilities`）。
+ *
+ * ## 硬约束（不做就是负价值）
+ *
+ * `can` 与 `cannot` **必须同屏、同视觉权重、不可折叠**。
+ * 只展示 `can` 不展示 `cannot`，这张卡就从「让用户看到系统做不到什么」
+ * 变成「吹牛工具」—— 比不接更糟，因为它有「官方认证」的外观。
+ *
+ * ## 为什么两栏用 grid 而不是两个独立卡
+ *
+ * 独立卡可以由任意一方先渲染完、另一方后渲染，中间出现
+ * 「只看到能做到」的窗口期。**同屏 = 同一个容器**，这在结构上消除那个窗口。
+ *
+ * ## 数值来源
+ *
+ * `constants` 段全部由后端实时读取（`engine._single_ticket_ev` 等），
+ * 前端**不写死任何一个数**，只做格式化展示。
+ */
+async function loadCapabilities() {
+  const body = $("#capBody");
+  if (!body) return;
+  try {
+    const d = await api("/api/capabilities");
+    renderCapabilities(d);
+  } catch (err) {
+    // 降级：不清空、不白屏，明确说「这张卡没读到」而不是「系统没有能力」
+    $("#capTag").textContent = "读取失败";
+    body.innerHTML = '<div class="note">能力清单暂时读不到（' +
+      escHtml(err && err.message ? err.message : "网络错误") +
+      '）。这不代表系统不可用，其他卡片仍可正常使用。</div>';
+  }
+}
+
+function renderCapabilities(d) {
+  const can = (d && d.can) || [];
+  const cannot = (d && d.cannot) || [];
+  const cons = (d && d.constants) || {};
+  const degraded = (d && d.degraded_items) || [];
+
+  $("#capTag").textContent = can.length + " 项能做 · " + cannot.length + " 项不能做";
+
+  const canHtml = can.map(function (it) {
+    return '<div class="cap-item">' +
+      '<div class="cap-title">✅ ' + escHtml(it.title || it.id) + '</div>' +
+      (it.honest_bound ? '<div class="cap-bound">边界：' + escHtml(it.honest_bound) + '</div>' : '') +
+      (it.evidence_script ? '<div class="cap-evi">证据：<code>' + escHtml(it.evidence_script) + '</code></div>' : '') +
+      '</div>';
+  }).join("");
+
+  const cannotHtml = cannot.map(function (it) {
+    return '<div class="cap-item cap-item-no">' +
+      '<div class="cap-title">🚫 ' + escHtml(it.title || it.id) + '</div>' +
+      (it.why_not ? '<div class="cap-bound">原因：' + escHtml(it.why_not) + '</div>' : '') +
+      '</div>';
+  }).join("");
+
+  // 常量段：全部实时值，前端口径与后端一致
+  const consRows = [
+    ["单注返奖比", cons.ev_single != null ? (cons.ev_single * 100).toFixed(2) + "%" : "—"],
+    ["六等奖返奖比", cons.ev_sixth != null ? (cons.ev_sixth * 100).toFixed(3) + "%" : "—"],
+    ["显著性水平 α", cons.alpha != null ? String(cons.alpha) : "—"],
+    ["单球检验空间", cons.single != null ? String(cons.single) : "—"],
+    ["交叉检验空间", cons.cross != null ? String(cons.cross) : "—"],
+  ].map(function (r) {
+    return '<span class="cap-kv"><b>' + escHtml(r[0]) + '</b> ' + escHtml(r[1]) + '</span>';
+  }).join("");
+
+  // 降级项：单一判据 = degraded_items 是否为空（不另外判断 full_ev 等，
+  // 避免与后端形成两处判据，见 D-19 纪律「同一事实只允许一处判据」）
+  const degHtml = degraded.length
+    ? '<div class="cap-degraded"><b>当前有 ' + degraded.length + ' 项能力受限：</b>' +
+      degraded.map(function (i) {
+        return '<div class="cap-deg-item">· ' + escHtml(i.reason || i.id) +
+          (i.how_to_restore ? '<br><span class="cap-deg-fix">恢复方式（给运维）：' +
+            escHtml(i.how_to_restore) + '</span>' : '') + '</div>';
+      }).join("") + '</div>'
+    : '';
+
+  body.innerHTML =
+    '<div class="cap-grid">' +
+      '<div class="cap-col"><div class="cap-head">能做到</div>' + canHtml + '</div>' +
+      '<div class="cap-col"><div class="cap-head cap-head-no">做不到</div>' + cannotHtml + '</div>' +
+    '</div>' +
+    '<div class="cap-consts"><b>关键口径（后端实时读取）：</b>' + consRows + '</div>' +
+    degHtml;
+}
+
 async function loadAll() {
   // 强制鉴权且未登录时不再打接口（登录成功后会再次调用本函数）
   if (AUTH.loaded && needsLogin()) return;
@@ -4730,6 +4818,7 @@ async function loadAll() {
     // 而首屏卡是**首屏**的内容，不能等用户点进去才有真值。
     // `loadBlueCoverage()` 内部已吞掉一切异常并切「示例值」标注，这里不必再包 try。
     loadBlueCoverage();
+    loadCapabilities();   // D-19：能力清单（can/cannot 同屏不可折叠）
     if (health) {
       $("#dataStatus").textContent = health.issues + " 期 | " + (health.max_issue || "");
       if (health.version) {
