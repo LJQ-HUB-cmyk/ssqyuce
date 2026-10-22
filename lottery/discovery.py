@@ -1462,11 +1462,34 @@ def discover(draws: Sequence[Dict], start: int = 200, families: Optional[Sequenc
         r["quick"]["p_adjusted"] = a
     # 取 |z| 最大的若干条做完整阶段画像（含全历史阶段检验）
     records.sort(key=lambda r: -abs(r["quick"]["z"]))
-    short = records[:max(1, int(top))]
+    # ---- S1：候选稀释修复（P2 §7.1 S1）----
+    # 旧实现直接 ``records[:top]``，同一族的参数化（如 cold{w=10,k=5/6/8}）会各自
+    # 占据一个名额，把真正**独立**的假设挤出阶段画像。实测（dilution.json）：
+    # 注入 +20% 时 124 条里 BH 显著 50.5 条，但经 top-12 裁剪后阶段 g3 仍为 0
+    # —— 瓶颈在裁剪，不在信号。
+    #
+    # 改法：**按族去重**后取 top-N —— 同一 ``key`` 只保留 ``|z|`` 最强的一条进入
+    # 阶段画像；其余参数档**仍完整保留在 records / all_quick 里**供前端展示，
+    # 只是不再占用阶段画像名额。于是 top-N 覆盖的是 N 个**独立维度**，而不是
+    # N 个同族变体。族内最强那条（原本可能因名额被同族兄弟挤掉）现在一定能进画像。
+    #
+    # **n_tested 绝不因此改变**：去重只是"阶段画像展示哪几条"的取舍，**不是**
+    # 少做检验。FWER 的分母是「扫描了多少个假设」，仍是 ``len(records)``（去重前）。
+    # 这一点写进返回体 note 与 docs/analysis/V15_ASSUMPTION_SPACE.md。
+    _seen_keys: set = set()
+    _dedup: List[Dict] = []
+    for _r in records:
+        _k = _r["filter"]["key"]
+        if _k in _seen_keys:
+            continue
+        _seen_keys.add(_k)
+        _dedup.append(_r)
+    short = _dedup[:max(1, int(top))]
     for r in short:
         flt = r.pop("_flt")
         try:
-            rep = regime_of_filter(draws, flt, start=start, min_era_n=min_era_n)
+            rep = regime_of_filter(draws, flt, start=start, min_era_n=min_era_n,
+                                   n_tested=n_tested, long_term_exclude=int(fast_window))
         except Exception as e:  # noqa: BLE001
             rep = {"status": "error", "label_zh": "阶段检验失败",
                    "reason_zh": f"{type(e).__name__}: {e}"}
@@ -1477,8 +1500,11 @@ def discover(draws: Sequence[Dict], start: int = 200, families: Optional[Sequenc
         r["recent_delta"] = (rep.get("recent") or {}).get("delta")
         r["recent_p_adjusted"] = (rep.get("recent") or {}).get("p_adjusted")
         r["n_sig_eras"] = rep.get("n_sig_eras")
-    for r in records[len(short):]:
-        r.pop("_flt", None)
+    # 去重后 short 不再是 records 的前缀，不能用切片；按 id 排除已处理的条目。
+    _short_ids = {id(r) for r in short}
+    for r in records:
+        if id(r) not in _short_ids:
+            r.pop("_flt", None)
     status_count: Dict[str, int] = {}
     for r in short:
         status_count[r.get("status") or "unknown"] = status_count.get(r.get("status") or "unknown", 0) + 1
