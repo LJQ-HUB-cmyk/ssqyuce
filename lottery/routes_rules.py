@@ -250,6 +250,64 @@ def llm_lab_latest(limit: int = Query(40, ge=1, le=200)):
             "claims": claims, "verdict_counts": counts,
             "verdict_legend": llm_lab.VERDICTS,
             "n_stored": len(data.get("claims") or [])}
+@router.get("/api/ai_hypothesis/schema")
+def ai_hypothesis_schema():
+    """V21 / L1：AI 假设生成器的提示词与结构骨架（供审计与前端说明用）。
+
+    为什么要暴露它：这次重设计的核心是「把 LLM 从挑参数改成提可证伪假设」。
+    把提示词本身公开，任何人都能检查它要求了什么、有没有在诱导 LLM 编造机理。
+    """
+    try:
+        from . import ai_hypothesis as AH
+    except ImportError as e:
+        return JSONResponse({"ok": False, "available": False,
+                             "error": "假设生成模块尚未就绪。该功能在本部署中不可用；其他功能不受影响。",
+                             "detail": str(e)}, status_code=503)
+    return {
+        "ok": True, "available": True,
+        "schema": AH.HYPOTHESIS_SCHEMA,
+        "max_hypotheses": AH.MAX_HYPOTHESES,
+        "prompt": AH.build_hypothesis_prompt(),
+        "note_zh": ("本接口只回显提示词与结构，不调用 LLM、不产出号码。"
+                    "假设需提交到 POST /api/ai_hypothesis/falsify 才会被证伪。"),
+    }
+
+
+@router.post("/api/ai_hypothesis/falsify")
+def ai_hypothesis_falsify(payload: Optional[Dict] = None):
+    """V21 / L1：对一组假设跑**证伪三关**（存在性 / 阶段 / 前向回测）。
+
+    Body: ``{"hypotheses": [{question, test_spec:{key,params}, why, falsifier}, ...]}``
+
+    ## 这不做的事
+
+    * **不调用 LLM** —— 它只负责证伪，不负责生成（生成由调用方/调度器提供）；
+    * **不产出号码** —— 三关全过也只是"值得继续看"，不是"能提高中奖率"；
+    * 失败项**原样保留**并带原因：记录「问过什么、答案是没有」本身就是产出。
+    """
+    try:
+        from . import ai_hypothesis as AH
+    except ImportError as e:
+        return JSONResponse({"ok": False, "error": "假设生成模块尚未就绪。该功能在本部署中不可用；其他功能不受影响。",
+                             "detail": str(e)}, status_code=503)
+    draws = db.load_draws()
+    if not draws:
+        return JSONResponse({"ok": False, "error": "本地还没有开奖数据。请先抓取或导入历史开奖，完成后再试。"},
+                            status_code=400)
+    hs = (payload or {}).get("hypotheses") if isinstance(payload, dict) else None
+    if not isinstance(hs, list) or not hs:
+        return JSONResponse({"ok": False,
+                             "error": "请求体需要一个非空的 hypotheses 数组（每条含 question/test_spec/why/falsifier）。"},
+                            status_code=400)
+    try:
+        res = AH.run_hypotheses(draws, hs)
+    except Exception as e:      # noqa: BLE001
+        return JSONResponse({"ok": False, "error": "证伪过程没能完成。请重试一次；若仍失败，请反馈维护者。",
+                             "detail": f"{type(e).__name__}: {e}"}, status_code=503)
+    res["n_draws"] = len(draws)
+    return res
+
+
 @router.post("/api/llm_lab/register")
 def llm_lab_register():
     """把工坊里 verified 的规律注册进假说库（unmappable/noise 不入库）。"""
