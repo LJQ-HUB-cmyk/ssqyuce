@@ -77,6 +77,27 @@ def test_advisory_not_overridden_by_strict_mode(monkeypatch, mc):
     assert ch.get("ai_role") == "advisor"
 
 
+def test_off_mode_under_strict_is_not_reported_as_picker(monkeypatch, mc):
+    """严格模式下 `mode=off` 不得报 `ai_role=picker`。
+
+    ## 为什么单列一条（V22 上线后被真实读数抓到的矛盾）
+
+    生产实测：`STRICT_MODE=1` 时 V12 的严格模式豁免会把 `llm_can_pick` 强制成 True，
+    而 `llm_output_mode` 仍是 `off`（配置没改）。若 `ai_role` 只看 `llm_can_pick`，
+    就会出现 **「模式 off 却说 AI 参与选号」** 的自相矛盾读数。
+
+    变异点：把 `llm_can_pick and llm_output_mode in ("only","mix")` 的条件
+    退回成只看 `llm_can_pick` —— 变红。
+    """
+    mc({"llm_output_mode": "off", "raw": "stat,ml,uniform,llm"})
+    monkeypatch.setenv("LOTT_STRICT_MODE", "1")
+    ch = M.resolve_channels(force_production=True)
+    assert ch.get("llm_output_mode") == "off"
+    assert ch.get("ai_role") == "off", (
+        f"mode=off 时不得报 picker（严格模式豁免会让 can_pick=True），"
+        f"实际 ai_role={ch.get('ai_role')} can_pick={ch.get('llm_can_pick')}")
+
+
 def test_advisory_role_reported(monkeypatch, mc):
     """`ai_role` 必须是三种之一，且与模式对应。"""
     for mode, want in (("off", "off"), ("advisory", "advisor"),

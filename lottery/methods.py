@@ -623,9 +623,19 @@ def resolve_channels(*, force_production: bool = False) -> Dict:
     )
     if _strict and families["llm"] and not _advisory:
         llm_can_pick = True
-    # AI 在本次出号中的角色（供响应/前端标注；不参与任何判据）
-    ai_role = ("advisor" if _advisory
-               else ("picker" if llm_can_pick else "off"))
+    # AI 在本次出号中的角色（供响应/前端标注；不参与任何判据）。
+    #
+    # ⚠️ 不能只看 llm_can_pick：生产实测 STRICT_MODE=1 时，
+    # V12 的严格模式豁免会把 `llm_can_pick` 强制成 True，而 `llm_output_mode`
+    # 仍是 off（配置没改）。若据此报 ai_role=picker，就会出现
+    # **「模式 off 却说 AI 参与选号」**的自相矛盾读数（V22 上线后被这条实测抓到）。
+    # 正确口径是：只有真正能产出 LLM 注的模式（only/mix）才算 picker。
+    if _advisory:
+        ai_role = "advisor"
+    elif llm_can_pick and llm_output_mode in ("only", "mix"):
+        ai_role = "picker"
+    else:
+        ai_role = "off"
 
     research_arm = {
         "stat": bool(families["stat"]),
