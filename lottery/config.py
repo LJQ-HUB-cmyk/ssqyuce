@@ -139,14 +139,15 @@ BACKUP_DATA_URL = (os.environ.get("LOTT_BACKUP_DATA_URL") or "").strip() or None
 
 # ---------- 版本信息（前端主页 / API / GitHub 说明统一引用） ----------
 
-APP_VERSION = "4.1.0"          # v12 完整版 + L2/L3：V12-01/04/10/11/12/13/14/15/16/21 + 容器 CPU 治理
+APP_VERSION = "4.2.0"          # v15：扩假设空间（S1/S2/S7）—— 只扩问题、不放宽判据
 
 # 单注 2 元（双色球官方单价，固定事实）。
 # 放在 config 而不是某个路由模块里：它被 evaluate / portfolio / rigor 共用，
 # 属于领域常量，不属于任何单个端点域。
 TICKET_PRICE = 2.0
-APP_BUILD = "2026-10-V12"      # 构建标识（V12 交付批次）
+APP_BUILD = "2026-10-V15"      # 构建标识（V15 交付批次）
 APP_MILESTONES = {
+    "V15": {"status": "done", "desc": "扩假设空间，只扩问题、不放宽判据（依据 docs/analysis/P2_STATS_WHY_ZERO.md §7.1 与 docs/analysis/V15_ASSUMPTION_SPACE.md）：①S1 候选稀释修复——discover 阶段画像按族去重（同族只留 |z| 最强一条），top-20 画像内不同族数 13→20，n_tested 分母不变（去重不是减检验次数）；②S2 新增 persistent_effect「长期效应」档——长期档整体 Bonferroni 显著（m=n_tested）∧ 近 K=3 段方向一致，不要求每段显著，把 H0 下 P≈3e-5 的断崖改成斜坡；USABLE_STATUSES 仍为 ('persistent',) 一字未动，且必须同样过 validated+prereg_ok+source!=llm；关键修正是长期检验须剔除用于挑选候选的近 fast_window 段（否则纯随机误报率 0.20，修正后 0.0~0.03）；③S7 新增 order_pos/number_bias/sum_dist 三族——order（开奖顺序）字段此前被 discovery 读取 0 次，现可检位置偏置（+35% 注入检出 0.783，此前恒 0）；三族走 stat_fn 分布检验通道，n_tested 124→134。红线 N1–N7 全部未动：ALPHA=0.05、ERA_FAMILY_M=32+locked、累计口径 Bonferroni、usable 三条件、as-of 语义、只降不升、≥4红/≥5红不可检验。双侧验收：纯随机 persistent_effect 族级误报 0.03/200（≤FWER 0.05）、number_bias 单号 +10% 检出 0.0（正确——需 3.7 万期，诚实结论）。测试 891 → 1680 passed（首次全量零失败；含引擎指纹口径改为固定 3500 期，真值锁不再每期开奖都红）。"},
     "V12": {"status": "done", "desc": "规律「窄/假/半」三重修复（依据 docs/analysis/LEAD_VERDICT.md）：①V12-01 修复 30/124 档从未被检验——V11 新增 8 个形态族用 history[-w:] 切片，但 asof_scan 传入 ScanContext（dict 子类）触发 KeyError 被 except Exception 静默吞成空集，再被 sd<=0 二次跳过；给 ScanContext 加切片支持后 n_tested 由 94 → 124、E[FP] 4.70 → 6.20，8 族全部进入搜索（真实数据 best_quick_p_adjusted=0.0804，与预测逐位吻合，仍 >0.05 故「修好≠找到」）。②V12-21 补集反转：hits(S)+hits(Sᶜ)≡6 ⇒ delta_S+delta_Sᶜ≡0，负效应本就是补集的正效应；原 resolve_registry 把 delta<0 判 rejected 直接丢弃，等于销毁一半信号；现在原假说仍记 rejected（诚实保留）并同时登记补集候选（仍需 A/B+前置注册三关门），complement_of 标记来源、n_tested_delta 恒 0 保证 FWER 不变。③V12-04 拆除跨层求和：patterns_runtime 与 rule_lifecycle 两处 usable=long+phase 改为 by_layer 分列 + all_tiers_sum 显式命名，避免首屏「N 条可用其中 0 条有预测力」。④V12-12 形态通过率全枚举精确化：span 由手写 0.95 修正为 0.999853、zones 0.90→0.799152、sum 0.90→0.906411、consec 0.99→0.997042、parity 由 2 万次抽样 0.8257→精确 0.825159；生产通过率锁定 68.2992%（结构锁 + 真值锁 + 反向用例）。测试 858 → 891 passed。"},
     "M1": {"status": "done",    "desc": "前端 Tab 工作台 + 规律库扩容 29 条 + 自动挖掘管道 + 任务系统"},
     "M2": {"status": "done",    "desc": "GBDT/RF 概率模型 + 滚动 Brier 加权融合 + 概率校准 + 蓝球独立投票 + ML walk-forward 评估"},
