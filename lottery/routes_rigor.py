@@ -220,3 +220,78 @@ def rigor_signal(strategy: str = Query("hot"), window: int = Query(100, ge=5, le
     })
     return out
 
+
+
+@router.get("/api/rigor/walk_forward")
+def rigor_walk_forward(method: str = Query("stat:freq"),
+                       color: str = Query("blue"),
+                       n_tickets: int = Query(5, ge=1, le=50),
+                       start: int = Query(0, ge=0),
+                       refresh: int = Query(0, ge=0, le=1)):
+    """V23 / L3：**前向回测**的公开读数——「这套系统到底能不能向前预测」。
+
+    ## 为什么要把它放到首屏
+
+    docs/analysis/V19_AI_REDESIGN.md §4 层 3：把「我们试过了，数据说没有」
+    变成可复核的事实，而不是让用户对着一个「AI 预测」的空壳猜。
+
+    现有 `/api/rigor/signal` 做的是「策略历史表现能否与随机区分」；
+    本端点做的是**更朴素也更硬**的一件事：**在时间上向前预测，命中率是否高于随机**。
+
+    ## 判据（与 V20 / L0 同一套，不另立标准）
+
+    * 多种子（`WF_SEEDS`）各跑一遍，取 z **中位数**；
+    * 中位数 > `WF_Z_MIN`（1.0）才叫「过线」；
+    * 单次 z 过线但多种子不稳健 → 明确判否并说明原因。
+
+    ## 诚实边界（写进返回体，前端必须显示）
+
+    过线 ≠ 有优势。这只是「不比随机差且有一点正向迹象」的最低诚信线。
+
+    ``start=0`` 表示按数据长度自适应（留出至少 400 期做前向评估）。
+    """
+    method = (method or "").strip()
+    color = (color or "blue").strip().lower()
+    if color not in ("blue", "red"):
+        return JSONResponse({"ok": False,
+                             "error": ("color 参数取值不对，只接受 blue 或 red。"
+                                       "请把请求里的 color 改成 blue（蓝球）或 red（红球）后重试。")},
+                            status_code=400)
+    draws = db.load_draws()
+    if not draws:
+        return JSONResponse({"ok": False,
+                             "error": "本地还没有开奖数据。请先抓取或导入历史开奖，完成后再试。"},
+                            status_code=400)
+    try:
+        from . import walk_forward_gate as WFG
+    except ImportError as e:
+        return JSONResponse({"ok": False, "available": False,
+                             "error": "前向回测模块尚未就绪。该功能在本部署中不可用；其他功能不受影响。",
+                             "detail": str(e)}, status_code=503)
+
+    _start = int(start) or max(300, min(2917, len(draws) - 400))
+    try:
+        res = WFG.walk_forward_check(draws, method, n_tickets=int(n_tickets),
+                                     start=_start, color=color)
+    except Exception as e:      # noqa: BLE001
+        return JSONResponse({"ok": False, "error": "前向回测没能完成。请重试一次；若仍失败，请反馈维护者。",
+                             "detail": f"{type(e).__name__}: {e}"}, status_code=503)
+
+    res["n_draws"] = len(draws)
+    res["z_min"] = WFG.WF_Z_MIN
+    res["seeds"] = list(WFG.WF_SEEDS)
+    # 前端必须能直接渲染一句诚实结论，而不是自己从数字里猜。
+    if not res.get("replayable", True):
+        res["headline_zh"] = "该方法不可历史回放 —— 无法提供前向预测证据。"
+    elif res.get("passed"):
+        res["headline_zh"] = (
+            "前向回测过线（z 中位数 {:.2f}）。注意：这只是最低诚信线，"
+            "不代表能提高中奖率。".format(float(res.get("z_median") or 0)))
+    else:
+        res["headline_zh"] = (
+            "未检出可预测性（z 中位数 {}）。本系统提供的是结构分析，不是中奖保证。"
+            .format(res.get("z_median")))
+    res["honesty_zh"] = (
+        "双色球为独立随机事件。前向回测是对「能不能向前预测」的检验；"
+        "不过线是**最正常**的结果，它说明系统没有在假装能预测。")
+    return res

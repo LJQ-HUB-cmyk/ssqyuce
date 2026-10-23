@@ -4575,6 +4575,43 @@ async function renderRigorSignal(strategy, window) {
   }
 }
 
+// V23 / L3：前向回测读数——把「我们试过了，数据说没有」变成可复核的事实。
+// 它必须显示**结论**，而不是只丢一堆数字让人自己猜。
+async function loadWalkForward() {
+  const tag = $("#wfTag"), body = $("#wfBody");
+  if (!body) return;
+  try {
+    const r = await api("/api/rigor/walk_forward?method=stat:freq&color=blue");
+    const z = (r.z_median === null || r.z_median === undefined) ? "—" : Number(r.z_median).toFixed(2);
+    const passed = !!r.passed;
+    tag.textContent = passed ? "过线" : "未过线";
+    tag.style.color = passed ? "var(--green)" : "var(--muted)";
+    const rows = [
+      ["命中率", r.hit_rate === null || r.hit_rate === undefined
+        ? "—" : (r.color === "red" ? Number(r.hit_rate).toFixed(3) + " 个/期"
+                                   : (Number(r.hit_rate) * 100).toFixed(2) + "%")],
+      ["随机基线", r.baseline === null || r.baseline === undefined
+        ? "—" : (r.color === "red" ? Number(r.baseline).toFixed(3) + " 个/期"
+                                   : (Number(r.baseline) * 100).toFixed(2) + "%")],
+      ["z（多种子中位数）", z],
+      ["门槛", String(r.z_min)],
+      ["评估注数", String(r.n || 0)],
+      ["各次 z", (r.z_by_seed || []).join(" / ") || "—"],
+    ];
+    const kv = rows.map(([k, v]) =>
+      '<div class="kv"><span class="muted">' + escHtml(k) + '</span><b>' +
+      escHtml(v) + '</b></div>').join("");
+    const headline = '<div style="margin:8px 0;font-weight:600;color:' +
+      (passed ? "var(--green)" : "var(--muted)") + '">' + escHtml(r.headline_zh || "") + '</div>';
+    const honesty = r.honesty_zh
+      ? '<div class="muted" style="font-size:12px;margin-top:6px">' + escHtml(r.honesty_zh) + '</div>' : "";
+    body.innerHTML = headline + kv + honesty;
+  } catch (e) {
+    tag.textContent = "不可用";
+    body.innerHTML = '<div class="muted">' + escHtml(e.message || "加载失败") + '</div>';
+  }
+}
+
 async function loadRigor() {
   const card = $("#rigorCard");
   try {
@@ -4833,7 +4870,7 @@ async function loadAll() {
       if (health.version) {
         const ver = "v" + health.version;
         const vb = $("#verBadge"), vt = $("#verText");
-        if (vb) { vb.textContent = ver; vb.title = "系统版本 " + ver + " · v4.7 V22"; }
+        if (vb) { vb.textContent = ver; vb.title = "系统版本 " + ver + " · v4.8 V23"; }
         if (vt) vt.textContent = ver;
       }
     }
@@ -4850,6 +4887,7 @@ async function loadAll() {
       renderTrackRecordError(e);
     }
     loadRigor();   // V4：随机性检验卡（依赖缺失时自行降级，不影响其它区块）
+  loadWalkForward();  // V23：前向回测卡（同样自降级；失败不阻塞首屏）
     initMlStatus();
     try {
       const llmRep = await api("/api/eval/llm/latest");
