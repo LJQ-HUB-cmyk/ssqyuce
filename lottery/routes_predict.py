@@ -448,6 +448,15 @@ def predict(use_llm: Optional[bool] = None,
     res.setdefault("data_basis", _exp)
     # 让前端能明确解释「为什么勾了使用大模型却没有 LLM 注」
     res["decision_channel_disabled"] = _decision_disabled
+    # V22 / L2：AI 的**角色**必须随响应回去（off / advisor / picker）。
+    # 用户有权知道这批票里 AI 到底做了什么：解释了结果，还是真的选了号。
+    # 只写"用了 AI"是不够的 —— 那会把"AI 解释了统计结果"误读成"AI 选了号"。
+    try:
+        _ch_now = METH.resolve_channels()
+        res["ai_role"] = _ch_now.get("ai_role") or "off"
+        res["llm_output_mode"] = _ch_now.get("llm_output_mode")
+    except Exception:      # noqa: BLE001
+        res["ai_role"] = "off"
     res["strict_mode"] = bool(getattr(config, "STRICT_MODE", False))
     if _quota_note:
         _strict_notes.append(_quota_note)

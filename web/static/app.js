@@ -890,7 +890,16 @@ function renderPredMeta(res) {
       g === "strategy" ? "规律为 0 条" : g).join(" / ");
     items.push('<span class="pm-item" style="color:var(--gold);font-weight:600">' +
       '📊 口径：统计模式（严格模式未出号' + (_g ? "：" + escHtml(_g) : "") + '）</span>');
-  } else if (res.source_mode === "strict") {
+  }
+  // V22 / L2：AI 角色必须显示 —— 「AI 解释了结果」与「AI 选了号」是两件事。
+  if (res.ai_role === "advisor") {
+    items.push('<span class="pm-item" style="color:var(--muted)">🤖 AI 角色：<b>仅解释</b>' +
+      '（未参与选号；模式 advisory）</span>');
+  } else if (res.ai_role === "picker") {
+    items.push('<span class="pm-item">🤖 AI 角色：<b>参与选号</b>（模式 ' +
+      escHtml(res.llm_output_mode || "llm") + '）</span>');
+  }
+  if (res.source_mode === "strict") {
     // V18：必须交代**凭据类型**——L1（统计规律，更强）与 L2（结构约束，可复核）
     // 是两种不同强度的证据，只写"严格模式"会让用户以为有统计规律支撑。
     const _basis = res.evidence_basis;
@@ -4824,7 +4833,7 @@ async function loadAll() {
       if (health.version) {
         const ver = "v" + health.version;
         const vb = $("#verBadge"), vt = $("#verText");
-        if (vb) { vb.textContent = ver; vb.title = "系统版本 " + ver + " · v4.6 V21"; }
+        if (vb) { vb.textContent = ver; vb.title = "系统版本 " + ver + " · v4.7 V22"; }
         if (vt) vt.textContent = ver;
       }
     }

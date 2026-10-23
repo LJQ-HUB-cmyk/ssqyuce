@@ -365,7 +365,22 @@ DEFAULT_MODE = "production"
 DEFAULT_LLM_OUTPUT_MODE = "off"
 
 # LLM 出号模式合法取值
-LLM_OUTPUT_MODES = ("off", "only", "mix")
+#
+# ## V22 / L2 新增 `advisory`：AI 只做解释，不参与选号
+#
+# 依据 docs/analysis/V19_AI_REDESIGN.md §4 层 2 与 §1.2 实测：LLM 票与统计票的
+# 历史战绩无统计差异（45 注：llm 红球 1.265 / 统计 1.182，基线 1.091），
+# 而 LLM 参与出号要付 503 风险、延迟与成本。既然选号无增量，
+# 就让 AI 去做它**真正擅长且可感**的事：解释统计结果、复盘开奖归因。
+#
+#   off      → 完全不使用 LLM（默认）
+#   advisory → **不参与选号**（llm_can_pick=False），但允许被调用来做
+#              「解释 / 复盘」；响应里会标注 ai_role="advisor"
+#   only / mix → 保留原有出号语义（向后兼容，未删除）
+#
+# **不删除 only/mix** 的理由：它们是已交付的行为，可能有人依赖；
+# L2 只是新增一个更诚实的模式并把它设为推荐值，而不是强行改变既有语义。
+LLM_OUTPUT_MODES = ("off", "advisory", "only", "mix")
 
 
 def _methods_config_file():
@@ -598,12 +613,19 @@ def resolve_channels(*, force_production: bool = False) -> Dict:
     # （缺配置则拒绝/降级，Web 路径走 LLMChannelError → 503 明确报错，
     # 仍符合"LLM 不可用则不出号"的严格语义）。
     _strict = os.environ.get("LOTT_STRICT_MODE", "0") == "1"
+    # V22 / L2：`advisory` 模式**永不出号** —— 无论是否严格模式、是否启用 llm 族。
+    # 这是该模式的全部意义：AI 做解释，不做选号。若它在这里仍能 pick，
+    # "AI 不参与选号"就只是文案而不是事实。
+    _advisory = (llm_output_mode == "advisory")
     llm_can_pick = bool(
-        families["llm"] and llm_output_mode != "off" and mode == "production"
-        and not decision_disabled
+        families["llm"] and llm_output_mode not in ("off", "advisory")
+        and mode == "production" and not decision_disabled
     )
-    if _strict and families["llm"]:
+    if _strict and families["llm"] and not _advisory:
         llm_can_pick = True
+    # AI 在本次出号中的角色（供响应/前端标注；不参与任何判据）
+    ai_role = ("advisor" if _advisory
+               else ("picker" if llm_can_pick else "off"))
 
     research_arm = {
         "stat": bool(families["stat"]),
@@ -617,6 +639,9 @@ def resolve_channels(*, force_production: bool = False) -> Dict:
         "families": families,
         "llm_output_mode": llm_output_mode,
         "llm_can_pick": llm_can_pick,
+        # V22：AI 的**角色**（off / advisor / picker）。前端必须能显示它，
+        # 否则用户会以为"AI 参与了选号"而其实只是解释了结果。
+        "ai_role": ai_role,
         "research_arm": research_arm,
         # ---- V10-11 新增（schema 只增不改）----
         "decision_disabled": decision_disabled,

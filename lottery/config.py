@@ -139,14 +139,15 @@ BACKUP_DATA_URL = (os.environ.get("LOTT_BACKUP_DATA_URL") or "").strip() or None
 
 # ---------- 版本信息（前端主页 / API / GitHub 说明统一引用） ----------
 
-APP_VERSION = "4.6.0"          # v21：L1 AI 假设生成器（提可证伪假设 + 自动证伪三关）
+APP_VERSION = "4.7.0"          # v22：L2 AI 角色分离（advisory 只解释、不参与选号）
 
 # 单注 2 元（双色球官方单价，固定事实）。
 # 放在 config 而不是某个路由模块里：它被 evaluate / portfolio / rigor 共用，
 # 属于领域常量，不属于任何单个端点域。
 TICKET_PRICE = 2.0
-APP_BUILD = "2026-10-V21"      # 构建标识（V21 交付批次）
+APP_BUILD = "2026-10-V22"      # 构建标识（V22 交付批次）
 APP_MILESTONES = {
+    "V22": {"status": "done", "desc": "L2 AI 角色分离 —— 新增 advisory 模式，AI 只解释、不参与选号（AI 重设计第三层，依据 docs/analysis/V19_AI_REDESIGN.md §1.2/§4 层2）：生产实测 45 注匹配样本，llm 票红球 1.265 / stat 票 1.182（基线 1.091）、蓝球 LLM 0.035 vs 统计 0.073（基线 0.0625），差异全在 1 个标准差内 —— LLM 选号无增量，却要付 503 风险、延迟与 token 成本。改动：LLM_OUTPUT_MODES 由 (off, only, mix) 扩为 (off, **advisory**, only, mix)；advisory 模式下 llm_can_pick 恒为 False（不产号），且**严格模式也不得覆盖**（历史严格模式会强制 llm_can_pick=True，若不排除 advisory，该承诺会在严格部署下被静默推翻）；新增 ai_role ∈ {off, advisor, picker} 并随 resolve_channels 快照与预测响应返回，前端元信息显示「🤖 AI 角色：仅解释（未参与选号）」或「参与选号」。only/mix 语义**一字未改**（向后兼容，不删既有行为）；llm 族关闭时 advisory 也回落 off（沿用拒绝列表优先纪律）。测试 1721 → 1728。"},
     "V21": {"status": "done", "desc": "L1 AI 假设生成器 —— 把 LLM 从「挑参数」改成「提可证伪假设」（AI 重设计第二层，依据 docs/analysis/V19_AI_REDESIGN.md §1.1/§4 层1）：旧 llm_lab 要求 LLM 输出 filters:[{key,params}]，输出空间=134 档排列组合，是搜索不是推理（枚举一遍只要 12.8~17s，比问 LLM 快两个数量级），且 data/llm_claims.json 的 claims/runs 长期为 0（从未产出）。新增 lottery/ai_hypothesis.py：LLM 输出改为 question+test_spec+why+falsifier，test_spec.key 必须取 FAMILIES 已实现族、params 必须完全匹配已声明档位（自造参数一律拒——无实现则无从验证），无 falsifier 一律拒（不可证伪不是科学假设）。自动证伪三关：①存在性 discover 能跑出该族；②阶段 regime 非 flipped/error；③前向回测（复用 V20 的 walk_forward_gate，起点按数据长度自适应，避免短样本 n=0 退化）。前向回测对象是方法通道 stat:freq 而非维度本身，返回值强制带 wf_caveat_zh 说明此口径。新增端点 GET /api/ai_hypothesis/schema（公开提示词供审计）与 POST /api/ai_hypothesis/falsify（只证伪、不调 LLM、不产号码）。失败项原样保留并带原因——记录「问过什么、答案是没有」本身就是产出。生产实测 4 条真实假设全部三关跑通、结论 walk_forward_rejected。测试 1708 → 1721。"},
     "V20": {"status": "done", "desc": "L0 前向回测判据门（AI 重设计第一层，依据 docs/analysis/V19_AI_REDESIGN.md §2.3）：修「置换检验显著 ≠ 可预测」这一方法论缺口。实测证据：ml_blue 在 B=200 下 p=0.010、换种子 0/7 分别 0.010/0.005（看起来稳定显著），但同一数据做严格前向回测命中率 5.00% vs 基线 6.25%、z=-1.26 —— 判据与前向回测直接矛盾。新增 lottery/walk_forward_gate.py：①walk_forward_check 复用 battle.replay_method 的 as-of 纪律，给出相对随机基线的 z；②**多种子稳健性**（WF_SEEDS=[42,7,99]，要求 z 中位数过线）—— 实测 stat:freq 红球单次 z=1.74 但三种子 1.74/0.83/-0.33，换种子就翻转，必须判否；③combine_gates 双重门槛：置换 p<α 且前向回测 z>1.0 才算 signal_found，任一不过降 monitor，不可回放（llm）标 unverifiable 且不伪造 z。接入 ml_model.diagnose_ml_channels 顶层：通道级 tier/trusted 保持原语义（t21 契约），只在顶层加 all_dual_pass 约束。口径坑已修三次：per_issue.blue_hit 是 round(mean) 不能累计（否则 z=-14 荒谬结论）、红球是每期平均命中数不能套百分号、判据是「中位数」不是「单次 z」。测试 1697 → 1708。"},
     "V18": {"status": "done", "desc": "严格模式换门控依据（依据 docs/analysis/V17_STRICT_MODE_EVALUATION.md，用户 2026-10-23 批准）：严格模式此前硬性要求 usable_replayable>0（L1 统计规律），而 L1 在 3515 期上需 +28% 真实效应才可达（n=150、m_cum≈3000 ⇒ z=4.31），真实数据最强仅 +5.0%（差 5.6 倍，换算需 31 年），再叠加 FROZEN_ISSUES=150 冻结期 ⇒ 严格模式永久不出号。改法：门控依据改为「L1 有则用 L1（更强）；无则用 L2 结构约束兜底（可逐注复核）」，并在响应/前端如实标注 evidence_basis ∈ {L1_statistical, L2_structural}。L2 是组合恒等约束（和值/跨度/三区/奇偶/连号），与 C(33,6)=1,107,568 理论枚举一致，任何人拿发过的票重跑 check_shape() 即可验证——比统计显著更硬，且不需要样本量。可行性实测：L2 约束在 3518 期真实数据上 7 个必需字段无一缺失（violation=0）；issue=2026122 那 5 注降级票 5/5 全部满足 L2 约束，即凭据早已存在、只是门控不认。红线未动：ALPHA=0.05、ERA_FAMILY_M=32+locked、FROZEN_ISSUES=150、USABLE_STATUSES、累计口径。口径纪律：L1 与 L2 是两种不同计数，分列展示禁止相加，不得把 L2 叫做「可用规律」，L2 通过不代表存在可预测下期的规律、不提高中奖概率。测试 1689 → 1697。"},
