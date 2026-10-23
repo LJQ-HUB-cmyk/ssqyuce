@@ -1091,11 +1091,65 @@ def diagnose_ml_channels(draws: List[Dict], colors=("red", "blue"), **kwargs) ->
     advisory = [str(v.get("channel")) for v in vals if v.get("advisory_only")]
     out["channel_tiers"] = {str(v.get("channel")): v.get("tier") for v in vals}
     out["channel_trusted"] = {str(v.get("channel")): bool(v.get("trusted")) for v in vals}
+    # ---- V20 / L0：加一道**前向回测**关（依据 docs/analysis/V19_AI_REDESIGN.md §2.3）----
+    #
+    # 为什么单靠置换检验不够：2026-10-23 实测 ml_blue 在 B=200 下 p=0.010、
+    # 换两个种子都显著（0.010 / 0.005），看起来"稳"；但同一数据做严格前向回测，
+    # 命中率 5.00% 低于基线 6.25%（z=-1.26）。**置换检验显著 ≠ 可预测。**
+    #
+    # 因此：通道要称为 signal_found，必须同时过
+    #   ① 置换检验 p < α（diagnose_ml_channel 已算）
+    #   ② 前向回测多种子 z 中位数 > WF_Z_MIN
+    # 任一条不过 → monitor。这就是本模块被 `walk_forward_gate.combine_gates` 覆盖的位置。
+    try:
+        from . import walk_forward_gate as _WFG
+        _wf = _WFG.walk_forward_check(draws, "stat:freq",
+                                      n_tickets=5, start=kwargs.get("wf_start", 2917),
+                                      color="blue")
+    except Exception as e:                     # noqa: BLE001
+        _wf = {"ok": False, "reason_zh": f"前向回测不可用（{type(e).__name__}: {e}）",
+               "replayable": None, "z": None, "passed": False}
+    out["walk_forward"] = _wf
+    _alpha_gate = float(kwargs.get("alpha") or 0.05)
+    # ⚠️ 口径纪律（V10-08 / D-2 既有契约，不得破坏）：
+    #   **通道级**的 `tier`/`trusted` 是「置换检验本身检出了什么」，必须原样保留
+    #   （tests/test_v10_ml_calibration.py::test_t21 守着：ml_red=monitor +
+    #   ml_blue=signal_found 时 channel_tiers 必须照实反映）。
+    #   前向回测这一关只作用在**顶层**判定上，并且单独暴露为 `dual_gate`。
+    #
+    #   第一版我直接改了通道的 tier/trusted，把 t21 弄红了 —— 那是越权修改
+    #   「置换检验读数的语义」，而它是有独立含义的。
+    _dual: Dict[str, Dict] = {}
+    for c_name, c_val in out["channels"].items():
+        # 兼容：通道结果里没有 `p_value` 时（内置替身/旧调用方），
+        # 沿用「通道自己的 tier」作为置换检验那一关的结论 ——
+        # 否则会把"没带 p 值"误判成"未做置换检验"，把原本 signal 的通道全降级，
+        # 那是口径错位而不是收紧（V20 实测踩到，t21 变红）。
+        _perm = c_val.get("p_value")
+        if _perm is None and c_val.get("tier") == "signal_found":
+            _perm = 0.0          # 通道已判 signal，等价于置换检验显著
+        _g = _WFG.combine_gates(_perm, _wf, alpha=_alpha_gate)
+        c_val["dual_gate"] = _g
+        c_val["tier_permutation_only"] = c_val.get("tier")   # 便于前端对照
+        _dual[c_name] = _g
+    vals = list(out["channels"].values())
+    tiers = {str(v.get("tier")) for v in vals}
+    # 顶层是否「全部通道都过了双重门槛」——只有这时才可能是 signal_found
+    out["all_dual_pass"] = bool(_dual) and all(
+        g.get("tier") == "signal_found" for g in _dual.values())
+
     # 最保守：任一通道不可信 → 整体不可信
     out["trusted"] = bool(vals) and all(bool(v.get("trusted")) for v in vals)
-    # 最保守：任一通道 monitor（或缺失）→ 顶层 monitor；只有全部 signal 才 signal
+    # 最保守：任一通道 monitor（或缺失）→ 顶层 monitor；只有全部 signal 才 signal。
+    # V20：**再加一道**——全部通道的置换检验都显著还不够，前向回测也必须全过。
+    # 这就是「双重门槛」在顶层的落点（ml_blue 实测：置换 p=0.010 但前向回测 z=-0.06）。
     out["tier"] = ("signal_found"
-                   if (vals and tiers == {"signal_found"}) else "monitor")
+                   if (vals and tiers == {"signal_found"} and out["all_dual_pass"])
+                   else "monitor")
+    if (vals and tiers == {"signal_found"} and not out["all_dual_pass"]):
+        out["dual_gate_warning_zh"] = (
+            "置换检验全部通道显著，但**前向回测未过**，故顶层降为 monitor。"
+            "依据 docs/analysis/V19_AI_REDESIGN.md §2.3：置换检验显著 ≠ 可预测。")
     out["n_channels"] = len(vals)
     out["n_channels_trusted"] = int(sum(1 for v in vals if v.get("trusted")))
     out["advisory_only"] = bool(advisory)

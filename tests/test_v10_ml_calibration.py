@@ -805,9 +805,22 @@ def test_t21_top_level_tier_takes_most_conservative(monkeypatch):
                 "trusted": True, "importance_significant": True,
                 "tier": "signal_found", "advisory_only": False, "n_null": 200}
 
+    # V20（L0）：顶层 tier 现在要求**双重门槛**（置换检验 + 前向回测）。
+    # 这条用例测的是「置换检验层的保守性」，因此必须把前向回测那一关固定为"通过"，
+    # 否则合成小样本上前向回测必不过，断言就变成了在测另一件事。
+    def _wf_pass(*a, **kw):
+        return {"ok": True, "replayable": True, "z": 3.0, "z_median": 3.0,
+                "robust": True, "passed": True, "reason_zh": "（测试替身：前向回测通过）"}
+
     monkeypatch.setattr(ml_model, "diagnose_ml_channel", _both_signal)
+    monkeypatch.setattr(ml_model, "_wf_for_diagnose", _wf_pass, raising=False)
+    # 直接替换 walk_forward_check 的调用点（模块内 import，用 sys.modules 打桩更稳）
+    import lottery.walk_forward_gate as _wfg
+    monkeypatch.setattr(_wfg, "walk_forward_check", _wf_pass)
     r2 = ml_model.diagnose_ml_channels(draws, colors=("red", "blue"))
-    assert r2["trusted"] is True and r2["tier"] == "signal_found"
+    assert r2["trusted"] is True and r2["tier"] == "signal_found", (
+        f"两道门都过时顶层应为 signal_found，实际 tier={r2.get('tier')} "
+        f"all_dual_pass={r2.get('all_dual_pass')}")
 
     # 两通道都不可信 → monitor / trusted=False
     def _both_monitor(draws, *, color="red", **kw):
