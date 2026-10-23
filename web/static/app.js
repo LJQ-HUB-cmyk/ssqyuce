@@ -891,7 +891,19 @@ function renderPredMeta(res) {
     items.push('<span class="pm-item" style="color:var(--gold);font-weight:600">' +
       '📊 口径：统计模式（严格模式未出号' + (_g ? "：" + escHtml(_g) : "") + '）</span>');
   } else if (res.source_mode === "strict") {
-    items.push('<span class="pm-item" style="color:var(--green)">✅ 口径：严格模式</span>');
+    // V18：必须交代**凭据类型**——L1（统计规律，更强）与 L2（结构约束，可复核）
+    // 是两种不同强度的证据，只写"严格模式"会让用户以为有统计规律支撑。
+    const _basis = res.evidence_basis;
+    const _bTxt = _basis === "L1_statistical"
+      ? "统计规律（可回放）"
+      : _basis === "L2_structural" ? "结构约束（可逐注复核）"
+      : _basis === "none" ? "无可复核凭据" : "未知";
+    items.push('<span class="pm-item" style="color:var(--green)">✅ 口径：严格模式 · 依据：' +
+      escHtml(_bTxt) + '</span>');
+    if (res.evidence_note_zh) {
+      items.push('<span class="pm-item" style="color:var(--muted);font-size:12px">' +
+        escHtml(res.evidence_note_zh) + '</span>');
+    }
   }
   if (basis.basis_issue) {
     items.push('<span class="pm-item">📥 数据基准 <b>' + escHtml(basis.basis_issue) + '</b>（' +
@@ -4812,7 +4824,7 @@ async function loadAll() {
       if (health.version) {
         const ver = "v" + health.version;
         const vb = $("#verBadge"), vt = $("#verText");
-        if (vb) { vb.textContent = ver; vb.title = "系统版本 " + ver + " · v4.3 V16"; }
+        if (vb) { vb.textContent = ver; vb.title = "系统版本 " + ver + " · v4.4 V18"; }
         if (vt) vt.textContent = ver;
       }
     }

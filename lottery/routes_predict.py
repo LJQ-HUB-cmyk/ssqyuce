@@ -142,11 +142,27 @@ def strict_mode_gates(draws, issue):
               f"**不代表**存在可预测下期的规律。请确认历史数据齐全，"
               f"或关闭严格模式（LOTT_STRICT_MODE=0）。")))
 
-    # ①-b P3：可回放的可用规律必须 > 0
+    # ①-b V18：**L1 优先，L2 兜底**（择一，不是并列否决）
     #
-    # 注意这里**不**用 counts.usable：那个字段的语义历史上被"L1 检出"与
-    # "阶段可用"混用过（见 patterns_runtime 的注释）。usable_replayable 是
-    # 语义单一的计数：**既可用、又可被确定性代码重放**。
+    # ## 为什么改（依据 docs/analysis/V17_STRICT_MODE_EVALUATION.md）
+    #
+    # 旧实现在这里**硬性要求** `usable_replayable > 0`，于是严格模式永远哑火：
+    # L1 要 +28% 的真实效应才可达（n=150 期、m_cum≈3000 ⇒ z=4.31），
+    # 而真实数据最强只有 +5.0% ⇒ 差 5.6 倍，换算需 31 年。
+    # 再叠加 FROZEN_ISSUES=150（≈1 年）的冻结期 —— 等于"永久不出号"。
+    #
+    # 但严格模式想表达的其实是「**没有可复核的真凭实据就不出号**」，
+    # 而"可复核"不等于"统计显著"：L2 组合恒等约束（和值/跨度/三区/奇偶/连号）
+    # 与 C(33,6)=1,107,568 的理论枚举一致，任何人拿发过的票重跑 check_shape()
+    # 就能验证 —— 这比统计显著**更硬**（恒等式 vs 概率陈述），且不需要样本量。
+    #
+    # 所以：**能用 L1 就用 L1（更强）；L1 为空才用 L2 兜底（稍弱但可复核）**，
+    # 并把走的是哪一条**如实标进响应**（`evidence_basis`）。
+    #
+    # 口径纪律（V12-04 强制，**不得违反**）：
+    #   * `usable_replayable` 与「L2 通过」是**两种不同的计数**，分列展示、**禁止相加**；
+    #   * 不得把 L2 叫做「可用规律」—— 它只是「结构合规」；
+    #   * L2 通过**不意味着**存在可预测下期的规律。
     _n_replayable = None
     try:
         from . import patterns_runtime as _PRT
@@ -155,14 +171,20 @@ def strict_mode_gates(draws, issue):
             _n_replayable = int((_snap.get("counts") or {}).get("usable_replayable") or 0)
     except Exception:      # noqa: BLE001
         _n_replayable = None
-    if _n_replayable is not None and _n_replayable <= 0:
+
+    # 决定依据：L1 有可回放规律 → 用 L1；否则若 L2 可用 → 用 L2；两者都无 → 拒绝
+    _evidence_basis = "none"
+    if _n_replayable is not None and _n_replayable > 0:
+        _evidence_basis = "L1_statistical"
+    elif _ok_ctx:
+        _evidence_basis = "L2_structural"
+    else:
         _errs.append(
-            ("replayable_rules",
-             ("严格模式下不出号：**通过前置注册且可被确定性代码重放**的规律为 0 条。"
-              "严格模式的含义是「没有可复核的真凭实据就不出号」，"
-              "而不可回放的规律无法被独立验证，不能作为依据。"
-              "这是**正确结果**不是故障 —— 3516 期真实数据上尚未检出可复现规律。"
-              "如需出号请关闭严格模式（LOTT_STRICT_MODE=0）走纯统计通道。")))
+            ("no_evidence_basis",
+             ("严格模式下不出号：**既没有可回放的可用规律（L1），"
+              "L2 结构约束也不可用**。严格模式的含义是「没有可复核的真凭实据就不出号」，"
+              "L2 是最后的兜底凭据，它都不可用说明历史数据不足或异常。"
+              "请确认历史数据齐全，或关闭严格模式（LOTT_STRICT_MODE=0）走纯统计通道。")))
 
     # ② LLM 通道必须可用
     _ch = _METH.resolve_channels()
@@ -174,6 +196,51 @@ def strict_mode_gates(draws, issue):
               "是否可用。")))
 
     return _errs
+
+
+def strict_evidence_basis(draws) -> Dict:
+    """严格模式**出号依据**的判定结果（V18）。返回::
+
+        {"basis": "L1_statistical" | "L2_structural" | "none",
+         "n_replayable": int | None,
+         "l2_ok": bool,
+         "note_zh": str}
+
+    与 :func:`strict_mode_gates` **同源**（同一套判定条件），只是把"依据是什么"
+    单独暴露出来 —— 前端必须能显示"这批票的凭据是统计规律还是结构约束"，
+    否则就是拿 L2 冒充 L1（V12-04 明令禁止）。
+    """
+    _n_replayable = None
+    try:
+        from . import patterns_runtime as _PRT
+        _snap = _PRT.load_snapshot()
+        if _snap:
+            _n_replayable = int((_snap.get("counts") or {}).get("usable_replayable") or 0)
+    except Exception:      # noqa: BLE001
+        _n_replayable = None
+
+    _l2_ok = False
+    try:
+        from . import shape_rules as _SR
+        _sc = _SR.shape_constraint_ctx(draws)
+        _required = ("sum_min", "sum_max", "span_min", "span_max",
+                     "top_zones", "odd_range", "max_consecutive")
+        _missing = [k for k in _required if _sc.get(k) is None]
+        _l2_ok = (not _missing) and bool(_sc.get("top_zones"))
+    except Exception:      # noqa: BLE001
+        _l2_ok = False
+
+    if _n_replayable is not None and _n_replayable > 0:
+        return {"basis": "L1_statistical", "n_replayable": _n_replayable, "l2_ok": _l2_ok,
+                "note_zh": (f"依据：**L1 统计规律**（{_n_replayable} 条通过前置注册且可回放）。"
+                            "这是更强的凭据。")}
+    if _l2_ok:
+        return {"basis": "L2_structural", "n_replayable": _n_replayable, "l2_ok": True,
+                "note_zh": ("依据：**L2 结构约束**（和值/跨度/三区/奇偶/连号，与 C(33,6) "
+                            "理论枚举一致，可逐注复核）。注意：L2 通过**不代表**存在可预测"
+                            "下期的规律，也不提高中奖概率；L1 可回放规律当前为 0 条。")}
+    return {"basis": "none", "n_replayable": _n_replayable, "l2_ok": False,
+            "note_zh": "既无可回放规律（L1），L2 结构约束也不可用 —— 无任何可复核凭据。"}
 
 
 def _strict_mode_reject_response(draws, issue):
@@ -320,7 +387,13 @@ def predict(use_llm: Optional[bool] = None,
             "），已按你的选择改用**统计模式**生成；本批票单标注为 stat_fallback。")
     elif _strict_active:
         use_llm = True                                   # 严格模式强制走 LLM
-        _strict_notes.append("严格模式：出号强制依赖 LLM + 规律，本次为现算（未走缓存）")
+        # V18：文案必须如实交代凭据类型 —— 不能笼统说"依赖规律"，
+        # 因为 L1 为空时兜底的是 L2 结构约束，二者强度不同。
+        try:
+            _ev_note = strict_evidence_basis(draws)["note_zh"]
+        except Exception:      # noqa: BLE001
+            _ev_note = "严格模式：出号强制依赖 LLM + 可复核凭据，本次为现算（未走缓存）"
+        _strict_notes.append("严格模式（现算，未走缓存）。" + _ev_note)
     elif _strict_bypass:
         # 绕过严格模式：**必须**如实告诉用户发生了什么，否则他会以为自己的
         # "必须 LLM 出号"设置生效了，而实际拿到的是纯统计票。
@@ -395,6 +468,19 @@ def predict(use_llm: Optional[bool] = None,
             print("[predict] 降级标注写入失败（票单仍有效）:", e)
     else:
         res["source_mode"] = "strict" if _strict_active else "stat"
+    # V18：严格模式出号时，必须交代**凭据类型**（L1 统计 / L2 结构）。
+    # 只写"严格模式"四个字是不够的 —— 用户有权知道这批票的凭据是"统计显著"
+    # 还是"结构合规"。L1 与 L2 是两种不同强度的凭据，不可混为一谈。
+    if _strict_active and _fallback_info is None:
+        try:
+            _ev = strict_evidence_basis(draws)
+        except Exception as e:      # noqa: BLE001
+            _ev = {"basis": "unknown", "n_replayable": None, "l2_ok": None,
+                   "note_zh": f"依据判定失败（{type(e).__name__}）"}
+        res["evidence_basis"] = _ev["basis"]
+        res["evidence_note_zh"] = _ev["note_zh"]
+        res["evidence_l1_replayable"] = _ev["n_replayable"]
+        res["evidence_l2_ok"] = _ev["l2_ok"]
     if _decision_disabled:
         res["decision_channel_note_zh"] = (
             "LLM 决策通道已被自动关停（决策技能 Wilson 下界 ≤ 随机基线 0.5），"
