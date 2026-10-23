@@ -55,7 +55,21 @@ from lottery import db, engine
 #
 # **什么时候可以改这个值**：只有「拆分前后在同口径下不一致」才算行为变化。
 # 判定方法：worktree 在父提交上跑同一段代码，两边必须一致；不一致才查回归。
-PREDICT_FINGERPRINT = "b3a2a3e69282e4ce4f39db694af11fbc"
+#
+# **2026-10-23 第四次修正（口径变更 + 常量更正）**：
+#
+# 上一版常量 b3a2a3e6 是个**从未被真实复现过的值**。证据（`docs/analysis/ENGINE_FINGERPRINT_DRIFT.md`）：
+# 在写下它的那个提交 `a2ce0b2` 上实测，实际值就是 3165f786；`72e59d0`、`8952c04`、HEAD 四点
+# **全部**是 3165f786，从写下常量到 HEAD 一个字没变 ⇒ 不是任何代码漂移。
+# 同时排除了期数变化（截断 0~12 期逐个变化，无一命中 b3a2a3e6）、
+# hypotheses.json 漂移（清空前后指纹一致）、剥离集变化（64 种组合无一命中）。
+#
+# 更根本的问题是**口径**：指纹覆盖「全部历史开奖」⇒ 每多开一期彩票就变一次，
+# 于是这条真值锁必然被「红了就改常量」处理掉，而那正是本用例明令禁止的。
+# 因此改为**截断到固定 `FINGERPRINT_DRAWS` 期**（最早 N 期，永不受后续开奖影响），
+# 指纹只反映「代码 + 固定样本」。常量随之更正为在该口径下实跑得到的值。
+FINGERPRINT_DRAWS = 3500
+PREDICT_FINGERPRINT = "09cef0f617b096c6a111ff5ad614e8f3"
 
 # 前端 / 路由 / 测试广泛依赖的公开 API —— 拆分后名字必须仍可从 `lottery.engine` 取到
 _PUBLIC_API = [
@@ -135,10 +149,28 @@ def deterministic_prediction():
     `config.guard_prod_db()` 会在测试上下文里拦截「DB_PATH 指向生产库」。
     **这是个好守卫**（本项目一天内因设错变量名踩过两次），**不能绕过它**。
 
-    但本用例的性质是「真值锁」—— 指纹是在**真实 3517 期数据**上取的，
+    但本用例的性质是「真值锁」—— 指纹是在**真实历史数据**上取的，
     换隔离空库会得到完全不同的输出，等价性验证就失去意义。
     所以这里走它提供的**正规通道** `LOTT_TEST_REAL_DB=1` 并通过
     `allow_real=True` 显式声明意图，而不是 monkeypatch 掉守卫。
+
+    ## 为什么必须截断到固定期数（`FINGERPRINT_DRAWS`）
+
+    `predict_next` 的输出覆盖**全部历史开奖**，于是「用全部数据算指纹」会得到一个
+    **每多开一期彩票就变一次**的值。实测（`docs/analysis/ENGINE_FINGERPRINT_DRIFT.md`）：
+    期数 3518 → `3165f786`、3517 → `f769cfdb`、3516 → `d2141b9a`、3515 → `a29ed47c` …
+
+    这样的「真值锁」有三个害处：
+    1. **每期开奖必红**，与代码是否回归无关；
+    2. 于是必然被「红了就改常量」处理掉 —— 而更新常量正是本用例明令禁止的动作；
+    3. 真正回归出现时，它和「又开了一期」混在同一类红灯里，无法区分。
+
+    所以这里把输入**截断到固定 `FINGERPRINT_DRAWS` 期**，指纹只反映「代码 + 固定样本」。
+    这比「锁定全部历史」更接近本用例的原意（D-03 `a2ce0b2` 的提交说明：
+    指纹只应反映代码与历史，不应随后台数据漂移）。
+
+    **注意**：截断取的是**最早**的 N 期（`draws[:N]`），不是最近 N 期 —— 最早那段历史
+    永远不会被后续开奖影响，才真正是把输入钉死。
     """
     import os
 
@@ -157,6 +189,12 @@ def deterministic_prediction():
             os.environ.pop("LOTT_TEST_REAL_DB", None)
         else:
             os.environ["LOTT_TEST_REAL_DB"] = prev
+    # 截断到固定期数：输入钉死，指纹不再随开奖漂移。
+    draws = draws[:FINGERPRINT_DRAWS]
+    assert len(draws) == FINGERPRINT_DRAWS, (
+        f"真实库只有 {len(draws)} 期，不足指纹口径要求的 {FINGERPRINT_DRAWS} 期；"
+        "本用例需要至少这么多历史才成立（不足时不应静默缩小样本）"
+    )
     return engine.predict_next(
         draws,
         use_llm=False,
