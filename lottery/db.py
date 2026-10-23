@@ -705,6 +705,78 @@ def save_eval_meta(issue: str, tickets: List[Dict], result: Optional[Dict] = Non
     conn.commit()
 
 
+def mark_prediction_source(issue: str, *, source_mode: str,
+                           strict_gates: Optional[List[str]] = None,
+                           strict_reason: str = "",
+                           user_id: Optional[int] = None) -> int:
+    """给已落库的预测**补标口径来源**（V16），返回受影响行数。
+
+    ## 为什么需要它
+
+    严格模式门控被拒后，后台调度器会**降级为统计模式**自动出号（用户既定策略），
+    但这种降级必须**可见** —— 否则用户看到 5 注票，会默认它们是"过了严格模式"的产物。
+    2026-10-22 的故障就是这样：`issue=2026122` 的 5 条全是 `stat:*`，而界面上
+    没有任何"这是降级来的"标记。
+
+    ## 写在哪
+
+    写进 `eval_meta.config_snapshot_json` 的 `source_mode` 等字段 —— **不改表结构**
+    （加列要跑迁移，而这是一次纯展示口径修复，不值得引入 schema 风险）。
+    读侧由 :func:`load_prediction_source` 取回。
+
+    `source_mode` 取值：
+      * ``"strict"``        —— 过了严格模式门控（有可复核规律 + LLM 通道可用）
+      * ``"stat_fallback"`` —— 严格模式未出号，按既定策略降级为统计模式（**必须标注**）
+      * ``"stat"``          —— 本来就没开严格模式，正常统计出号
+    """
+    uid = resolve_tenant(user_id)
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT method, config_snapshot_json FROM eval_meta WHERE user_id=? AND issue=?",
+        (uid, issue),
+    ).fetchall()
+    n = 0
+    for r in rows:
+        d = dict(r)
+        try:
+            snap = json.loads(d.get("config_snapshot_json") or "{}")
+        except Exception:          # noqa: BLE001
+            snap = {}
+        snap["source_mode"] = str(source_mode)
+        snap["strict_gates"] = list(strict_gates or [])
+        snap["strict_reason"] = str(strict_reason or "")
+        conn.execute(
+            "UPDATE eval_meta SET config_snapshot_json=? WHERE user_id=? AND issue=? AND method=?",
+            (json.dumps(snap, ensure_ascii=False), uid, issue, d["method"]),
+        )
+        n += 1
+    conn.commit()
+    return n
+
+
+def load_prediction_source(issue: str, *, user_id: Optional[int] = None) -> Dict:
+    """读回某期预测的口径来源（V16）。无记录时返回 ``source_mode="unknown"``。
+
+    网关取**任一条**方法的快照即可 —— `mark_prediction_source` 是整期统一标注的。
+    """
+    uid = resolve_tenant(user_id)
+    row = get_conn().execute(
+        "SELECT config_snapshot_json FROM eval_meta WHERE user_id=? AND issue=? LIMIT 1",
+        (uid, issue),
+    ).fetchone()
+    if not row:
+        return {"source_mode": "unknown", "strict_gates": [], "strict_reason": ""}
+    try:
+        snap = json.loads(row[0] or "{}")
+    except Exception:              # noqa: BLE001
+        snap = {}
+    return {
+        "source_mode": snap.get("source_mode") or "unknown",
+        "strict_gates": snap.get("strict_gates") or [],
+        "strict_reason": snap.get("strict_reason") or "",
+    }
+
+
 def save_eval_details(issue: str, method: str, tickets: List[Dict], draw: Dict,
                       *, user_id: Optional[int] = None) -> Dict:
     """幂等保存逐注开奖对照明细，并返回方法汇总。"""

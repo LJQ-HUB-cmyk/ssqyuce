@@ -35,8 +35,34 @@ from . import request_context
 
 router = APIRouter()
 
+def strict_scope_for_user(user_id):
+    """严格模式对**指定用户**是否生效。返回 ``(active: bool, bypass_reason: str)``。
+
+    V16：从"只认当前请求用户"改为**可按 user_id 判定**，因为后台调度器
+    （``api_app._scheduler_step``）没有 HTTP 请求上下文，但它同样必须服从
+    严格模式的语义 —— 否则就是"手动点不出号、后台却悄悄存了统计票"
+    （这正是 2026-10-22 那批 5 注纯统计票的真实成因）。
+    """
+    if not bool(getattr(config, "STRICT_MODE", False)):
+        return False, ""
+    try:
+        from . import user_llm_store
+        eff = user_llm_store.effective_for_user(user_id)
+        if eff.get("llm_available"):
+            return True, ""
+        _why = eff.get("reason") or "未配置 LLM"
+        return False, (
+            f"严格模式对当前账号**不生效**：没有可用的 LLM 通道（{_why}）。"
+            f"本次已按纯统计通道出号。若希望强制 LLM 出号，请在设置页配置自己的"
+            f" API Key（或由管理员配置共享通道）后重试。")
+    except Exception as e:      # noqa: BLE001
+        # 判定失败**不**升级成"拒绝出号"：宁可出一份纯统计票，也不要让用户
+        # 因为"读取配置抛了个异常"就拿不到任何结果。
+        return False, f"严格模式作用域判定失败（{type(e).__name__}），已按纯统计通道出号。"
+
+
 def _strict_scope_for_current_user():
-    """严格模式对**当前用户**是否生效。返回 ``(active: bool, bypass_reason: str)``。
+    """严格模式对**当前请求用户**是否生效（薄封装，保持既有调用点不变）。
 
     ## 为什么严格模式必须按用户判定（Lead 裁决 2-A）
 
@@ -55,29 +81,14 @@ def _strict_scope_for_current_user():
     没有通道的用户**绕过**门控，走纯统计出号，并在响应里如实说明原因
     （`strict_bypassed` + 提示文案）—— 既不静默降级，也不算"出号成功"。
     """
-    if not bool(getattr(config, "STRICT_MODE", False)):
-        return False, ""
-    try:
-        from . import user_llm_store
-        uid = request_context.current_user_id()
-        eff = user_llm_store.effective_for_user(uid)
-        if eff.get("llm_available"):
-            return True, ""
-        _why = eff.get("reason") or "未配置 LLM"
-        return False, (
-            f"严格模式对当前账号**不生效**：没有可用的 LLM 通道（{_why}）。"
-            f"本次已按纯统计通道出号。若希望强制 LLM 出号，请在设置页配置自己的"
-            f" API Key（或由管理员配置共享通道）后重试。")
-    except Exception as e:      # noqa: BLE001
-        # 判定失败**不**升级成"拒绝出号"：宁可出一份纯统计票，也不要让用户
-        # 因为"读取配置抛了个异常"就拿不到任何结果。
-        return False, f"严格模式作用域判定失败（{type(e).__name__}），已按纯统计通道出号。"
+    return strict_scope_for_user(request_context.current_user_id())
 
 
-def _strict_mode_reject_response(draws, issue):
+def strict_mode_gates(draws, issue):
     """V11 严格模式门控：出号必须由 LLM 分析规律完成。
 
-    返回 None（放行）或 JSONResponse（拒绝出号，422）。
+    返回**未通过的门控列表** ``[(gate_key, message), ...]``；空列表 = 放行。
+    纯数据、不碰 HTTP —— 路由与后台调度器共用同一套判定（V16）。
     **必须在缓存检查之前调用**：严格模式下已有预测缓存也必须重新校验，
     不允许用旧缓存绕过门控（2026-10-18 顺序缺陷修复）。
 
@@ -162,11 +173,28 @@ def _strict_mode_reject_response(draws, issue):
               "请检查 LOTT_METHODS 是否包含 llm、LLM 网关（data/llm_config.json）"
               "是否可用。")))
 
+    return _errs
+
+
+def _strict_mode_reject_response(draws, issue):
+    """HTTP 包装：门控不通过 → 422 JSONResponse；通过 → None。
+
+    V16 起判定本身抽到 :func:`strict_mode_gates`（返回纯数据），
+    因为这个判定**不止路由要用** —— 后台调度器也必须服从同一套语义，
+    否则就会出现"手动点不出号、后台却悄悄存了统计票"（2026-10-22 的真实故障）。
+    """
+    _errs = strict_mode_gates(draws, issue)
     if _errs:
         return JSONResponse(
             {"ok": False, "strict_mode": True,
              "strict_gates": [e[0] for e in _errs],
-             "error": "；".join(e[1] for e in _errs)},
+             "error": "；".join(e[1] for e in _errs),
+             # V16：让前端能据此弹出"是否改用统计模式"的选择，而不是只看到一个红字。
+             "can_fallback": True,
+             "fallback_hint": "严格模式下没有可复核的真凭实据，故未出号。"
+                              "你可以选择改用统计模式生成（结果会被明确标注为统计口径），"
+                              "或先配置 LLM 通道 / 关闭严格模式。",
+             },
             status_code=422)
     return None
 
@@ -177,7 +205,8 @@ def predict(use_llm: Optional[bool] = None,
             regenerate: bool = False,
             bet_mode: Optional[str] = None,
             coverage: bool = False,
-            coverage_r: Optional[int] = None):
+            coverage_r: Optional[int] = None,
+            allow_stat_fallback: int = Query(0, ge=0, le=1)):
     """生成下一期预测；目标期已有预测且未要求重新生成时复用缓存。
 
     bet_mode: U2 投注模式 single / blue_compound / dan_tuo（None=跟随 LOTT_BET_MODE）。
@@ -187,6 +216,14 @@ def predict(use_llm: Optional[bool] = None,
     M4.5 快速失败：use_llm=true（前端勾选「使用大模型」）时 LLM 通道
     不可用/超时/输出异常，直接返回 503 + 明确错误信息（预测失败），
     不再静默降级为纯统计模型；use_llm=false 走纯统计，行为不变。
+
+    allow_stat_fallback（V16）：**用户是否已明确同意"严格模式不出号时改用统计模式"**。
+    默认 0 = 不同意（严格模式被拒就返回 422，由前端弹窗让用户选）。
+    为 1 时：门控被拒 → 降级为统计出号，并把 `source_mode="stat_fallback"`
+    + 未通过的门控写进快照，**页面上必须能看出这不是严格模式的产物**。
+
+    为什么默认不让后端自己降级：严格模式的语义是"没有可复核的真凭实据就不出号"，
+    静默降级恰好是它要禁止的事。要不要拿统计票，是用户的决定，不是实现者的。
     """
     from . import backtest as BT, engine
     from . import methods as METH
@@ -203,11 +240,20 @@ def predict(use_llm: Optional[bool] = None,
     # 不可用时拒绝出号；通过校验则强制现算（regenerate=True），不允许
     # 用旧缓存绕过门控。这是 2026-10-18 修复的顺序缺陷。
     _strict_active, _strict_bypass = _strict_scope_for_current_user()
+    _fallback_info = None            # V16：非 None = 严格模式被拒且用户已授权降级
     if _strict_active:
-        _rej = _strict_mode_reject_response(draws, issue)
-        if _rej is not None:
-            return _rej
-        regenerate = True            # 严格模式强制现算，不走缓存
+        _errs = strict_mode_gates(draws, issue)
+        if _errs:
+            if not allow_stat_fallback:
+                # 默认路径：如实拒绝，并告诉前端"可以选统计模式"（can_fallback）。
+                return _strict_mode_reject_response(draws, issue)
+            # 用户已在前端明确选择"改用统计模式" → 降级，但必须标注口径。
+            _fallback_info = {
+                "gates": [e[0] for e in _errs],
+                "reason": "；".join(e[1] for e in _errs),
+            }
+        else:
+            regenerate = True        # 严格模式通过 → 强制现算，不走缓存
     if not regenerate:
         existing = db.load_predictions(issue)
         if existing:
@@ -224,6 +270,11 @@ def predict(use_llm: Optional[bool] = None,
             if bm not in ("single", "blue_compound", "dan_tuo"):
                 bm = "single"
             _llm_used = any(str(t.get("method", "")).startswith("llm:") for t in existing)
+            try:
+                _src_cached = {k: v for k, v in db.load_prediction_source(issue).items()
+                               if k in ("source_mode", "strict_gates", "strict_reason")}
+            except Exception:      # noqa: BLE001
+                _src_cached = {}
             _gen_ts = max((t.get("created_at") or 0) for t in existing) if existing else None
             return {"issue": issue, "tickets": existing, "from_cache": True,
                     "generated_at": (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(_gen_ts))
@@ -239,6 +290,9 @@ def predict(use_llm: Optional[bool] = None,
                     "coverage_mode": bool(meta.get("coverage_mode", False)),
                     "blue_covered": meta.get("blue_covered"),
                     "blue_coverage_rate": meta.get("blue_coverage_rate"),
+                    # V16：缓存路径也必须带回口径来源 —— 否则用户从缓存看到 5 注票时
+                    # 会以为它们是"过了严格模式"的产物（2026-10-22 那次正是如此）。
+                    **_src_cached,
                     "adaptive": METH.adaptive_status() if config.ADAPTIVE_ENABLED else None}
     # V10-11：技能关停（decision_disabled）只关「LLM 出号决策通道」，**不**关预测。
     # 关键区别（R3 G6 第 2 条）：走 LLM_DISABLED 时 engine 会因 llm_required=True
@@ -256,7 +310,15 @@ def predict(use_llm: Optional[bool] = None,
     # **不能**重新读 config.STRICT_MODE —— 那会把刚绕过门控的用户的 use_llm
     # 又强制成 True，于是绕过门控却仍然去调 LLM，必然抛 LLMChannelError → 503。
     _strict_notes = []
-    if _strict_active:
+    if _fallback_info is not None:
+        # V16：严格模式未出号，但用户在前端明确选择了「改用统计模式」。
+        # 必须满足两条：① 强制关 LLM（走纯统计）；② 强制现算，不拿缓存冒充。
+        use_llm = False
+        regenerate = True
+        _strict_notes.append(
+            "严格模式未出号（未通过：" + " / ".join(_fallback_info["gates"]) +
+            "），已按你的选择改用**统计模式**生成；本批票单标注为 stat_fallback。")
+    elif _strict_active:
         use_llm = True                                   # 严格模式强制走 LLM
         _strict_notes.append("严格模式：出号强制依赖 LLM + 规律，本次为现算（未走缓存）")
     elif _strict_bypass:
@@ -318,6 +380,21 @@ def predict(use_llm: Optional[bool] = None,
         _strict_notes.append(_quota_note)
     if _strict_notes:
         res["strict_notes"] = _strict_notes
+    # V16：口径来源必须随响应一起返回，前端据此打标（不得让统计票看起来像严格模式产物）。
+    if _fallback_info is not None:
+        res["source_mode"] = "stat_fallback"
+        res["strict_gates"] = list(_fallback_info["gates"])
+        res["strict_reason"] = _fallback_info["reason"]
+        try:
+            db.mark_prediction_source(
+                issue, source_mode="stat_fallback",
+                strict_gates=_fallback_info["gates"],
+                strict_reason=_fallback_info["reason"],
+            )
+        except Exception as e:      # noqa: BLE001
+            print("[predict] 降级标注写入失败（票单仍有效）:", e)
+    else:
+        res["source_mode"] = "strict" if _strict_active else "stat"
     if _decision_disabled:
         res["decision_channel_note_zh"] = (
             "LLM 决策通道已被自动关停（决策技能 Wilson 下界 ≤ 随机基线 0.5），"

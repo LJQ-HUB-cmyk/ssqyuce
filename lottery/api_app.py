@@ -395,9 +395,59 @@ def _scheduler_step():
         # 但预测**照常生成**（这就是与 LLM_DISABLED 的区别：后者会 503）。
         from . import methods as METH
         _llm_on = not bool(METH.resolve_channels().get("decision_disabled"))
-        engine.predict_next(draws, use_llm=_llm_on)
+
+        # ── V16：严格模式优先 + 降级必须可见 ──────────────────────────
+        #
+        # ## 修的是什么（2026-10-22 的真实故障）
+        #
+        # 严格模式门控此前只挂在 `/api/predict` 路由上，而这里**直接调
+        # `engine.predict_next()`，绕过门控**。结果是：用户在页面上点"生成预测"
+        # 收到 422「严格模式下不出号」，后台却悄悄往库里存了 5 注纯统计票
+        # （实测 issue=2026122，5 条 method 全是 stat:*/uniform，无一条 llm:）。
+        #
+        # 用户要的语义（2026-10-23 明确）：
+        #   ① 自动生成时**严格模式优先**；
+        #   ② 严格模式不出号 → **自动降级统计模式**，但**必须标注清楚**是统计口径；
+        #   ③ 手动生成时**弹窗让用户自己选**（已在 routes_predict + 前端实现）。
+        #
+        # 所以这里：先按同一套门控判定；被拒就降级为统计，并把
+        # `source_mode="stat_fallback"` + 拒绝原因写进配置快照，
+        # 让前端/校验层能一眼看出「这批票不是严格模式的产物」。
+        from . import routes_predict as _RP
+        _uid = 1                      # 调度器产出归属主租户（与 db.resolve_tenant 默认一致）
+        _strict_active, _strict_bypass = _RP.strict_scope_for_user(_uid)
+        _fallback = None              # None = 未降级
+        if _strict_active:
+            _errs = _RP.strict_mode_gates(draws, issue)
+            if _errs:
+                _fallback = {
+                    "gates": [e[0] for e in _errs],
+                    "reason": "；".join(e[1] for e in _errs),
+                }
+                _llm_on = False       # 降级为纯统计
+                print("[scheduler] 严格模式不出号（门控未过：",
+                      ", ".join(_fallback["gates"]),
+                      "）→ 按用户既定策略降级为**统计模式**并标注 source_mode=stat_fallback")
+        elif _strict_bypass:
+            # 该账号没有 LLM 通道 → 严格模式本就不对他生效，走统计但同样标注
+            _fallback = {"gates": ["no_llm_channel"], "reason": _strict_bypass}
+            _llm_on = False
+
+        _res = engine.predict_next(draws, use_llm=_llm_on)
+        # 把降级事实写进快照（engine 已落库，这里补标口径）
+        if _fallback is not None and isinstance(_res, dict):
+            try:
+                db.mark_prediction_source(
+                    issue, source_mode="stat_fallback",
+                    strict_gates=_fallback["gates"],
+                    strict_reason=_fallback["reason"],
+                    user_id=_uid,
+                )
+            except Exception as e:      # noqa: BLE001
+                print("[scheduler] 降级标注写入失败（不影响票单）:", e)
         print("[scheduler] 已生成", issue, "预测",
-              "（LLM 决策通道已关停，本次为纯统计/ML）" if not _llm_on else "")
+              ("（严格模式未出号 → 统计模式 · 已标注 stat_fallback）" if _fallback
+               else ("（LLM 决策通道已关停，本次为纯统计/ML）" if not _llm_on else "")))
 
 
 def _scheduler_loop():

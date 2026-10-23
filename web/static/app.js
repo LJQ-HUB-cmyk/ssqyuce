@@ -711,7 +711,7 @@ function renderReplayItem(item) {
 
 // ==================== 预测 ====================
 
-async function runPredict(regenerate, btnId) {
+async function runPredict(regenerate, btnId, allowFallback) {
   if (regenerate === undefined) regenerate = false;
   if (btnId === undefined) btnId = regenerate ? "#btnRegen" : "#btnPredict";
   const n = parseInt($("#cfgTickets")?.value || 10);
@@ -720,7 +720,11 @@ async function runPredict(regenerate, btnId) {
   $("#predStatus").textContent = "⏳ 正在请求服务器，请稍候…";
   $("#predStatus").style.color = "var(--gold)";
   try {
-    const r = await api("/api/predict?n_tickets=" + n + "&regenerate=" + regenerate + "&use_llm=" + llm, {method:"POST"});
+    // V16：`allow_stat_fallback=1` 表示用户已在前端明确同意「严格模式不出号时改用统计模式」。
+    // 没有这个标记时后端绝不会自动降级 —— 严格模式的语义是"没有真凭实据就不出号"，
+    // 悄悄给一份统计票正是它要禁止的事。
+    const _fb = allowFallback ? "&allow_stat_fallback=1" : "";
+    const r = await api("/api/predict?n_tickets=" + n + "&regenerate=" + regenerate + "&use_llm=" + llm + _fb, {method:"POST"});
     currentIssue = r.issue;
     localStorage.setItem("lastPredictIssue", r.issue);
     renderPredictions(r);
@@ -759,6 +763,23 @@ async function runPredict(regenerate, btnId) {
               ).join(" / ") + "</div>"
             : "");
         b.style.color = "var(--red)";
+        // V16：让用户**自己选**是否改用统计模式（不替用户决定，也不悄悄降级）。
+        if (p.can_fallback) {
+          b.innerHTML += '<div class="strict-fallback" style="margin-top:8px">' +
+            '<button class="btn" id="btnStatFallback" style="font-size:13px">' +
+            '改用统计模式生成</button>' +
+            '<div class="note" style="margin-top:6px">' +
+            escHtml(p.fallback_hint || "统计模式不含 LLM 判断；生成结果会被明确标注为统计口径。") +
+            "</div></div>";
+          const fbBtn = $("#btnStatFallback");
+          if (fbBtn) {
+            fbBtn.onclick = () => {
+              fbBtn.disabled = true;
+              fbBtn.textContent = "统计模式生成中…";
+              runPredict(regenerate, btnId, true);
+            };
+          }
+        }
       } else {
         b.classList.add("hidden");
       }
@@ -861,6 +882,17 @@ function renderPredMeta(res) {
   if (!genTxt) genTxt = res.from_cache ? "未知（历史缓存预测，生成时未记录时间）" : "—";
   items.push('<span class="pm-item">🕒 生成时间 <b class="pm-key">' + escHtml(genTxt) + '</b>' +
     (res.from_cache ? '<span class="pm-warn">（缓存）</span>' : "") + '</span>');
+  // V16：口径来源必须可见。stat_fallback = 严格模式未出号后改用统计模式生成的，
+  // 不标出来用户会以为这批票过了严格模式（2026-10-22 的 5 注票就是这样被误读的）。
+  if (res.source_mode === "stat_fallback") {
+    const _g = (res.strict_gates || []).map(g =>
+      g === "replayable_rules" ? "无可回放规律" : g === "llm" ? "LLM 不可用" :
+      g === "strategy" ? "规律为 0 条" : g).join(" / ");
+    items.push('<span class="pm-item" style="color:var(--gold);font-weight:600">' +
+      '📊 口径：统计模式（严格模式未出号' + (_g ? "：" + escHtml(_g) : "") + '）</span>');
+  } else if (res.source_mode === "strict") {
+    items.push('<span class="pm-item" style="color:var(--green)">✅ 口径：严格模式</span>');
+  }
   if (basis.basis_issue) {
     items.push('<span class="pm-item">📥 数据基准 <b>' + escHtml(basis.basis_issue) + '</b>（' +
       escHtml(basis.basis_date || "") + '）</span>');
@@ -4780,7 +4812,7 @@ async function loadAll() {
       if (health.version) {
         const ver = "v" + health.version;
         const vb = $("#verBadge"), vt = $("#verText");
-        if (vb) { vb.textContent = ver; vb.title = "系统版本 " + ver + " · v4.2 V15"; }
+        if (vb) { vb.textContent = ver; vb.title = "系统版本 " + ver + " · v4.3 V16"; }
         if (vt) vt.textContent = ver;
       }
     }
