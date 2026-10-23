@@ -139,14 +139,15 @@ BACKUP_DATA_URL = (os.environ.get("LOTT_BACKUP_DATA_URL") or "").strip() or None
 
 # ---------- 版本信息（前端主页 / API / GitHub 说明统一引用） ----------
 
-APP_VERSION = "4.8.0"          # v23：L3 前向回测首屏公开（让"未检出可预测性"可复核）
+APP_VERSION = "4.8.1"          # v24：修 LLM 连接测试误用全局默认通道
 
 # 单注 2 元（双色球官方单价，固定事实）。
 # 放在 config 而不是某个路由模块里：它被 evaluate / portfolio / rigor 共用，
 # 属于领域常量，不属于任何单个端点域。
 TICKET_PRICE = 2.0
-APP_BUILD = "2026-10-V23"      # 构建标识（V23 交付批次）
+APP_BUILD = "2026-10-V24"      # 构建标识（V24 交付批次）
 APP_MILESTONES = {
+    "V24": {"status": "done", "desc": "修 LLM 连接测试误用全局默认通道（用户 2026-10-23 报告「用户自己填写自定义模型，保存配置，测试是否正常。貌似测的还是默认的，不是手动填写的」）：/api/llm/test 旧实现只用 config.llm_model_list()（全局/管理员默认通道），**从头到尾没读用户自备配置** —— 用户填了自己的 base_url/Key/model 并保存后点测试，实际测的是另一条通道；若自备通道是坏的（地址错、Key 无效、模型名拼错），测试仍显示成功，这是最坏的一种误导。生产实证：用户1 生效来源 user、自备 model=group/subscription @magpie.ff88.de，而测试端点用的是全局 agent-router/deepseek-v4-flash。修法：改走 user_llm_store.effective_for_user(uid, with_secret=True) —— 全项目唯一的「该用户实际生效参数」判据（出号链路也用它），测试与出号从此同源。返回值新增 source(user/system/none) 与 base_url_host，让人看得出测的是哪条通道；无用户通道时才退回全局并标 source=system。实测用户自备通道短提示 3.0s 成功、长提示（真实观察轮）会超 180s 预算 —— 旧代码把后者也算作全局通道的成功，掩盖了真实差异。测试 1735 → 1739。"},
     "V23": {"status": "done", "desc": "L3 前向回测首屏公开 —— 把「未检出可预测性」变成可复核的事实（AI 重设计第四层，依据 docs/analysis/V19_AI_REDESIGN.md §4 层3）：新增 GET /api/rigor/walk_forward?method=&color=&n_tickets=&start=，复用 V20 的 walk_forward_gate（同一种子组 WF_SEEDS、同一门槛 WF_Z_MIN），返回 z_median/z_by_seed/n/hit_rate/baseline 并强制附带 headline_zh（结论句）与 honesty_zh（诚实声明）—— 不只丢数字让人自己猜。判据纪律：z_min 必须等于 WF_Z_MIN、seeds 必须等于 WF_SEEDS（不许另立标准）。非法 color 返回 400 **且不返回任何命中率读数**（防止被误读成结论）。红球通道基线 6*6/33、蓝球 1/16，口径分开。首屏新增「🎯 前向回测」卡片（index.html #walkForwardCard + app.js loadWalkForward），启动即加载、失败自降级不阻塞首屏。实测读数：stat:freq 蓝球 z 中位数 -0.06、命中率 6.22% vs 基线 6.25%，未检出可预测性 —— 这是最正常也最诚实的结果。测试 1728 → 1735；B_BASELINE 145 → 146（+1，已注明为何必要且无法合并）。"},
     "V22": {"status": "done", "desc": "L2 AI 角色分离 —— 新增 advisory 模式，AI 只解释、不参与选号（AI 重设计第三层，依据 docs/analysis/V19_AI_REDESIGN.md §1.2/§4 层2）：生产实测 45 注匹配样本，llm 票红球 1.265 / stat 票 1.182（基线 1.091）、蓝球 LLM 0.035 vs 统计 0.073（基线 0.0625），差异全在 1 个标准差内 —— LLM 选号无增量，却要付 503 风险、延迟与 token 成本。改动：LLM_OUTPUT_MODES 由 (off, only, mix) 扩为 (off, **advisory**, only, mix)；advisory 模式下 llm_can_pick 恒为 False（不产号），且**严格模式也不得覆盖**（历史严格模式会强制 llm_can_pick=True，若不排除 advisory，该承诺会在严格部署下被静默推翻）；新增 ai_role ∈ {off, advisor, picker} 并随 resolve_channels 快照与预测响应返回，前端元信息显示「🤖 AI 角色：仅解释（未参与选号）」或「参与选号」。only/mix 语义**一字未改**（向后兼容，不删既有行为）；llm 族关闭时 advisory 也回落 off（沿用拒绝列表优先纪律）。测试 1721 → 1728。"},
     "V21": {"status": "done", "desc": "L1 AI 假设生成器 —— 把 LLM 从「挑参数」改成「提可证伪假设」（AI 重设计第二层，依据 docs/analysis/V19_AI_REDESIGN.md §1.1/§4 层1）：旧 llm_lab 要求 LLM 输出 filters:[{key,params}]，输出空间=134 档排列组合，是搜索不是推理（枚举一遍只要 12.8~17s，比问 LLM 快两个数量级），且 data/llm_claims.json 的 claims/runs 长期为 0（从未产出）。新增 lottery/ai_hypothesis.py：LLM 输出改为 question+test_spec+why+falsifier，test_spec.key 必须取 FAMILIES 已实现族、params 必须完全匹配已声明档位（自造参数一律拒——无实现则无从验证），无 falsifier 一律拒（不可证伪不是科学假设）。自动证伪三关：①存在性 discover 能跑出该族；②阶段 regime 非 flipped/error；③前向回测（复用 V20 的 walk_forward_gate，起点按数据长度自适应，避免短样本 n=0 退化）。前向回测对象是方法通道 stat:freq 而非维度本身，返回值强制带 wf_caveat_zh 说明此口径。新增端点 GET /api/ai_hypothesis/schema（公开提示词供审计）与 POST /api/ai_hypothesis/falsify（只证伪、不调 LLM、不产号码）。失败项原样保留并带原因——记录「问过什么、答案是没有」本身就是产出。生产实测 4 条真实假设全部三关跑通、结论 walk_forward_rejected。测试 1708 → 1721。"},
